@@ -187,7 +187,7 @@ class MultiStepLIFNeuron(nn.Module):
     """
 
     def __init__(self, tau=2.0, v_threshold=1.0, v_reset=0.0,
-                 surrogate='atan', detach_reset=False, backend='torch'):
+                 surrogate='sigmoid', detach_reset=False, backend='torch'):
         super().__init__()
         self.neuron = LIFNeuron(tau, v_threshold, v_reset, surrogate, detach_reset)
 

@@ -25,13 +25,13 @@ class BasicBlock18(nn.Module):
 
     def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
-        self.sn1 = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
+        self.sn1 = MultiStepLIFNeuron(tau=4, v_threshold=0.5, detach_reset=True)
         self.conv_bn1 = SeqToANNContainer(
             nn.Conv2d(in_channels, out_channels, kernel_size=3,
                       stride=stride, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
         )
-        self.sn2 = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
+        self.sn2 = MultiStepLIFNeuron(tau=4, v_threshold=0.5, detach_reset=True)
         self.conv_bn2 = SeqToANNContainer(
             nn.Conv2d(out_channels, out_channels, kernel_size=3,
                       padding=1, bias=False),
@@ -63,7 +63,7 @@ class MSResNet18(nn.Module):
             nn.Conv2d(3, 64, kernel_size=7, padding=3, bias=False, stride=2),
             nn.BatchNorm2d(64),
         )
-        self.sn_out = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
+        self.sn_out = MultiStepLIFNeuron(tau=4, v_threshold=0.5, detach_reset=True)
         self.conv2_x = self._make_layer(block, 64, num_block[0], 2)
         self.conv3_x = self._make_layer(block, 128, num_block[1], 2)
         self.conv4_x = self._make_layer(block, 256, num_block[2], 2)
@@ -103,13 +103,13 @@ class BasicBlock104(nn.Module):
 
     def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
-        self.sn1 = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
+        self.sn1 = MultiStepLIFNeuron(tau=4, v_threshold=0.5, detach_reset=True)
         self.conv_bn1 = SeqToANNContainer(
             nn.Conv2d(in_channels, out_channels, kernel_size=3,
                       stride=stride, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
         )
-        self.sn2 = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
+        self.sn2 = MultiStepLIFNeuron(tau=4, v_threshold=0.5, detach_reset=True)
         self.conv_bn2 = SeqToANNContainer(
             nn.Conv2d(out_channels, out_channels, kernel_size=3,
                       padding=1, bias=False),
@@ -146,7 +146,7 @@ class MSResNet104(nn.Module):
             nn.Conv2d(64, 64, kernel_size=3, padding=1, stride=1),
             nn.BatchNorm2d(64),
         )
-        self.sn_out = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
+        self.sn_out = MultiStepLIFNeuron(tau=4, v_threshold=0.5, detach_reset=True)
         self.conv2_x = self._make_layer(block, 64, num_block[0], 2)
         self.conv3_x = self._make_layer(block, 128, num_block[1], 2)
         self.conv4_x = self._make_layer(block, 256, num_block[2], 2)

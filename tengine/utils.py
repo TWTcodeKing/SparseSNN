@@ -1,5 +1,5 @@
 """
-Training utilities: metrics tracking, checkpointing, seed, model builder.
+Training utilities: metrics tracking, checkpointing, seed, model/config builder.
 """
 
 import os
@@ -7,6 +7,7 @@ import random
 import torch
 import torch.nn as nn
 import numpy as np
+import yaml
 
 
 # ---- Metrics ----
@@ -79,58 +80,80 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
+# ---- YAML config loading ----
+
+def load_model_config(config_path):
+    """Load a model config from a YAML file.
+
+    Returns a dict with at least an 'arch' key identifying the model family.
+    """
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    if 'arch' not in config:
+        raise ValueError(f"Config {config_path} must contain an 'arch' field")
+    return config
+
+
 # ---- Model builder ----
 
-_MODEL_REGISTRY = {}
+_RESNET_REGISTRY = {}
 
 
-def _populate_registry():
-    """Lazy-populate from models package."""
-    if _MODEL_REGISTRY:
+def _populate_resnet_registry():
+    """Lazy-populate ResNet factory functions."""
+    if _RESNET_REGISTRY:
         return
     import models as M
-
-    # ResNet variants
     for name in ['sew_resnet18', 'sew_resnet34', 'sew_resnet50',
                  'sew_resnet101', 'sew_resnet152',
                  'ms_resnet18', 'ms_resnet34', 'ms_resnet104']:
         fn = getattr(M, name, None)
         if fn:
-            _MODEL_REGISTRY[name] = fn
-
-    # Transformer variants
-    for name in ['spikformer_8_384', 'spikformer_8_512', 'spikformer_8_768',
-                 'sdt_v1_8_384', 'sdt_v1_8_512', 'sdt_v1_8_768',
-                 'meta_spikformer_8_384', 'meta_spikformer_8_512', 'meta_spikformer_8_768',
-                 'qkformer_10_384', 'qkformer_10_512', 'qkformer_10_768',
-                 'maxformer_10_384', 'maxformer_10_512', 'maxformer_10_768']:
-        fn = getattr(M, name, None)
-        if fn:
-            _MODEL_REGISTRY[name] = fn
+            _RESNET_REGISTRY[name] = fn
 
 
 def list_models():
-    _populate_registry()
-    return sorted(_MODEL_REGISTRY.keys())
+    _populate_resnet_registry()
+    resnet_names = sorted(_RESNET_REGISTRY.keys())
+    transformer_note = ['(transformer models: use --config <yaml>)']
+    return resnet_names + transformer_note
+
+
+def build_model_from_config(config):
+    """Build a transformer model from a merged config dict.
+
+    The config must contain 'arch' (matching a key in models.ARCH_BUILDERS)
+    plus all required model parameters (including runtime keys like
+    num_classes, T, img_size, in_channels).
+    """
+    from models import ARCH_BUILDERS
+    arch = config['arch']
+    if arch not in ARCH_BUILDERS:
+        raise ValueError(
+            f"Unknown arch '{arch}'. Available: {list(ARCH_BUILDERS.keys())}"
+        )
+    return ARCH_BUILDERS[arch](config)
 
 
 def build_model(model_name, **kwargs):
-    """Build a model by name. kwargs are forwarded to the factory function."""
-    _populate_registry()
-    if model_name not in _MODEL_REGISTRY:
+    """Build a ResNet model by name. kwargs are forwarded to the factory function."""
+    _populate_resnet_registry()
+    if model_name not in _RESNET_REGISTRY:
         raise ValueError(
-            f"Unknown model '{model_name}'. Available: {list_models()}"
+            f"Unknown ResNet model '{model_name}'. "
+            f"Available: {sorted(_RESNET_REGISTRY.keys())}. "
+            f"For transformer models, use --config <yaml>."
         )
-    return _MODEL_REGISTRY[model_name](**kwargs)
+    return _RESNET_REGISTRY[model_name](**kwargs)
 
 
 # ---- Dataset builder ----
 
 _DATASET_CONFIG = {
-    'cifar10':    {'num_classes': 10,  'img_size': 32},
-    'cifar100':   {'num_classes': 100, 'img_size': 32},
-    'imagenet':   {'num_classes': 1000, 'img_size': 224},
-    'cifar10dvs': {'num_classes': 10,  'img_size': 128},
+    'cifar10':    {'num_classes': 10,   'img_size': 32,  'in_channels': 3},
+    'cifar100':   {'num_classes': 100,  'img_size': 32,  'in_channels': 3},
+    'imagenet':   {'num_classes': 1000, 'img_size': 224, 'in_channels': 3},
+    'cifar10dvs': {'num_classes': 10,   'img_size': 128, 'in_channels': 2},
 }
 
 

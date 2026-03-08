@@ -8,6 +8,9 @@ SNN foundation model implementations covering:
 All models use standalone spiking neurons (models.neurons) instead of spikingjelly
 where possible. Input format is standard (B, C, H, W) images; the temporal
 dimension is handled internally.
+
+Transformer models are built via `build_<arch>(config)` functions that accept a
+config dict (loaded from YAML). ResNet models retain their direct factory functions.
 """
 
 # Neuron primitives
@@ -27,24 +30,18 @@ from .msresnet import (
     ms_resnet18, ms_resnet34, ms_resnet104,
 )
 
-# ---- SNN Transformer variants ----
-from .spikformer import (
-    Spikformer,
-    spikformer_8_384, spikformer_8_512, spikformer_8_768,
-)
-from .sdformer import (
-    SpikeDrivenTransformerV1,
-    sdt_v1_8_384, sdt_v1_8_512, sdt_v1_8_768,
-)
-from .sdformer2 import (
-    SpikeDrivenTransformerV2,
-    meta_spikformer_8_384, meta_spikformer_8_512, meta_spikformer_8_768,
-)
-from .qkformer import (
-    QKFormer,
-    qkformer_10_384, qkformer_10_512, qkformer_10_768,
-)
-from .maxformer import (
-    MaxFormer,
-    maxformer_10_384, maxformer_10_512, maxformer_10_768,
-)
+# ---- SNN Transformer variants (config-based builders) ----
+from .spikformer import Spikformer, build_spikformer
+from .sdformer import SpikeDrivenTransformerV1, build_sdformer
+from .sdformer2 import SpikeDrivenTransformerV2, build_sdformer2
+from .qkformer import QKFormer, build_qkformer
+from .maxformer import MaxFormer, build_maxformer
+
+# arch name -> build function mapping
+ARCH_BUILDERS = {
+    'spikformer': build_spikformer,
+    'sdformer': build_sdformer,
+    'sdformer2': build_sdformer2,
+    'qkformer': build_qkformer,
+    'maxformer': build_maxformer,
+}

@@ -1,0 +1,5 @@
+arch: maxformer
+
+embed_dims: 768
+mlp_ratios: 4
+depths: 10

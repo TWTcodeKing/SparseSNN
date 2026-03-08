@@ -19,7 +19,7 @@ from functools import partial
 from models import MultiStepLIFNeuron
 from models import SeqToANNContainerT, SeqToANNContainer
 
-__all__ = ['MaxFormer', 'maxformer_10_384', 'maxformer_10_512', 'maxformer_10_768']
+__all__ = ['MaxFormer', 'build_maxformer']
 
 
 def _trunc_normal_(tensor, mean=0., std=.02):
@@ -369,14 +369,19 @@ class MaxFormer(nn.Module):
         return x
 
 
-def maxformer_10_384(num_classes=1000, T=4, **kwargs):
-    return MaxFormer(T=T, embed_dims=384, mlp_ratios=4,
-                     in_channels=3, num_classes=num_classes, depths=10, **kwargs)
+def build_maxformer(config):
+    """Build a MaxFormer model from a config dict.
 
-def maxformer_10_512(num_classes=1000, T=4, **kwargs):
-    return MaxFormer(T=T, embed_dims=512, mlp_ratios=4,
-                     in_channels=3, num_classes=num_classes, depths=10, **kwargs)
-
-def maxformer_10_768(num_classes=1000, T=4, **kwargs):
-    return MaxFormer(T=T, embed_dims=768, mlp_ratios=4,
-                     in_channels=3, num_classes=num_classes, depths=10, **kwargs)
+    Config keys (from YAML):
+        embed_dims, mlp_ratios, depths
+    Runtime keys (merged by training script):
+        num_classes, T, in_channels
+    """
+    return MaxFormer(
+        T=config['T'],
+        embed_dims=config['embed_dims'],
+        mlp_ratios=config.get('mlp_ratios', 4),
+        in_channels=config.get('in_channels', 3),
+        num_classes=config['num_classes'],
+        depths=config.get('depths', 10),
+    )

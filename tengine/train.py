@@ -3,14 +3,18 @@ SparseSNN Training Script.
 
 Supports single-GPU and multi-GPU (DDP) training for all SNN models.
 
-Single GPU:
-    python tengine/train.py --model spikformer_8_384 --dataset cifar10 \
+Single GPU (ResNet, legacy):
+    python tengine/train.py --model sew_resnet18 --dataset cifar10 \
         --data-root ./data --gpu-ids 0
 
-Multi-GPU:
+Single GPU (Transformer, config-based):
+    python tengine/train.py --config configs/spikformer/spikformer_8_384.yaml \
+        --dataset cifar100 --data-root ./data --gpu-ids 0
+
+Multi-GPU (Transformer, config-based):
     torchrun --nproc_per_node=4 tengine/train.py \
-        --model spikformer_8_384 --dataset imagenet \
-        --data-root /data/imagenet --gpu-ids 0,1,2,3
+        --config configs/spikformer/spikformer_8_384.yaml \
+        --dataset imagenet --data-root /data/imagenet --gpu-ids 0,1,2,3
 """
 
 import os
@@ -32,16 +36,20 @@ from tengine.logger import setup_logger, TrainLogger
 from tengine.utils import (
     AverageMeter, accuracy, set_seed,
     save_checkpoint, load_checkpoint,
-    build_model, build_dataloaders, get_dataset_config, list_models,
+    build_model, build_model_from_config, load_model_config,
+    build_dataloaders, get_dataset_config, list_models,
 )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='SparseSNN Training')
 
-    # ---- Model ----
-    parser.add_argument('--model', type=str, required=True,
-                        help=f'Model name. Available: {list_models()}')
+    # ---- Model (two modes: --model for ResNets, --config for Transformers) ----
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--model', type=str, default=None,
+                       help='ResNet model name (e.g. sew_resnet18)')
+    group.add_argument('--config', type=str, default=None,
+                       help='Path to model YAML config (for transformer models)')
     parser.add_argument('--T', type=int, default=4,
                         help='Number of timesteps for SNN (default: 4)')
 
@@ -59,8 +67,8 @@ def parse_args():
     parser.add_argument('--batch-size', type=int, default=64,
                         help='Batch size per GPU')
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--weight-decay', type=float, default=5e-2)
-    parser.add_argument('--warmup-epochs', type=int, default=10)
+    parser.add_argument('--weight-decay', type=float, default=0)
+    parser.add_argument('--warmup-epochs', type=int, default=0)
     parser.add_argument('--min-lr', type=float, default=1e-5)
     parser.add_argument('--label-smoothing', type=float, default=0.1)
 
@@ -204,8 +212,44 @@ def main():
 
     set_seed(args.seed + rank)
 
+    # ---- Dataset ----
+    ds_cfg = get_dataset_config(args.dataset)
+    num_classes = ds_cfg['num_classes']
+    img_size = args.img_size or ds_cfg['img_size']
+    in_channels = ds_cfg['in_channels']
+
+    train_loader, val_loader = build_dataloaders(
+        args.dataset, args.data_root, args.batch_size,
+        img_size=img_size, num_workers=args.workers,
+        distributed=distributed,
+    )
+
+    # ---- Model ----
+    if args.config:
+        # Transformer models: load YAML config and merge runtime params
+        model_cfg = load_model_config(args.config)
+        model_cfg.update({
+            'num_classes': num_classes,
+            'T': args.T,
+            'img_size': img_size,
+            'in_channels': in_channels,
+        })
+        model = build_model_from_config(model_cfg)
+        model_name = os.path.splitext(os.path.basename(args.config))[0]
+    else:
+        # ResNet models: direct factory
+        model_kwargs = {'num_classes': num_classes}
+        if 'sew_' in args.model:
+            model_kwargs['T'] = args.T
+        else:
+            model_kwargs['time_window'] = args.T
+        model = build_model(args.model, **model_kwargs)
+        model_name = args.model
+
+    model = model.to(device)
+
     # ---- Output directory ----
-    run_name = f"{args.model}_{args.dataset}_bs{args.batch_size}_lr{args.lr}"
+    run_name = f"{model_name}_{args.dataset}_bs{args.batch_size}_lr{args.lr}"
     output_dir = os.path.join(args.output_dir, run_name)
     if is_main_process():
         os.makedirs(output_dir, exist_ok=True)
@@ -218,35 +262,13 @@ def main():
     if is_main_process():
         tlog.banner(f"Config: {vars(args)}")
 
-    # ---- Dataset ----
-    ds_cfg = get_dataset_config(args.dataset)
-    num_classes = ds_cfg['num_classes']
-    img_size = args.img_size or ds_cfg['img_size']
-
-    train_loader, val_loader = build_dataloaders(
-        args.dataset, args.data_root, args.batch_size,
-        img_size=img_size, num_workers=args.workers,
-        distributed=distributed,
-    )
-
-    # ---- Model ----
-    model_kwargs = {'num_classes': num_classes}
-    # Transformer models accept T; ResNet models use time_window
-    if 'resnet' in args.model or 'sew_' in args.model:
-        model_kwargs['time_window'] = args.T
-    else:
-        model_kwargs['T'] = args.T
-
-    model = build_model(args.model, **model_kwargs)
-    model = model.to(device)
-
     if distributed:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = DDP(model, device_ids=[local_rank])
 
     if is_main_process():
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        logger.info(f"Model: {args.model}  |  Params: {n_params:,}")
+        logger.info(f"Model: {model_name}  |  Params: {n_params:,}")
 
     # ---- Optimizer ----
     if args.opt == 'adamw':

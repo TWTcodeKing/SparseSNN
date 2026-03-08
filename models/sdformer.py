@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from functools import partial
 from .neurons import MultiStepLIFNeuron
 
-__all__ = ['SpikeDrivenTransformerV1', 'sdt_v1_8_384', 'sdt_v1_8_512', 'sdt_v1_8_768']
+__all__ = ['SpikeDrivenTransformerV1', 'build_sdformer']
 
 
 def _trunc_normal_(tensor, mean=0., std=.02):
@@ -249,23 +249,30 @@ class SpikeDrivenTransformerV1(nn.Module):
         return x
 
 
-def sdt_v1_8_384(num_classes=1000, T=4, **kwargs):
-    return SpikeDrivenTransformerV1(
-        embed_dim=[96, 192, 384], num_heads=6, mlp_ratios=4,
-        in_channels=3, num_classes=num_classes,
-        depths=8, sr_ratios=1, T=T, **kwargs
-    )
+def build_sdformer(config):
+    """Build a Spike-Driven Transformer V1 from a config dict.
 
-def sdt_v1_8_512(num_classes=1000, T=4, **kwargs):
+    Config keys (from YAML):
+        embed_dim (list), num_heads, mlp_ratios, depths, sr_ratios,
+        qkv_bias, drop_rate, attn_drop_rate, drop_path_rate
+    Runtime keys (merged by training script):
+        num_classes, T, img_size, in_channels
+    """
+    img_size = config.get('img_size', 224)
     return SpikeDrivenTransformerV1(
-        embed_dim=[128, 256, 512], num_heads=8, mlp_ratios=4,
-        in_channels=3, num_classes=num_classes,
-        depths=8, sr_ratios=1, T=T, **kwargs
-    )
-
-def sdt_v1_8_768(num_classes=1000, T=4, **kwargs):
-    return SpikeDrivenTransformerV1(
-        embed_dim=[192, 384, 768], num_heads=12, mlp_ratios=4,
-        in_channels=3, num_classes=num_classes,
-        depths=8, sr_ratios=1, T=T, **kwargs
+        img_size_h=img_size, img_size_w=img_size,
+        embed_dim=config['embed_dim'],
+        num_heads=config['num_heads'],
+        mlp_ratios=config.get('mlp_ratios', 4),
+        in_channels=config.get('in_channels', 3),
+        num_classes=config['num_classes'],
+        qkv_bias=config.get('qkv_bias', False),
+        qk_scale=config.get('qk_scale', None),
+        norm_layer=nn.LayerNorm,
+        depths=config.get('depths', 8),
+        sr_ratios=config.get('sr_ratios', 1),
+        T=config['T'],
+        drop_rate=config.get('drop_rate', 0.0),
+        attn_drop_rate=config.get('attn_drop_rate', 0.0),
+        drop_path_rate=config.get('drop_path_rate', 0.0),
     )

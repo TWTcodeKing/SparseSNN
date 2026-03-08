@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from functools import partial
 from .neurons import MultiStepLIFNeuron
 
-__all__ = ['QKFormer', 'qkformer_10_384', 'qkformer_10_512', 'qkformer_10_768']
+__all__ = ['QKFormer', 'build_qkformer']
 
 
 def _trunc_normal_(tensor, mean=0., std=.02):
@@ -374,26 +374,31 @@ class QKFormer(nn.Module):
         return x
 
 
-def qkformer_10_384(num_classes=1000, T=4, **kwargs):
-    return QKFormer(
-        T=T, img_size_h=224, img_size_w=224, patch_size=16,
-        embed_dims=384, num_heads=6, mlp_ratios=4,
-        in_channels=3, num_classes=num_classes,
-        depths=10, sr_ratios=1, **kwargs
-    )
+def build_qkformer(config):
+    """Build a QKFormer model from a config dict.
 
-def qkformer_10_512(num_classes=1000, T=4, **kwargs):
+    Config keys (from YAML):
+        embed_dims, num_heads, mlp_ratios, depths, patch_size, sr_ratios,
+        qkv_bias, drop_rate, attn_drop_rate, drop_path_rate
+    Runtime keys (merged by training script):
+        num_classes, T, img_size, in_channels
+    """
+    img_size = config.get('img_size', 224)
     return QKFormer(
-        T=T, img_size_h=224, img_size_w=224, patch_size=16,
-        embed_dims=512, num_heads=8, mlp_ratios=4,
-        in_channels=3, num_classes=num_classes,
-        depths=10, sr_ratios=1, **kwargs
-    )
-
-def qkformer_10_768(num_classes=1000, T=4, **kwargs):
-    return QKFormer(
-        T=T, img_size_h=224, img_size_w=224, patch_size=16,
-        embed_dims=768, num_heads=12, mlp_ratios=4,
-        in_channels=3, num_classes=num_classes,
-        depths=10, sr_ratios=1, **kwargs
+        T=config['T'],
+        img_size_h=img_size, img_size_w=img_size,
+        patch_size=config.get('patch_size', 16),
+        embed_dims=config['embed_dims'],
+        num_heads=config['num_heads'],
+        mlp_ratios=config.get('mlp_ratios', 4),
+        in_channels=config.get('in_channels', 3),
+        num_classes=config['num_classes'],
+        qkv_bias=config.get('qkv_bias', False),
+        qk_scale=config.get('qk_scale', None),
+        norm_layer=nn.LayerNorm,
+        depths=config.get('depths', 10),
+        sr_ratios=config.get('sr_ratios', 1),
+        drop_rate=config.get('drop_rate', 0.0),
+        attn_drop_rate=config.get('attn_drop_rate', 0.0),
+        drop_path_rate=config.get('drop_path_rate', 0.0),
     )

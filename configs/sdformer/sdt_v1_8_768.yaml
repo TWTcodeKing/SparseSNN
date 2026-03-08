@@ -1,0 +1,14 @@
+arch: sdformer
+
+embed_dim:
+  - 192
+  - 384
+  - 768
+num_heads: 12
+mlp_ratios: 4
+depths: 8
+sr_ratios: 1
+qkv_bias: false
+drop_rate: 0.0
+attn_drop_rate: 0.0
+drop_path_rate: 0.0

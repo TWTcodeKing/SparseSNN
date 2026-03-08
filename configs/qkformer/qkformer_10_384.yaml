@@ -1,0 +1,12 @@
+arch: qkformer
+
+embed_dims: 384
+num_heads: 6
+mlp_ratios: 4
+depths: 10
+patch_size: 16
+sr_ratios: 1
+qkv_bias: false
+drop_rate: 0.0
+attn_drop_rate: 0.0
+drop_path_rate: 0.0

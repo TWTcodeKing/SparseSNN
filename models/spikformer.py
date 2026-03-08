@@ -13,7 +13,7 @@ from functools import partial
 from models import MultiStepLIFNeuron
 from models import SeqToANNContainer
 
-__all__ = ['Spikformer', 'spikformer_8_512', 'spikformer_8_384', 'spikformer_8_768']
+__all__ = ['Spikformer', 'build_spikformer']
 
 
 def _to_2tuple(x):
@@ -268,29 +268,31 @@ class Spikformer(nn.Module):
         return x
 
 
-def spikformer_8_384(num_classes=1000, T=4, **kwargs):
-    return Spikformer(
-        img_size_h=224, img_size_w=224, patch_size=16,
-        embed_dims=384, num_heads=6, mlp_ratios=4,
-        in_channels=3, num_classes=num_classes, qkv_bias=False,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        depths=8, sr_ratios=1, T=T, **kwargs
-    )
+def build_spikformer(config):
+    """Build a Spikformer model from a config dict.
 
-def spikformer_8_512(num_classes=1000, T=4, **kwargs):
+    Config keys (from YAML):
+        embed_dims, num_heads, mlp_ratios, depths, patch_size, sr_ratios,
+        qkv_bias, drop_rate, attn_drop_rate, drop_path_rate
+    Runtime keys (merged by training script):
+        num_classes, T, img_size, in_channels
+    """
+    img_size = config.get('img_size', 224)
     return Spikformer(
-        img_size_h=224, img_size_w=224, patch_size=16,
-        embed_dims=512, num_heads=8, mlp_ratios=4,
-        in_channels=3, num_classes=num_classes, qkv_bias=False,
+        img_size_h=img_size, img_size_w=img_size,
+        patch_size=config.get('patch_size', 16),
+        embed_dims=config['embed_dims'],
+        num_heads=config['num_heads'],
+        mlp_ratios=config.get('mlp_ratios', 4),
+        in_channels=config.get('in_channels', 3),
+        num_classes=config['num_classes'],
+        qkv_bias=config.get('qkv_bias', False),
+        qk_scale=config.get('qk_scale', None),
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        depths=8, sr_ratios=1, T=T, **kwargs
-    )
-
-def spikformer_8_768(num_classes=1000, T=4, **kwargs):
-    return Spikformer(
-        img_size_h=224, img_size_w=224, patch_size=16,
-        embed_dims=768, num_heads=12, mlp_ratios=4,
-        in_channels=3, num_classes=num_classes, qkv_bias=False,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        depths=8, sr_ratios=1, T=T, **kwargs
+        depths=config.get('depths', 8),
+        sr_ratios=config.get('sr_ratios', 1),
+        T=config['T'],
+        drop_rate=config.get('drop_rate', 0.0),
+        attn_drop_rate=config.get('attn_drop_rate', 0.0),
+        drop_path_rate=config.get('drop_path_rate', 0.0),
     )

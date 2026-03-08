@@ -3,9 +3,13 @@ SparseSNN Evaluation Script.
 
 Evaluate a trained model checkpoint on a dataset.
 
-Usage:
-    python tengine/test.py --model spikformer_8_384 --dataset cifar10 \
+Usage (ResNet):
+    python tengine/test.py --model sew_resnet18 --dataset cifar10 \
         --data-root ./data --checkpoint ./output/.../best.pth --gpu-ids 0
+
+Usage (Transformer, config-based):
+    python tengine/test.py --config configs/spikformer/spikformer_8_384.yaml \
+        --dataset cifar10 --data-root ./data --checkpoint ./output/.../best.pth --gpu-ids 0
 """
 
 import os
@@ -13,22 +17,27 @@ import sys
 import argparse
 
 import torch
+import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from models import reset_net
-from tengine.logger import setup_logger, TrainLogger
+from tengine.logger import setup_logger
 from tengine.utils import (
     AverageMeter, accuracy, set_seed,
-    build_model, build_dataloaders, get_dataset_config, list_models,
+    build_model, build_model_from_config, load_model_config,
+    build_dataloaders, get_dataset_config,
 )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='SparseSNN Evaluation')
 
-    parser.add_argument('--model', type=str, required=True,
-                        help=f'Model name. Available: {list_models()}')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--model', type=str, default=None,
+                       help='ResNet model name (e.g. sew_resnet18)')
+    group.add_argument('--config', type=str, default=None,
+                       help='Path to model YAML config (for transformer models)')
     parser.add_argument('--T', type=int, default=4,
                         help='Number of timesteps for SNN')
     parser.add_argument('--dataset', type=str, default='cifar10',
@@ -93,6 +102,7 @@ def main():
     ds_cfg = get_dataset_config(args.dataset)
     num_classes = ds_cfg['num_classes']
     img_size = args.img_size or ds_cfg['img_size']
+    in_channels = ds_cfg['in_channels']
 
     _, val_loader = build_dataloaders(
         args.dataset, args.data_root, args.batch_size,
@@ -100,13 +110,24 @@ def main():
     )
 
     # ---- Model ----
-    model_kwargs = {'num_classes': num_classes}
-    if 'resnet' in args.model or 'sew_' in args.model:
-        model_kwargs['time_window'] = args.T
+    if args.config:
+        model_cfg = load_model_config(args.config)
+        model_cfg.update({
+            'num_classes': num_classes,
+            'T': args.T,
+            'img_size': img_size,
+            'in_channels': in_channels,
+        })
+        model = build_model_from_config(model_cfg)
+        model_name = os.path.splitext(os.path.basename(args.config))[0]
     else:
-        model_kwargs['T'] = args.T
-
-    model = build_model(args.model, **model_kwargs)
+        model_kwargs = {'num_classes': num_classes}
+        if 'sew_' in args.model:
+            model_kwargs['T'] = args.T
+        else:
+            model_kwargs['time_window'] = args.T
+        model = build_model(args.model, **model_kwargs)
+        model_name = args.model
 
     # ---- Load checkpoint ----
     ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
@@ -116,7 +137,7 @@ def main():
 
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(dash)
-    logger.info(f"Model: {args.model}  |  Params: {n_params:,}")
+    logger.info(f"Model: {model_name}  |  Params: {n_params:,}")
     logger.info(f"Dataset: {args.dataset}  |  Checkpoint: {args.checkpoint}")
     logger.info(dash)
 

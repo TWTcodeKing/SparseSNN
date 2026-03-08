@@ -1,0 +1,24 @@
+# Spikformer training recipe for ImageNet
+# Ref: Zhou et al., "Spikformer" (ICLR 2023)
+optimizer:
+  type: adamw
+  lr: 5e-4
+  weight_decay: 0.06
+  betas: [0.9, 0.999]
+scheduler:
+  type: cosine
+  warmup_epochs: 20
+  min_lr: 1e-6
+epochs: 310
+batch_size: 128
+augmentation:
+  auto_aug: true
+  cutout: false
+  mixup_alpha: 0.8
+  cutmix_alpha: 1.0
+  random_erasing: 0.25
+regularization:
+  label_smoothing: 0.1
+  drop_path_rate: 0.1
+snn:
+  T: 4

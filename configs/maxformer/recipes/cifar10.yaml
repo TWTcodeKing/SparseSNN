@@ -1,0 +1,23 @@
+# MaxFormer recipe for CIFAR-10
+# Ref: "Max-Former" (NeurIPS 2025)
+optimizer:
+  type: adamw
+  lr: 1e-4
+  weight_decay: 0.06
+  betas: [0.9, 0.999]
+scheduler:
+  type: cosine
+  warmup_epochs: 20
+  min_lr: 1e-6
+epochs: 300
+batch_size: 128
+augmentation:
+  auto_aug: true
+  cutout: true
+  mixup_alpha: 0.0
+  cutmix_alpha: 0.0
+regularization:
+  label_smoothing: 0.1
+  drop_path_rate: 0.0
+snn:
+  T: 4

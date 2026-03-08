@@ -37,8 +37,10 @@ from tengine.utils import (
     AverageMeter, accuracy, set_seed,
     save_checkpoint, load_checkpoint,
     build_model, build_model_from_config, load_model_config,
+    load_training_recipe,
     build_dataloaders, get_dataset_config, list_models,
 )
+from datasets.augmentation import mixup_data, cutmix_data, mixup_criterion
 
 
 def parse_args():
@@ -80,9 +82,25 @@ def parse_args():
                         choices=['adamw', 'sgd'])
     parser.add_argument('--momentum', type=float, default=0.9)
 
+    # ---- Augmentation ----
+    parser.add_argument('--mixup-alpha', type=float, default=0.0,
+                        help='MixUp alpha (0 = disabled)')
+    parser.add_argument('--cutmix-alpha', type=float, default=0.0,
+                        help='CutMix alpha (0 = disabled)')
+    parser.add_argument('--auto-aug', action='store_true', default=False,
+                        help='Use AutoAugment')
+    parser.add_argument('--cutout', action='store_true', default=False,
+                        help='Use Cutout (RandomErasing)')
+    parser.add_argument('--random-erasing', type=float, default=0.0,
+                        help='Random erasing probability')
+
     # ---- AMP ----
     parser.add_argument('--amp', action='store_true', default=False,
                         help='Use automatic mixed precision')
+
+    # ---- Recipe ----
+    parser.add_argument('--recipe', type=str, default='',
+                        help='Path to training recipe YAML (values serve as defaults)')
 
     # ---- Infrastructure ----
     parser.add_argument('--gpu-ids', type=str, default='0',
@@ -117,24 +135,48 @@ def build_scheduler(optimizer, warmup_epochs, total_epochs, min_lr, base_lr):
 # ---------------------------------------------------------------------------
 
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
-                    epoch, tlog, world_size):
+                    epoch, tlog, world_size, mixup_alpha=0.0, cutmix_alpha=0.0):
     model.train()
     losses = AverageMeter('Loss')
     top1 = AverageMeter('Acc@1')
     top5 = AverageMeter('Acc@5')
     total_steps = len(loader)
+    use_mix = mixup_alpha > 0 or cutmix_alpha > 0
 
     for step, (images, targets) in enumerate(loader):
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
+        # MixUp / CutMix
+        mix_active = False
+        if use_mix:
+            import random as _rnd
+            if mixup_alpha > 0 and cutmix_alpha > 0:
+                if _rnd.random() < 0.5:
+                    images, targets_a, targets_b, lam = mixup_data(images, targets, mixup_alpha)
+                else:
+                    images, targets_a, targets_b, lam = cutmix_data(images, targets, cutmix_alpha)
+                mix_active = True
+            elif mixup_alpha > 0:
+                images, targets_a, targets_b, lam = mixup_data(images, targets, mixup_alpha)
+                mix_active = True
+            elif cutmix_alpha > 0:
+                images, targets_a, targets_b, lam = cutmix_data(images, targets, cutmix_alpha)
+                mix_active = True
+
         if scaler is not None:
             with amp.autocast():
                 output = model(images)
-                loss = criterion(output, targets)
+                if mix_active:
+                    loss = mixup_criterion(criterion, output, targets_a, targets_b, lam)
+                else:
+                    loss = criterion(output, targets)
         else:
             output = model(images)
-            loss = criterion(output, targets)
+            if mix_active:
+                loss = mixup_criterion(criterion, output, targets_a, targets_b, lam)
+            else:
+                loss = criterion(output, targets)
 
         optimizer.zero_grad()
         if scaler is not None:
@@ -203,6 +245,23 @@ def evaluate(model, loader, criterion, device, world_size):
 def main():
     args = parse_args()
 
+    # ---- Apply recipe defaults (CLI args override recipe values) ----
+    if args.recipe:
+        recipe = load_training_recipe(args.recipe)
+        parser_defaults = {
+            'opt': 'adamw', 'lr': 1e-3, 'weight_decay': 0, 'momentum': 0.9,
+            'warmup_epochs': 0, 'min_lr': 1e-5, 'epochs': 200, 'batch_size': 64,
+            'label_smoothing': 0.1, 'T': 4, 'mixup_alpha': 0.0, 'cutmix_alpha': 0.0,
+            'auto_aug': False, 'cutout': False, 'random_erasing': 0.0,
+        }
+        for key, recipe_val in recipe.items():
+            if hasattr(args, key):
+                # Only apply recipe value if user didn't explicitly set this arg
+                current = getattr(args, key)
+                default = parser_defaults.get(key)
+                if current == default:
+                    setattr(args, key, recipe_val)
+
     # ---- Distributed setup ----
     rank, local_rank, world_size = setup_distributed()
     distributed = world_size > 1
@@ -225,6 +284,7 @@ def main():
         args.dataset, args.data_root, args.batch_size,
         img_size=img_size, num_workers=args.workers,
         distributed=distributed,
+        auto_aug=args.auto_aug, cutout=args.cutout,
     )
 
     # ---- Model ----
@@ -312,7 +372,9 @@ def main():
             tlog.epoch_start(epoch)
 
         train_m = train_one_epoch(model, train_loader, criterion, optimizer,
-                                  scaler, device, epoch, tlog, world_size)
+                                  scaler, device, epoch, tlog, world_size,
+                                  mixup_alpha=args.mixup_alpha,
+                                  cutmix_alpha=args.cutmix_alpha)
         val_m = evaluate(model, val_loader, criterion, device, world_size)
 
         scheduler.step()

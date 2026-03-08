@@ -82,6 +82,60 @@ def set_seed(seed):
 
 # ---- YAML config loading ----
 
+def load_training_recipe(recipe_path):
+    """Load a training recipe YAML file.
+
+    Returns a flat dict suitable for merging with argparse defaults.
+    Nested keys like optimizer.lr become top-level: {'opt': ..., 'lr': ..., ...}
+    """
+    with open(recipe_path, 'r') as f:
+        recipe = yaml.safe_load(f)
+
+    flat = {}
+    # Optimizer
+    opt = recipe.get('optimizer', {})
+    if 'type' in opt:
+        flat['opt'] = opt['type']
+    if 'lr' in opt:
+        flat['lr'] = float(opt['lr'])
+    if 'weight_decay' in opt:
+        flat['weight_decay'] = float(opt['weight_decay'])
+    if 'momentum' in opt:
+        flat['momentum'] = float(opt['momentum'])
+
+    # Scheduler
+    sched = recipe.get('scheduler', {})
+    if 'warmup_epochs' in sched:
+        flat['warmup_epochs'] = int(sched['warmup_epochs'])
+    if 'min_lr' in sched:
+        flat['min_lr'] = float(sched['min_lr'])
+
+    # Top-level
+    for key in ('epochs', 'batch_size'):
+        if key in recipe:
+            flat[key.replace('-', '_')] = recipe[key]
+
+    # Augmentation
+    aug = recipe.get('augmentation', {})
+    for key in ('auto_aug', 'cutout', 'mixup_alpha', 'cutmix_alpha', 'random_erasing'):
+        if key in aug:
+            flat[key] = aug[key]
+
+    # Regularization
+    reg = recipe.get('regularization', {})
+    if 'label_smoothing' in reg:
+        flat['label_smoothing'] = reg['label_smoothing']
+    if 'drop_path_rate' in reg:
+        flat['drop_path_rate'] = reg['drop_path_rate']
+
+    # SNN
+    snn = recipe.get('snn', {})
+    if 'T' in snn:
+        flat['T'] = snn['T']
+
+    return flat
+
+
 def load_model_config(config_path):
     """Load a model config from a YAML file.
 

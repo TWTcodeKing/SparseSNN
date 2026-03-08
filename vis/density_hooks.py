@@ -121,43 +121,76 @@ class DensityTracker:
                 self._register_ssa_hooks(child, full_name)
 
     def _make_conv_hook(self, name, layer):
-        """Create a hook for Conv layers that computes input spike density."""
+        """Create a hook for Conv layers that computes exact computation density.
+
+        For Conv2d: uses im2col (F.unfold) to count element-wise where BOTH
+        the unfolded input AND the weight are non-zero. This accounts for
+        padding zeros and per-receptive-field sparsity patterns.
+
+        For Conv1d: uses approximate method (mean(input!=0) * mean(weight!=0)),
+        which is exact for 1x1 kernels (no padding overlap).
+        """
         def hook_fn(module, inp, out):
             x = inp[0].detach()  # (T*B, C, H, W) or (T*B, C, N)
             weight = module.weight.detach()
 
-            # Input firing rate (fraction of non-zero elements)
-            input_nonzero = (x != 0).float()
-            density = input_nonzero.mean().item()
-
-            # Weight density (fraction of non-zero weights)
-            weight_nonzero_rate = (weight != 0).float().mean().item()
-            # True computation density = input_density * weight_density
-            # (but weights are almost always dense, so this ≈ input_density)
-            true_density = density * weight_nonzero_rate
-
-            # Spatial density map (averaged over batch and channels)
-            spatial_map = None
-            if x.dim() == 4:  # Conv2d: (TB, C, H, W)
-                spatial_density = input_nonzero.mean(dim=1)  # (TB, H, W)
-                spatial_map = spatial_density.mean(dim=0).cpu().numpy()  # (H, W)
-
-            # Compute total and effective ops
             if isinstance(module, nn.Conv2d):
+                # Exact im2col-based density computation
+                TB = x.shape[0]
                 kH, kW = module.kernel_size
                 C_in = module.in_channels
-                H_out, W_out = out.shape[2], out.shape[3]
                 C_out = module.out_channels
-                total = C_out * H_out * W_out * C_in * kH * kW * x.shape[0]
+                H_out, W_out = out.shape[2], out.shape[3]
+                K = C_in * kH * kW  # elements per receptive field
+
+                # Unfold input: (TB, C_in*kH*kW, L) where L = H_out * W_out
+                x_unfolded = F.unfold(x, kernel_size=(kH, kW),
+                                      padding=module.padding,
+                                      stride=module.stride)
+                L = x_unfolded.shape[2]
+
+                # Non-zero masks
+                x_nz = (x_unfolded != 0).float()  # (TB, K, L)
+                w_nz = (weight.view(C_out, -1) != 0).float()  # (C_out, K)
+
+                # Count effective ops: for each (b, l, c), count jointly non-zero
+                # x_nz[b].T @ w_nz.T → (L, C_out) per batch element
+                total_effective = 0
+                spatial_effective = torch.zeros(L, device=x.device)
+                for b in range(TB):
+                    joint = x_nz[b].T @ w_nz.T  # (L, C_out)
+                    total_effective += joint.sum().item()
+                    spatial_effective += joint.sum(dim=1)  # (L,)
+
+                total = TB * C_out * L * K
+                true_density = total_effective / total if total > 0 else 0.0
+                effective = int(total_effective)
+
+                # Spatial density map: per output position, normalized
+                spatial_total_per_pos = TB * C_out * K
+                spatial_density = (spatial_effective / spatial_total_per_pos).cpu().numpy()
+                spatial_map = spatial_density.reshape(H_out, W_out)
+
             elif isinstance(module, nn.Conv1d):
+                # Approximate (exact for 1x1 kernels used in this codebase)
+                input_density = (x != 0).float().mean().item()
+                weight_density = (weight != 0).float().mean().item()
+                true_density = input_density * weight_density
+
                 kW = module.kernel_size[0]
                 C_in = module.in_channels
-                N_out = out.shape[2]
                 C_out = module.out_channels
+                N_out = out.shape[2]
                 total = C_out * N_out * C_in * kW * x.shape[0]
+                effective = int(total * true_density)
+                spatial_map = None
             else:
+                input_density = (x != 0).float().mean().item()
+                weight_density = (weight != 0).float().mean().item()
+                true_density = input_density * weight_density
                 total = x.numel() * weight.shape[0]
-            effective = int(total * true_density)
+                effective = int(total * true_density)
+                spatial_map = None
 
             self.records[name].add(true_density, spatial_map, total, effective)
 

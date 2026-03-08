@@ -52,7 +52,10 @@ def parse_args():
                        help='Path to model YAML config (for transformer models)')
     parser.add_argument('--T', type=int, default=4,
                         help='Number of timesteps for SNN (default: 4)')
-
+    parser.add_argument('--zero-init-residual', action='store_true', default=False,
+                        help='Zero-initialize last BN in each residual branch (ResNets only)')
+    parser.add_argument('--connect-f', type=str, default="ADD",
+                        help='Add extra connection from block input to block output (ResNets only)')
     # ---- Dataset ----
     parser.add_argument('--dataset', type=str, default='cifar10',
                         choices=['cifar10', 'cifar100', 'imagenet', 'cifar10dvs'],
@@ -241,6 +244,8 @@ def main():
         model_kwargs = {'num_classes': num_classes}
         if 'sew_' in args.model:
             model_kwargs['T'] = args.T
+            model_kwargs['zero_init_residual'] = args.zero_init_residual
+            model_kwargs['connect_f'] = args.connect_f
         else:
             model_kwargs['time_window'] = args.T
         model = build_model(args.model, **model_kwargs)

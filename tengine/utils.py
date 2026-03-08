@@ -105,10 +105,22 @@ def load_training_recipe(recipe_path):
 
     # Scheduler
     sched = recipe.get('scheduler', {})
+    if 'type' in sched:
+        flat['sched'] = sched['type']
     if 'warmup_epochs' in sched:
         flat['warmup_epochs'] = int(sched['warmup_epochs'])
     if 'min_lr' in sched:
         flat['min_lr'] = float(sched['min_lr'])
+    if 'step_size' in sched:
+        flat['step_size'] = int(sched['step_size'])
+    if 'decay_rate' in sched:
+        flat['decay_rate'] = float(sched['decay_rate'])
+    if 'decay_epochs' in sched:
+        de = sched['decay_epochs']
+        if isinstance(de, list):
+            flat['decay_epochs'] = ','.join(str(e) for e in de)
+        else:
+            flat['decay_epochs'] = str(de)
 
     # Top-level
     for key in ('epochs', 'batch_size'):

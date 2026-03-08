@@ -82,6 +82,17 @@ def parse_args():
                         choices=['adamw', 'sgd'])
     parser.add_argument('--momentum', type=float, default=0.9)
 
+    # ---- Scheduler ----
+    parser.add_argument('--sched', type=str, default='cosine',
+                        choices=['cosine', 'step', 'multistep'],
+                        help='LR scheduler type')
+    parser.add_argument('--step-size', type=int, default=30,
+                        help='Epoch interval for StepLR decay')
+    parser.add_argument('--decay-rate', type=float, default=0.1,
+                        help='LR decay factor for step/multistep')
+    parser.add_argument('--decay-epochs', type=str, default='',
+                        help='Comma-separated milestone epochs for multistep (e.g. 100,150)')
+
     # ---- Augmentation ----
     parser.add_argument('--mixup-alpha', type=float, default=0.0,
                         help='MixUp alpha (0 = disabled)')
@@ -116,18 +127,61 @@ def parse_args():
 
 
 # ---------------------------------------------------------------------------
-# Cosine LR scheduler with linear warmup
+# LR scheduler with linear warmup
 # ---------------------------------------------------------------------------
 
-def build_scheduler(optimizer, warmup_epochs, total_epochs, min_lr, base_lr):
-    """Cosine annealing with linear warmup."""
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return epoch / max(1, warmup_epochs)
-        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-        import math
-        return max(min_lr / base_lr, 0.5 * (1.0 + math.cos(math.pi * progress)))
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+def build_scheduler(optimizer, args):
+    """Build LR scheduler with optional linear warmup.
+
+    Supported scheduler types (args.sched):
+        - 'cosine': CosineAnnealingLR (default for all SNN models)
+        - 'step':   StepLR with fixed step_size and gamma
+        - 'multistep': MultiStepLR with milestone epochs and gamma
+
+    When warmup_epochs > 0, a LinearLR warmup phase is prepended via
+    SequentialLR so the two phases compose cleanly.
+    """
+    import math
+    warmup_epochs = args.warmup_epochs
+    total_epochs = args.epochs
+    sched_type = getattr(args, 'sched', 'cosine')
+
+    # ---- Main scheduler (operates over post-warmup epochs) ----
+    after_epochs = max(1, total_epochs - warmup_epochs)
+
+    if sched_type == 'cosine':
+        main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=after_epochs, eta_min=args.min_lr)
+    elif sched_type == 'step':
+        step_size = getattr(args, 'step_size', 30)
+        decay_rate = getattr(args, 'decay_rate', 0.1)
+        main_scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=step_size, gamma=decay_rate)
+    elif sched_type == 'multistep':
+        decay_epochs = getattr(args, 'decay_epochs', [])
+        if isinstance(decay_epochs, str):
+            decay_epochs = [int(e) for e in decay_epochs.split(',') if e.strip()]
+        # Shift milestones by warmup offset since SequentialLR resets epoch count
+        milestones = [max(0, m - warmup_epochs) for m in decay_epochs]
+        decay_rate = getattr(args, 'decay_rate', 0.1)
+        main_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer, milestones=milestones, gamma=decay_rate)
+    else:
+        raise ValueError(f"Unknown scheduler type: {sched_type}")
+
+    # ---- Warmup phase ----
+    if warmup_epochs > 0:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-3, end_factor=1.0,
+            total_iters=warmup_epochs)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, main_scheduler],
+            milestones=[warmup_epochs])
+    else:
+        scheduler = main_scheduler
+
+    return scheduler
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +304,9 @@ def main():
         recipe = load_training_recipe(args.recipe)
         parser_defaults = {
             'opt': 'adamw', 'lr': 1e-3, 'weight_decay': 0, 'momentum': 0.9,
-            'warmup_epochs': 0, 'min_lr': 1e-5, 'epochs': 200, 'batch_size': 64,
+            'sched': 'cosine', 'warmup_epochs': 0, 'min_lr': 1e-5,
+            'step_size': 30, 'decay_rate': 0.1, 'decay_epochs': '',
+            'epochs': 200, 'batch_size': 64,
             'label_smoothing': 0.1, 'T': 4, 'mixup_alpha': 0.0, 'cutmix_alpha': 0.0,
             'auto_aug': False, 'cutout': False, 'random_erasing': 0.0,
         }
@@ -344,8 +400,7 @@ def main():
                                     lr=args.lr, momentum=args.momentum,
                                     weight_decay=args.weight_decay)
 
-    scheduler = build_scheduler(optimizer, args.warmup_epochs, args.epochs,
-                                args.min_lr, args.lr)
+    scheduler = build_scheduler(optimizer, args)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 

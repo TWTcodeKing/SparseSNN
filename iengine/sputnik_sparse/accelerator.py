@@ -121,6 +121,7 @@ class SputnikAccelerator(SparseAccelerator):
                     count += 1
             print(f"[SputnikAccelerator] Patched {count} SSA attention modules")
 
+        self.attach_profiler(model)
         return model
 
     def cleanup(self, model: nn.Module) -> nn.Module:
@@ -132,6 +133,7 @@ class SputnikAccelerator(SparseAccelerator):
         Returns:
             The model with all instrumentation removed.
         """
+        self.detach_profiler()
         # Restore all original forwards (Linear + SSA)
         n_restored = 0
         for module, original_forward in self._original_forwards.values():

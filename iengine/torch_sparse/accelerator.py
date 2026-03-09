@@ -52,6 +52,7 @@ class TorchSparseAccelerator(SparseAccelerator):
         if self._enable_attention:
             self._patch_ssa_modules(model)
 
+        self.attach_profiler(model)
         return model
 
     def _patch_linear_modules(self, model):
@@ -85,6 +86,7 @@ class TorchSparseAccelerator(SparseAccelerator):
 
     def cleanup(self, model):
         """Restore all original forward methods (Linear + SSA)."""
+        self.detach_profiler()
         for name, (module, original_forward) in self._original_forwards.items():
             module.forward = original_forward
         self._original_forwards.clear()

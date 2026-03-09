@@ -97,6 +97,7 @@ class TritonSparseAccelerator(SparseAccelerator):
               f"block_size={self._block_size}, "
               f"min_tensor_size={self._min_tensor_size}")
 
+        self.attach_profiler(model)
         return model
 
     def cleanup(self, model: nn.Module) -> nn.Module:
@@ -108,6 +109,7 @@ class TritonSparseAccelerator(SparseAccelerator):
         Returns:
             The model with all instrumentation removed.
         """
+        self.detach_profiler()
         # Restore all original forwards (Conv2d + SSA)
         num_restored = len(self._patched_modules)
         for module, original_forward in self._patched_modules:

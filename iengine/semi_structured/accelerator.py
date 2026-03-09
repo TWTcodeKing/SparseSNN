@@ -87,6 +87,7 @@ class SemiStructuredAccelerator(SparseAccelerator):
                 'weight_density': 0.5 if info['converted'] else 1.0,
             }
 
+        self.attach_profiler(model)
         self._prepared = True
         return model
 
@@ -99,6 +100,7 @@ class SemiStructuredAccelerator(SparseAccelerator):
         Returns:
             The model with original dense weights restored.
         """
+        self.detach_profiler()
         model = restore_dense(model)
         self._prepared = False
         return model

@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from models import reset_net
 from iengine.common.benchmark import SparseBenchmark, profile_layer_density
+from iengine.common.profiler import SparsityProfiler, export_benchmark_report
 from tengine.utils import (
     set_seed, build_model, build_model_from_config, load_model_config,
     build_dataloaders, get_dataset_config,
@@ -140,6 +141,8 @@ def parse_args():
                         help='Model names to test (default: all with checkpoints)')
     parser.add_argument('--profile-density', action='store_true',
                         help='Profile per-layer density before benchmarking')
+    parser.add_argument('--output-md', type=str, default='iengine/sparse_results.md',
+                        help='Output markdown file for benchmark results')
     return parser.parse_args()
 
 
@@ -164,6 +167,7 @@ def main():
 
     # Results table
     all_results = []
+    density_profiles = {}  # model_name -> profiler report
 
     print(f"\n{'='*80}")
     print(f"  Sparse Acceleration Benchmark — All Backends")
@@ -184,15 +188,37 @@ def main():
         model = model.to(device)
         model.eval()
 
-        # Optional density profiling
-        if args.profile_density:
-            print(f"\n  Profiling per-layer density...")
-            density_profile = profile_layer_density(
-                model, val_loader, device, max_samples=50, reset_fn=reset_fn
-            )
-            for lname, info in sorted(density_profile.items()):
-                print(f"    {lname:<50} {info['type']:<12} density={info['density']:.4f}")
-            reset_net(model)
+        # Density profiling (always run to collect sparsity data)
+        print(f"\n  Profiling per-layer activation density...")
+        profiler = SparsityProfiler()
+        profiler.attach(model)
+        # Run a few batches to collect density data
+        with torch.no_grad():
+            processed = 0
+            for images, targets in val_loader:
+                if processed >= 50:
+                    break
+                images = images.to(device, non_blocking=True)
+                _ = model(images)
+                reset_fn(model)
+                processed += images.size(0)
+        density_report = profiler.get_report()
+        density_profiles[model_name] = density_report
+        profiler.detach()
+        reset_net(model)
+
+        summary = density_report['summary']
+        print(f"    Overall density: {summary['overall_mean_density']:.4f} "
+              f"(sparsity: {summary['overall_sparsity']:.4f})")
+        print(f"    Sparse layers (<50%): {summary['sparse_layers']}/{summary['total_layers']}")
+        print(f"    Very sparse (<15%): {summary['very_sparse_layers']}/{summary['total_layers']}")
+
+        # Also export standalone density profile per model
+        density_md = os.path.join(os.path.dirname(args.output_md),
+                                  f'density_{model_name.lower().replace("-", "_")}.md')
+        profiler.export_report(density_md, model_name=model_name,
+                               extra_info=f'Dataset: **{args.dataset}**  |  Samples: **{processed}**')
+        print(f"    Density profile exported to {density_md}")
 
         # Dense baseline
         print(f"\n  Running dense baseline...")
@@ -234,10 +260,14 @@ def main():
                 result = SparseBenchmark.compare(dense_stats, sparse_stats, backend_name)
                 result['model'] = model_name
 
-                # Get backend-specific stats
+                # Get backend-specific stats (includes density from profiler)
                 try:
                     backend_stats = accel.get_stats()
                     result['backend_stats'] = backend_stats
+                    # Also collect the accelerator's own density report
+                    accel_density = accel.get_density_report()
+                    if accel_density['per_layer']:
+                        result['accel_density'] = accel_density
                 except Exception:
                     pass
 
@@ -253,7 +283,7 @@ def main():
         # Reset model state
         reset_net(model)
 
-    # Summary table
+    # Summary table (terminal)
     if all_results:
         print(f"\n\n{'='*90}")
         print(f"  SUMMARY: All Backends × All Models")
@@ -271,6 +301,15 @@ def main():
 
         print(f"{'='*90}\n")
 
+    # Export everything to markdown
+    export_benchmark_report(
+        all_results,
+        filepath=args.output_md,
+        dataset=args.dataset,
+        max_samples=args.max_samples,
+        density_profiles=density_profiles,
+    )
+    print(f"Full results exported to {args.output_md}")
     print("Done.")
 
 

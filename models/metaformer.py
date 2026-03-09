@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from functools import partial
 from models import MultiStepLIFNeuron
 
-__all__ = ['SpikeDrivenTransformerV2', 'build_sdformer2']
+__all__ = ['SpikeDrivenTransformerV2', 'build_metaformer']
 
 
 def _trunc_normal_(tensor, mean=0., std=.02):
@@ -343,7 +343,7 @@ class SpikeDrivenTransformerV2(nn.Module):
         return x
 
 
-def build_sdformer2(config):
+def build_metaformer(config):
     """Build a Spike-Driven Transformer V2 (Meta Spikformer) from a config dict.
 
     Config keys (from YAML):

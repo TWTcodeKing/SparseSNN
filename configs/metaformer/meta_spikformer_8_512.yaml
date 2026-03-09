@@ -1,10 +1,11 @@
-arch: sdformer
+arch: metaformer
 
 embed_dim:
-  - 192
-  - 384
-  - 768
-num_heads: 12
+  - 128
+  - 256
+  - 512
+  - 640
+num_heads: 8
 mlp_ratios: 4
 depths: 8
 sr_ratios: 1

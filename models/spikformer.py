@@ -49,25 +49,25 @@ class MLP(nn.Module):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        self.fc1_conv = nn.Conv2d(in_features, hidden_features, kernel_size=1, stride=1)
-        self.fc1_bn = nn.BatchNorm2d(hidden_features)
+        self.fc1_linear = nn.Linear(in_features, hidden_features)
+        self.fc1_bn = nn.BatchNorm1d(hidden_features)
         self.fc1_lif = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
 
-        self.fc2_conv = nn.Conv2d(hidden_features, out_features, kernel_size=1, stride=1)
-        self.fc2_bn = nn.BatchNorm2d(out_features)
+        self.fc2_linear = nn.Linear(hidden_features, out_features)
+        self.fc2_bn = nn.BatchNorm1d(out_features)
         self.fc2_lif = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
 
         self.c_hidden = hidden_features
         self.c_output = out_features
 
     def forward(self, x):
-        T, B, C, H, W = x.shape
-        x = self.fc1_conv(x.flatten(0, 1))
-        x = self.fc1_bn(x).reshape(T, B, self.c_hidden, H, W).contiguous()
+        T, B, N, C = x.shape
+        x = self.fc1_linear(x.flatten(0, 1))
+        x = self.fc1_bn(x.transpose(-1, -2)).transpose(-1,-2).reshape(T, B, N, self.c_hidden).contiguous()
         x = self.fc1_lif(x)
 
-        x = self.fc2_conv(x.flatten(0, 1))
-        x = self.fc2_bn(x).reshape(T, B, C, H, W).contiguous()
+        x = self.fc2_linear(x.flatten(0, 1))
+        x = self.fc2_bn(x.transpose(-1,-2)).transpose(-1,-2).reshape(T, B, N, C).contiguous()
         x = self.fc2_lif(x)
         return x
 
@@ -83,52 +83,51 @@ class SSA(nn.Module):
         self.num_heads = num_heads
         self.scale = 0.125
 
-        self.q_conv = nn.Conv1d(dim, dim, kernel_size=1, stride=1, bias=False)
+        self.q_linear = nn.Linear(dim, dim)
         self.q_bn = nn.BatchNorm1d(dim)
         self.q_lif = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
 
-        self.k_conv = nn.Conv1d(dim, dim, kernel_size=1, stride=1, bias=False)
+        self.k_linear = nn.Linear(dim, dim)
         self.k_bn = nn.BatchNorm1d(dim)
         self.k_lif = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
 
-        self.v_conv = nn.Conv1d(dim, dim, kernel_size=1, stride=1, bias=False)
+        self.v_linear = nn.Linear(dim, dim)
         self.v_bn = nn.BatchNorm1d(dim)
         self.v_lif = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
         self.attn_lif = MultiStepLIFNeuron(tau=2.0, v_threshold=0.5, detach_reset=True)
 
-        self.proj_conv = nn.Conv1d(dim, dim, kernel_size=1, stride=1)
+        self.proj_linear = nn.Linear(dim, dim)
         self.proj_bn = nn.BatchNorm1d(dim)
         self.proj_lif = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
 
-    def forward(self, x, res_attn):
-        T, B, C, H, W = x.shape
-        x = x.flatten(3)
-        T, B, C, N = x.shape
+    def forward(self, x):
+        T, B, N, C = x.shape
         x_for_qkv = x.flatten(0, 1)
+    
+        q_linear_out = self.q_linear(x_for_qkv)
+        q_linear_out = self.q_bn(q_linear_out.transpose(-1,-2)).transpose(-1,-2).reshape(T, B, N, C).contiguous()
+        q_linear_out = self.q_lif(q_linear_out)
+        q = q_linear_out.reshape(T, B, N, self.num_heads, C // self.num_heads).permute(0, 1, 3, 2, 4).contiguous()
 
-        q_conv_out = self.q_conv(x_for_qkv)
-        q_conv_out = self.q_bn(q_conv_out).reshape(T, B, C, N).contiguous()
-        q_conv_out = self.q_lif(q_conv_out)
-        q = q_conv_out.transpose(-1, -2).reshape(T, B, N, self.num_heads, C // self.num_heads).permute(0, 1, 3, 2, 4).contiguous()
+        k_linear_out = self.k_linear(x_for_qkv)
+        k_linear_out = self.k_bn(k_linear_out.transpose(-1,-2)).transpose(-1,-2).reshape(T, B, N, C).contiguous()
+        k_linear_out = self.k_lif(k_linear_out)
+        k = k_linear_out.reshape(T, B, N, self.num_heads, C // self.num_heads).permute(0, 1, 3, 2, 4).contiguous()
 
-        k_conv_out = self.k_conv(x_for_qkv)
-        k_conv_out = self.k_bn(k_conv_out).reshape(T, B, C, N).contiguous()
-        k_conv_out = self.k_lif(k_conv_out)
-        k = k_conv_out.transpose(-1, -2).reshape(T, B, N, self.num_heads, C // self.num_heads).permute(0, 1, 3, 2, 4).contiguous()
+        v_linear_out = self.v_linear(x_for_qkv)
+        v_linear_out = self.v_bn(v_linear_out.transpose(-1,-2)).transpose(-1,-2).reshape(T, B, N, C).contiguous()
+        v_linear_out = self.v_lif(v_linear_out)
+        v = v_linear_out.reshape(T, B, N, self.num_heads, C // self.num_heads).permute(0, 1, 3, 2, 4).contiguous()
 
-        v_conv_out = self.v_conv(x_for_qkv)
-        v_conv_out = self.v_bn(v_conv_out).reshape(T, B, C, N).contiguous()
-        v_conv_out = self.v_lif(v_conv_out)
-        v = v_conv_out.transpose(-1, -2).reshape(T, B, N, self.num_heads, C // self.num_heads).permute(0, 1, 3, 2, 4).contiguous()
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        x = attn @ v
 
-        x = k.transpose(-2, -1) @ v
-        x = (q @ x) * self.scale
-
-        x = x.transpose(3, 4).reshape(T, B, C, N).contiguous()
+        
+        x = x.transpose(2, 3).reshape(T, B, N, C).contiguous()
         x = self.attn_lif(x)
         x = x.flatten(0, 1)
-        x = self.proj_lif(self.proj_bn(self.proj_conv(x)).reshape(T, B, C, H, W))
-        return x, v
+        x = self.proj_lif(self.proj_bn(self.proj_linear(x).transpose(-1,-2)).transpose(-1,-2).reshape(T, B, N, C))
+        return x
 
 
 class Block(nn.Module):
@@ -140,11 +139,10 @@ class Block(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, drop=drop)
 
-    def forward(self, x, res_attn):
-        x_attn, attn = self.attn(x, res_attn)
-        x = x + x_attn
+    def forward(self, x):
+        x = x + self.attn(x)
         x = x + self.mlp(x)
-        return x, attn
+        return x
 
 
 class SPS(nn.Module):
@@ -161,22 +159,20 @@ class SPS(nn.Module):
         self.proj_conv = nn.Conv2d(in_channels, embed_dims // 8, kernel_size=3, stride=1, padding=1, bias=False)
         self.proj_bn = nn.BatchNorm2d(embed_dims // 8)
         self.proj_lif = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
         self.proj_conv1 = nn.Conv2d(embed_dims // 8, embed_dims // 4, kernel_size=3, stride=1, padding=1, bias=False)
         self.proj_bn1 = nn.BatchNorm2d(embed_dims // 4)
         self.proj_lif1 = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
-        self.maxpool1 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
         self.proj_conv2 = nn.Conv2d(embed_dims // 4, embed_dims // 2, kernel_size=3, stride=1, padding=1, bias=False)
         self.proj_bn2 = nn.BatchNorm2d(embed_dims // 2)
         self.proj_lif2 = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
-        self.maxpool2 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.maxpool2 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1,dilation=1,ceil_mode=False)
 
         self.proj_conv3 = nn.Conv2d(embed_dims // 2, embed_dims, kernel_size=3, stride=1, padding=1, bias=False)
         self.proj_bn3 = nn.BatchNorm2d(embed_dims)
         self.proj_lif3 = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
-        self.maxpool3 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.maxpool3 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1,dilation=1,ceil_mode=False)
 
         self.rpe_conv = nn.Conv2d(embed_dims, embed_dims, kernel_size=3, stride=1, padding=1, bias=False)
         self.rpe_bn = nn.BatchNorm2d(embed_dims)
@@ -188,31 +184,29 @@ class SPS(nn.Module):
         x = self.proj_conv(x.flatten(0, 1))
         x = self.proj_bn(x).reshape(T, B, -1, H, W).contiguous()
         x = self.proj_lif(x).flatten(0, 1).contiguous()
-        x = self.maxpool(x)
 
         x = self.proj_conv1(x)
-        x = self.proj_bn1(x).reshape(T, B, -1, H // 2, W // 2).contiguous()
+        x = self.proj_bn1(x).reshape(T, B, -1, H, W).contiguous()
         x = self.proj_lif1(x).flatten(0, 1).contiguous()
-        x = self.maxpool1(x)
 
         x = self.proj_conv2(x)
-        x = self.proj_bn2(x).reshape(T, B, -1, H // 4, W // 4).contiguous()
+        x = self.proj_bn2(x).reshape(T, B, -1, H, W).contiguous()
         x = self.proj_lif2(x).flatten(0, 1).contiguous()
         x = self.maxpool2(x)
 
         x = self.proj_conv3(x)
-        x = self.proj_bn3(x).reshape(T, B, -1, H // 8, W // 8).contiguous()
+        x = self.proj_bn3(x).reshape(T, B, -1, H // 2, W // 2).contiguous()
         x = self.proj_lif3(x).flatten(0, 1).contiguous()
         x = self.maxpool3(x)
 
-        x_feat = x.reshape(T, B, -1, H // 16, W // 16).contiguous()
+        x_feat = x.reshape(T, B, -1, H // 4, W // 4).contiguous()
         x = self.rpe_conv(x)
-        x = self.rpe_bn(x).reshape(T, B, -1, H // 16, W // 16).contiguous()
+        x = self.rpe_bn(x).reshape(T, B, -1, H // 4, W // 4).contiguous()
         x = self.rpe_lif(x)
         x = x + x_feat
 
-        H, W = H // self.patch_size[0], W // self.patch_size[1]
-        return x, (H, W)
+        x = x.flatten(-2).transpose(-1,-2)
+        return x
 
 
 class Spikformer(nn.Module):
@@ -255,11 +249,10 @@ class Spikformer(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward_features(self, x):
-        x, (H, W) = self.patch_embed(x)
-        attn = None
+        x = self.patch_embed(x)
         for blk in self.block:
-            x, attn = blk(x, attn)
-        return x.flatten(3).mean(3)
+            x = blk(x)
+        return x.mean(2)
 
     def forward(self, x):
         x = (x.unsqueeze(0)).repeat(self.T, 1, 1, 1, 1)

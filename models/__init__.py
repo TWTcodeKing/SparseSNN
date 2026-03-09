@@ -3,7 +3,7 @@ SparseSNN Model Zoo
 
 SNN foundation model implementations covering:
 - SNN ResNet variants: SEW-ResNet, MS-ResNet
-- SNN Transformer variants: Spikformer, Spike-Driven Transformer V1/V2, QKFormer, MaxFormer
+- SNN Transformer variants: Spikformer, Meta-SNN (Spike-Driven Transformer V2), QKFormer, MaxFormer
 
 All models use standalone spiking neurons (models.neurons) instead of spikingjelly
 where possible. Input format is standard (B, C, H, W) images; the temporal
@@ -32,16 +32,14 @@ from .msresnet import (
 
 # ---- SNN Transformer variants (config-based builders) ----
 from .spikformer import Spikformer, build_spikformer
-from .sdformer import SpikeDrivenTransformerV1, build_sdformer
-from .sdformer2 import SpikeDrivenTransformerV2, build_sdformer2
+from .metaformer import SpikeDrivenTransformerV2, build_metaformer
 from .qkformer import QKFormer, build_qkformer
 from .maxformer import MaxFormer, build_maxformer
 
 # arch name -> build function mapping
 ARCH_BUILDERS = {
     'spikformer': build_spikformer,
-    'sdformer': build_sdformer,
-    'sdformer2': build_sdformer2,
+    'metaformer': build_metaformer,
     'qkformer': build_qkformer,
     'maxformer': build_maxformer,
 }

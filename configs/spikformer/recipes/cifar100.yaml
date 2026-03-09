@@ -7,9 +7,9 @@ optimizer:
   betas: [0.9, 0.999]
 scheduler:
   type: cosine
-  warmup_epochs: 20
+  warmup_epochs: 10
   min_lr: 1e-6
-epochs: 300
+epochs: 150
 batch_size: 128
 augmentation:
   auto_aug: true

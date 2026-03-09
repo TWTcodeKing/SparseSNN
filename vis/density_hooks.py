@@ -227,22 +227,36 @@ class DensityTracker:
             if q_key not in self._attn_captures:
                 return
 
-            # Q, K, V are spike outputs from LIF: shape (T, B, C, N) for 1d
-            q_spike = self._attn_captures[q_key]  # (T, B, C, N)
+            # Q, K, V are spike outputs from LIF.
+            # Shape may be (T, B, C, N) or (T, B, N, C) depending on the model.
+            q_spike = self._attn_captures[q_key]
             k_spike = self._attn_captures[k_key]
             v_spike = self._attn_captures[v_key]
 
-            T, B, C, N = q_spike.shape
+            dim = ssa_module.dim
             num_heads = ssa_module.num_heads
-            d_head = C // num_heads
+            d_head = dim // num_heads
 
-            # Reshape to multi-head format: (T, B, H, N, d_head)
-            q = q_spike.transpose(-1, -2).reshape(T, B, N, num_heads, d_head)\
-                .permute(0, 1, 3, 2, 4)
-            k = k_spike.transpose(-1, -2).reshape(T, B, N, num_heads, d_head)\
-                .permute(0, 1, 3, 2, 4)
-            v = v_spike.transpose(-1, -2).reshape(T, B, N, num_heads, d_head)\
-                .permute(0, 1, 3, 2, 4)
+            # Detect layout: check if last dim == embed_dim (T,B,N,C) or
+            # second-to-last dim == embed_dim (T,B,C,N)
+            if q_spike.shape[-1] == dim:
+                # (T, B, N, C) layout — e.g. Spikformer
+                T, B, N, C = q_spike.shape
+                q = q_spike.reshape(T, B, N, num_heads, d_head)\
+                    .permute(0, 1, 3, 2, 4)
+                k = k_spike.reshape(T, B, N, num_heads, d_head)\
+                    .permute(0, 1, 3, 2, 4)
+                v = v_spike.reshape(T, B, N, num_heads, d_head)\
+                    .permute(0, 1, 3, 2, 4)
+            else:
+                # (T, B, C, N) layout
+                T, B, C, N = q_spike.shape
+                q = q_spike.transpose(-1, -2).reshape(T, B, N, num_heads, d_head)\
+                    .permute(0, 1, 3, 2, 4)
+                k = k_spike.transpose(-1, -2).reshape(T, B, N, num_heads, d_head)\
+                    .permute(0, 1, 3, 2, 4)
+                v = v_spike.transpose(-1, -2).reshape(T, B, N, num_heads, d_head)\
+                    .permute(0, 1, 3, 2, 4)
 
             # --- K^T @ V density ---
             # K: (T,B,H,N,d), V: (T,B,H,N,d)

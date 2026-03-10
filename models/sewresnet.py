@@ -8,7 +8,7 @@ Original uses spikingjelly - replaced with standalone neurons/layers.
 
 import torch
 import torch.nn as nn
-from models import MultiStepIFNeuron
+from models import MultiStepIFNeuron, MultiStepLIFNeuron
 from models import SeqToANNContainer, SeqToANNContainerT
 
 __all__ = ['SEWResNet', 'sew_resnet18', 'sew_resnet34', 'sew_resnet50',
@@ -69,23 +69,24 @@ class BasicBlock(nn.Module):
 class Bottleneck(nn.Module):
     expansion = 4
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
+    def __init__(self, inplanes, planes, neuron_type="if", stride=1, downsample=None, groups=1,
                  base_width=64, dilation=1, norm_layer=None, connect_f=None):
         super().__init__()
         self.connect_f = connect_f
+        self.neuron_type = neuron_type
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         width = int(planes * (base_width / 64.)) * groups
 
         self.conv1 = SeqToANNContainer(conv1x1(inplanes, width), norm_layer(width))
-        self.sn1 = MultiStepIFNeuron(detach_reset=True)
+        self.sn1 = MultiStepIFNeuron(detach_reset=True) if self.neuron_type == "if" else MultiStepLIFNeuron(detach_reset=True)
 
         self.conv2 = SeqToANNContainer(conv3x3(width, width, stride, groups, dilation), norm_layer(width))
-        self.sn2 = MultiStepIFNeuron(detach_reset=True)
+        self.sn2 = MultiStepIFNeuron(detach_reset=True) if self.neuron_type == "if" else MultiStepLIFNeuron(detach_reset=True)
 
         self.conv3 = SeqToANNContainer(conv1x1(width, planes * self.expansion), norm_layer(planes * self.expansion))
         self.downsample = downsample
-        self.sn3 = MultiStepIFNeuron(detach_reset=True)
+        self.sn3 = MultiStepIFNeuron(detach_reset=True) if self.neuron_type == "if" else MultiStepLIFNeuron(detach_reset=True)
 
     def forward(self, x):
         identity = x
@@ -120,7 +121,7 @@ def zero_init_blocks(net, connect_f):
 
 
 class SEWResNet(nn.Module):
-    def __init__(self, block, layers, in_channels,num_classes=1000, zero_init_residual=False,
+    def __init__(self, block, layers, in_channels,neuron_type="lif",num_classes=1000, zero_init_residual=False,
                  groups=1, width_per_group=64, replace_stride_with_dilation=None,
                  norm_layer=None, T=4, connect_f=None):
         super().__init__()
@@ -135,10 +136,10 @@ class SEWResNet(nn.Module):
             replace_stride_with_dilation = [False, False, False]
         self.groups = groups
         self.base_width = width_per_group
-
+        self.neuron_type = neuron_type
         self.conv1 = nn.Conv2d(in_channels, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = norm_layer(self.inplanes)
-        self.sn1 = MultiStepIFNeuron(detach_reset=True)
+        self.sn1 = MultiStepIFNeuron(detach_reset=True) if neuron_type == "if" else MultiStepLIFNeuron(detach_reset=True)
         self.maxpool = SeqToANNContainer(nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
 
         self.layer1 = self._make_layer(block, 64, layers[0], connect_f=connect_f)
@@ -174,14 +175,14 @@ class SEWResNet(nn.Module):
                     conv1x1(self.inplanes, planes * block.expansion, stride),
                     norm_layer(planes * block.expansion),
                 ),
-                MultiStepIFNeuron(detach_reset=True)
+                MultiStepIFNeuron(detach_reset=True) if self.neuron_type == "if" else MultiStepLIFNeuron(detach_reset=True)
             )
         layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample, self.groups,
+        layers.append(block(self.inplanes, planes, self.neuron_type, stride, downsample, self.groups,
                             self.base_width, previous_dilation, norm_layer, connect_f))
         self.inplanes = planes * block.expansion
         for _ in range(1, blocks):
-            layers.append(block(self.inplanes, planes, groups=self.groups,
+            layers.append(block(self.inplanes, planes, self.neuron_type,groups=self.groups,
                                 base_width=self.base_width, dilation=self.dilation,
                                 norm_layer=norm_layer, connect_f=connect_f))
         return nn.Sequential(*layers)

@@ -1,0 +1,24 @@
+# Spikformer training recipe for CIFAR-10-DVS
+# Ref: Zhou et al., "Spikformer" (ICLR 2023)
+optimizer:
+  type: SGD
+  lr: 0.001
+  weight_decay: 0
+  momentum: 0.9
+scheduler:
+  type: step
+  step_size: 64
+  warmup_epochs: 0
+epochs: 192
+batch_size: 16
+augmentation:
+  auto_aug: false
+  cutout: false
+  mixup_alpha: 0.0
+  cutmix_alpha: 0.0
+  random_erasing: 0.0
+regularization:
+  label_smoothing: 0.0
+  drop_path_rate: 0.0
+snn:
+  T: 16

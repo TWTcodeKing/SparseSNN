@@ -27,7 +27,7 @@ def conv1x1(in_planes, out_planes, stride=1):
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
+    def __init__(self, inplanes, planes, neuron_type="lif",stride=1, downsample=None, groups=1,
                  base_width=64, dilation=1, norm_layer=None, connect_f=None):
         super().__init__()
         self.connect_f = connect_f
@@ -38,14 +38,14 @@ class BasicBlock(nn.Module):
             conv3x3(inplanes, planes, stride),
             norm_layer(planes)
         )
-        self.sn1 = MultiStepIFNeuron(detach_reset=True)
+        self.sn1 = MultiStepIFNeuron(detach_reset=True) if neuron_type == "if" else MultiStepLIFNeuron(detach_reset=True)
 
         self.conv2 = SeqToANNContainer(
             conv3x3(planes, planes),
             norm_layer(planes)
         )
         self.downsample = downsample
-        self.sn2 = MultiStepIFNeuron(detach_reset=True)
+        self.sn2 = MultiStepIFNeuron(detach_reset=True) if neuron_type == "if" else MultiStepLIFNeuron(detach_reset=True)
 
     def forward(self, x):
         identity = x

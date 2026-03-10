@@ -17,7 +17,8 @@ from spikingjelly.datasets import split_to_train_test_set
 
 def cifar10dvs_dataloaders(data_root, batch_size, frames_number=16,
                            split_by='number', train_ratio=0.9,
-                           num_workers=4, distributed=False):
+                           num_workers=4, distributed=False, 
+                           auto_aug=False,cutout=False):
     """
     Returns (train_loader, test_loader) for CIFAR10-DVS.
 

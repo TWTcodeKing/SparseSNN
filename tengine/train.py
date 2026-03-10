@@ -358,6 +358,7 @@ def main():
     else:
         # ResNet models: direct factory
         model_kwargs = {'num_classes': num_classes}
+        model_kwargs = {'in_channels': in_channels}
         if 'sew_' in args.model:
             model_kwargs['T'] = args.T
             model_kwargs['zero_init_residual'] = args.zero_init_residual

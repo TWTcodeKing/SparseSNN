@@ -120,7 +120,7 @@ def zero_init_blocks(net, connect_f):
 
 
 class SEWResNet(nn.Module):
-    def __init__(self, block, layers, num_classes=1000, zero_init_residual=False,
+    def __init__(self, block, layers, in_channels,num_classes=1000, zero_init_residual=False,
                  groups=1, width_per_group=64, replace_stride_with_dilation=None,
                  norm_layer=None, T=4, connect_f=None):
         super().__init__()
@@ -136,7 +136,7 @@ class SEWResNet(nn.Module):
         self.groups = groups
         self.base_width = width_per_group
 
-        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
+        self.conv1 = nn.Conv2d(in_channels, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = norm_layer(self.inplanes)
         self.sn1 = MultiStepIFNeuron(detach_reset=True)
         self.maxpool = SeqToANNContainer(nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
@@ -187,9 +187,17 @@ class SEWResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = x.unsqueeze(0).repeat(self.T, 1, 1, 1, 1)
+        if len(x.shape) == 5:
+            B,T,C,H,W = x.shape
+            x = x.transpose(0,1).contiguous() # B,T,C,H,W -> T,B,C,H,W
+            x = x.flatten(0,1)
+            x = self.conv1(x)
+            x = self.bn1(x)
+            x = x.view(T, B, -1, H//2, W//2)
+        else:
+            x = self.conv1(x)
+            x = self.bn1(x)
+            x = x.unsqueeze(0).repeat(self.T, 1, 1, 1, 1)
         x = self.sn1(x)
         x = self.maxpool(x)
         x = self.layer1(x)

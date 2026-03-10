@@ -255,7 +255,10 @@ class Spikformer(nn.Module):
         return x.mean(2)
 
     def forward(self, x):
-        x = (x.unsqueeze(0)).repeat(self.T, 1, 1, 1, 1)
+        if len(x.shape) == 4:
+            x = (x.unsqueeze(0)).repeat(self.T, 1, 1, 1, 1)
+        else:
+            x = x.transpose(0,1).continuous()
         x = self.forward_features(x)
         x = self.head(x.mean(0))
         return x

@@ -54,13 +54,13 @@ class BasicBlock18(nn.Module):
 class MSResNet18(nn.Module):
     """MS-ResNet for ResNet-18/34 configuration."""
 
-    def __init__(self, block, num_block, num_classes=1000, time_window=None):
+    def __init__(self, block, num_block, in_channels, num_classes=1000, time_window=None):
         super().__init__()
         self.time_window = time_window or _TIME_WINDOW
         self.in_channels = 64
 
         self.conv1 = SeqToANNContainer(
-            nn.Conv2d(3, 64, kernel_size=7, padding=3, bias=False, stride=2),
+            nn.Conv2d(in_channels, 64, kernel_size=7, padding=3, bias=False, stride=2),
             nn.BatchNorm2d(64),
         )
         self.sn_out = MultiStepLIFNeuron(tau=4, v_threshold=0.5, surrogate="gate",detach_reset=True)
@@ -135,13 +135,13 @@ class BasicBlock104(nn.Module):
 class MSResNet104(nn.Module):
     """MS-ResNet-104: deeper variant with 3-conv stem."""
 
-    def __init__(self, block, num_block, num_classes=1000, time_window=None):
+    def __init__(self, block, num_block, in_channels,num_classes=1000, time_window=None):
         super().__init__()
         self.time_window = time_window or _TIME_WINDOW
         self.in_channels = 64
 
         self.conv1 = SeqToANNContainer(
-            nn.Conv2d(3, 64, kernel_size=3, padding=1, stride=2),
+            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1, stride=2),
             nn.Conv2d(64, 64, kernel_size=3, padding=1, stride=1),
             nn.Conv2d(64, 64, kernel_size=3, padding=1, stride=1),
             nn.BatchNorm2d(64),
@@ -180,10 +180,10 @@ class MSResNet104(nn.Module):
 
 
 def ms_resnet18(num_classes=1000, time_window=6, **kwargs):
-    return MSResNet18(BasicBlock18, [2, 2, 2, 2], num_classes=num_classes, time_window=time_window)
+    return MSResNet18(BasicBlock18, [2, 2, 2, 2], **kwargs)
 
 def ms_resnet34(num_classes=1000, time_window=6, **kwargs):
-    return MSResNet18(BasicBlock18, [3, 4, 6, 3], num_classes=num_classes, time_window=time_window)
+    return MSResNet18(BasicBlock18, [3, 4, 6, 3], **kwargs)
 
 def ms_resnet104(num_classes=1000, time_window=6, **kwargs):
-    return MSResNet104(BasicBlock104, [3, 8, 32, 8], num_classes=num_classes, time_window=time_window)
+    return MSResNet104(BasicBlock104, [3, 8, 32, 8], **kwargs)

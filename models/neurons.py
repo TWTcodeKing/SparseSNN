@@ -21,7 +21,7 @@ class ATan(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
         ctx.save_for_backward(x)
-        return x.ge(0.0).float()
+        return x.ge(0.0).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -38,7 +38,7 @@ class Sigmoid(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
         ctx.save_for_backward(x)
-        return x.ge(0.0).float()
+        return x.ge(0.0).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -56,12 +56,12 @@ class GateGrad(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
         ctx.save_for_backward(x)
-        return x.ge(0.0).float()
+        return x.ge(0.0).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
         x, = ctx.saved_tensors
-        grad = grad_output * (x.abs() < GateGrad.lens).float() / (2 * GateGrad.lens)
+        grad = grad_output * (x.abs() < GateGrad.lens).to(x.dtype) / (2 * GateGrad.lens)
         return grad
 
 
@@ -97,13 +97,19 @@ class LIFNeuron(nn.Module):
         v_reset: reset voltage after spike (None for soft reset), default 0.0
         surrogate: surrogate gradient function name, default 'atan'
         detach_reset: whether to detach reset in backward, default False
+        learnable_params: if True, tau and v_threshold become nn.Parameter
+            (learnable via backprop). Default False preserves original behavior.
     """
 
     def __init__(self, tau=2.0, v_threshold=1.0, v_reset=0.0,
-                 surrogate='atan', detach_reset=False):
+                 surrogate='atan', detach_reset=False, learnable_params=False):
         super().__init__()
-        self.tau = tau
-        self.v_threshold = v_threshold
+        if learnable_params:
+            self.tau = nn.Parameter(torch.tensor(float(tau)))
+            self.v_threshold = nn.Parameter(torch.tensor(float(v_threshold)))
+        else:
+            self.tau = tau
+            self.v_threshold = v_threshold
         self.v_reset = v_reset
         self.surrogate = surrogate
         self.detach_reset = detach_reset
@@ -187,9 +193,11 @@ class MultiStepLIFNeuron(nn.Module):
     """
 
     def __init__(self, tau=2.0, v_threshold=1.0, v_reset=0.0,
-                 surrogate='sigmoid', detach_reset=False, backend='torch'):
+                 surrogate='sigmoid', detach_reset=False, backend='torch',
+                 learnable_params=False):
         super().__init__()
-        self.neuron = LIFNeuron(tau, v_threshold, v_reset, surrogate, detach_reset)
+        self.neuron = LIFNeuron(tau, v_threshold, v_reset, surrogate, detach_reset,
+                                learnable_params=learnable_params)
 
     def reset(self):
         self.neuron.reset()

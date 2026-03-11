@@ -1,0 +1,59 @@
+# Spikformer training recipe: SR-STE progressive 2:4 structured sparse training
+#
+# Trains Spikformer with SR-STE (Sparse-Refined Straight-Through Estimator)
+# regularization to nudge Linear layer weights toward the 2:4 sparsity pattern.
+# After training, hard 2:4 projection + SparseSemiStructuredTensor conversion
+# can be applied with minimal accuracy loss via:
+#
+#   python -m iengine.structured_sparse.semi_structured_path \
+#       --checkpoint output/.../best.pth \
+#       --config configs/spikformer/spikformer_cifar.yaml \
+#       --dataset cifar100 --data-root /home/twt/datasets/
+#
+# Usage:
+#   uv run tengine/train.py \
+#       --config configs/spikformer/spikformer_cifar.yaml \
+#       --dataset cifar100 --data-root /home/twt/datasets/ \
+#       --recipe configs/spikformer/recipes/structured_sparse.yaml \
+#       --gpu-ids 0
+#
+# The recipe sets defaults; CLI flags override them.  Use --structured-sparse
+# on the command line or rely on the structured_sparse section below which is
+# read by train.py's recipe-loading logic when those args are at their defaults.
+#
+# Note: learnable_params=true makes tau and v_threshold of each LIF neuron
+# trainable nn.Parameters.  This allows the network to adapt its temporal
+# dynamics in conjunction with the weight sparsity regularization.
+
+optimizer:
+  type: adamw
+  lr: 1e-4
+  weight_decay: 0.06
+
+scheduler:
+  type: cosine
+  warmup_epochs: 10
+  min_lr: 1e-6
+
+epochs: 200
+batch_size: 128
+
+augmentation:
+  auto_aug: true
+  cutout: false
+  mixup_alpha: 0.0
+  cutmix_alpha: 0.0
+  random_erasing: 0.0
+
+regularization:
+  label_smoothing: 0.1
+
+snn:
+  T: 4
+  learnable_params: true
+
+structured_sparse:
+  enabled: true
+  sr_lambda: 0.01
+  start_epoch: 50
+  end_epoch: 150

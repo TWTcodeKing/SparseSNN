@@ -123,6 +123,19 @@ def parse_args():
     parser.add_argument('--resume', type=str, default='',
                         help='Path to checkpoint to resume from')
 
+    # ---- Structured Sparse Training (SR-STE 2:4) ----
+    parser.add_argument('--structured-sparse', action='store_true', default=False,
+                        help='Enable SR-STE 2:4 structured sparsity regularization')
+    parser.add_argument('--sr-lambda', type=float, default=0.01,
+                        help='SR-STE regularization strength (default: 0.01)')
+    parser.add_argument('--sr-start-epoch', type=int, default=50,
+                        help='Epoch at which SR-STE regularization begins (default: 50)')
+    parser.add_argument('--sr-end-epoch', type=int, default=150,
+                        help='Epoch at which SR-STE lambda reaches target (default: 150)')
+    # ---- Learnable neuron parameters ----
+    parser.add_argument('--learnable-params', action='store_true', default=False,
+                        help='Make tau and v_threshold of LIF neurons learnable')
+
     return parser.parse_args()
 
 
@@ -189,13 +202,27 @@ def build_scheduler(optimizer, args):
 # ---------------------------------------------------------------------------
 
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
-                    epoch, tlog, world_size, mixup_alpha=0.0, cutmix_alpha=0.0):
+                    epoch, tlog, world_size, mixup_alpha=0.0, cutmix_alpha=0.0,
+                    structured_sparse=False, sr_lambda=0.0):
+    """Train one epoch.
+
+    Args:
+        structured_sparse: If True, adds SR-STE 2:4 regularization to task loss.
+        sr_lambda: Current regularization coefficient (computed by caller from
+            ProgressiveSparsityScheduler). Only used when structured_sparse=True.
+    """
     model.train()
     losses = AverageMeter('Loss')
     top1 = AverageMeter('Acc@1')
     top5 = AverageMeter('Acc@5')
     total_steps = len(loader)
     use_mix = mixup_alpha > 0 or cutmix_alpha > 0
+
+    # Import SR-STE helper only when needed (avoids import cost for normal runs)
+    if structured_sparse and sr_lambda > 0:
+        from models.structured_training import sr_ste_regularizer
+    else:
+        sr_ste_regularizer = None
 
     for step, (images, targets) in enumerate(loader):
         images = images.to(device, non_blocking=True)
@@ -222,15 +249,22 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
             with amp.autocast():
                 output = model(images)
                 if mix_active:
-                    loss = mixup_criterion(criterion, output, targets_a, targets_b, lam)
+                    task_loss = mixup_criterion(criterion, output, targets_a, targets_b, lam)
                 else:
-                    loss = criterion(output, targets)
+                    task_loss = criterion(output, targets)
         else:
             output = model(images)
             if mix_active:
-                loss = mixup_criterion(criterion, output, targets_a, targets_b, lam)
+                task_loss = mixup_criterion(criterion, output, targets_a, targets_b, lam)
             else:
-                loss = criterion(output, targets)
+                task_loss = criterion(output, targets)
+
+        # SR-STE regularization: adds ||W - project_2_4(W)||^2 penalty
+        if sr_ste_regularizer is not None:
+            sr_loss = sr_ste_regularizer(model, sr_lambda)
+            loss = task_loss + sr_loss
+        else:
+            loss = task_loss
 
         optimizer.zero_grad()
         if scaler is not None:
@@ -309,6 +343,10 @@ def main():
             'epochs': 200, 'batch_size': 64,
             'label_smoothing': 0.1, 'T': 4, 'mixup_alpha': 0.0, 'cutmix_alpha': 0.0,
             'auto_aug': False, 'cutout': False, 'random_erasing': 0.0,
+            # structured sparse defaults
+            'structured_sparse': False, 'sr_lambda': 0.01,
+            'sr_start_epoch': 50, 'sr_end_epoch': 150,
+            'learnable_params': False,
         }
         for key, recipe_val in recipe.items():
             if hasattr(args, key):
@@ -344,6 +382,7 @@ def main():
     )
 
     # ---- Model ----
+    learnable_params = getattr(args, 'learnable_params', False)
     if args.config:
         # Transformer models: load YAML config and merge runtime params
         model_cfg = load_model_config(args.config)
@@ -353,6 +392,8 @@ def main():
             'img_size': img_size,
             'in_channels': in_channels,
         })
+        if learnable_params:
+            model_cfg['learnable_params'] = True
         model = build_model_from_config(model_cfg)
         model_name = os.path.splitext(os.path.basename(args.config))[0]
     else:
@@ -417,6 +458,19 @@ def main():
         if is_main_process():
             logger.info(f"Resumed from epoch {start_epoch}, best_acc={best_acc:.2f}")
 
+    # ---- Structured sparse scheduler (SR-STE) ----
+    structured_sparse = getattr(args, 'structured_sparse', False)
+    sr_scheduler = None
+    if structured_sparse:
+        from models.structured_training import ProgressiveSparsityScheduler
+        sr_scheduler = ProgressiveSparsityScheduler(
+            start_epoch=getattr(args, 'sr_start_epoch', 50),
+            end_epoch=getattr(args, 'sr_end_epoch', 150),
+            target_lambda=getattr(args, 'sr_lambda', 0.01),
+        )
+        if is_main_process():
+            logger.info(f"SR-STE enabled: {sr_scheduler}")
+
     # ---- Training loop ----
     t0 = time.time()
 
@@ -427,10 +481,17 @@ def main():
         if is_main_process():
             tlog.epoch_start(epoch)
 
+        # Compute current SR-STE lambda (0.0 if not using structured sparse)
+        current_sr_lambda = 0.0
+        if sr_scheduler is not None:
+            current_sr_lambda = sr_scheduler.get_lambda(epoch)
+
         train_m = train_one_epoch(model, train_loader, criterion, optimizer,
                                   scaler, device, epoch, tlog, world_size,
                                   mixup_alpha=args.mixup_alpha,
-                                  cutmix_alpha=args.cutmix_alpha)
+                                  cutmix_alpha=args.cutmix_alpha,
+                                  structured_sparse=structured_sparse,
+                                  sr_lambda=current_sr_lambda)
         val_m = evaluate(model, val_loader, criterion, device, world_size)
 
         scheduler.step()
@@ -452,6 +513,22 @@ def main():
                 'best_acc': best_acc,
                 'args': vars(args),
             }, is_best, output_dir)
+
+    # ---- Apply hard 2:4 projection after training ----
+    if structured_sparse and is_main_process():
+        from models.structured_training import apply_hard_2_4_projection
+        raw_model = model.module if distributed else model
+        proj_stats = apply_hard_2_4_projection(raw_model)
+        n_projected = sum(1 for v in proj_stats.values())
+        logger.info(f"Hard 2:4 projection applied to {n_projected} Linear layers")
+        # Save the sparse model
+        sparse_path = os.path.join(output_dir, 'best_sparse.pth')
+        torch.save({
+            'model': raw_model.state_dict(),
+            'args': vars(args),
+            'projection_stats': proj_stats,
+        }, sparse_path)
+        logger.info(f"Sparse model saved to {sparse_path}")
 
     total_time = time.time() - t0
     if is_main_process():

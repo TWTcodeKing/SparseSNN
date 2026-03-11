@@ -144,6 +144,19 @@ def load_training_recipe(recipe_path):
     snn = recipe.get('snn', {})
     if 'T' in snn:
         flat['T'] = snn['T']
+    if 'learnable_params' in snn:
+        flat['learnable_params'] = bool(snn['learnable_params'])
+
+    # Structured sparse (SR-STE 2:4)
+    ss = recipe.get('structured_sparsity', recipe.get('structured_sparse', {}))
+    if ss.get('enabled', False):
+        flat['structured_sparse'] = True
+    if 'sr_lambda' in ss:
+        flat['sr_lambda'] = float(ss['sr_lambda'])
+    if 'start_epoch' in ss:
+        flat['sr_start_epoch'] = int(ss['start_epoch'])
+    if 'end_epoch' in ss:
+        flat['sr_end_epoch'] = int(ss['end_epoch'])
 
     return flat
 

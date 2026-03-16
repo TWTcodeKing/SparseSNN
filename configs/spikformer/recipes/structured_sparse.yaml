@@ -55,5 +55,7 @@ snn:
 structured_sparse:
   enabled: true
   sr_lambda: 0.01
+  sr_n: 2
+  sr_m: 4
   start_epoch: 50
   end_epoch: 150

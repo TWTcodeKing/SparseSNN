@@ -8,6 +8,8 @@ Tracks:
    operands are non-zero in K^T@V (binary x binary) and Q@(K^T@V) (binary x real).
 3. Spatial density maps: per-spatial-position computation density, up-sampled back
    to input image resolution for GradCAM-style overlay.
+4. Per-channel firing rates: channel-level spike firing rates for activation-aware
+   channel permutation (used by models/channel_permutation.py for 2:4 sparsity).
 """
 
 import torch
@@ -15,6 +17,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from collections import OrderedDict
+from dataclasses import dataclass, field
+
+
+@dataclass
+class LayerChannelRecord:
+    """Stores per-channel firing rate information for a single neuron layer."""
+    name: str
+    channel_rates: list = field(default_factory=list)  # list of (C,) Tensors
+
+    @property
+    def mean_channel_rates(self):
+        """Return mean per-channel firing rate across all recorded batches."""
+        if not self.channel_rates:
+            return None
+        stacked = torch.stack(self.channel_rates)
+        return stacked.mean(dim=0)
+
+    @property
+    def num_channels(self):
+        if not self.channel_rates:
+            return 0
+        return self.channel_rates[0].shape[0]
 
 
 class LayerDensityRecord:
@@ -77,6 +101,64 @@ class DensityTracker:
         """Register forward hooks on all Conv, Linear, and SSA modules."""
         self._register_conv_linear_hooks(self.model, prefix='')
         self._register_ssa_hooks(self.model, prefix='')
+
+    def register_channel_hooks(self):
+        """Register forward hooks on LIF/IF neuron layers for per-channel firing rates.
+
+        Records per-channel mean spike rates from neuron outputs. Results are
+        stored in self.channel_records (OrderedDict of LayerChannelRecord).
+
+        Tensor layouts handled:
+          - (T, B, C, H, W): channel dim is index 2, mean over T, B, H, W
+          - (T, B, N, C): channel dim is last, mean over T, B, N
+        """
+        if not hasattr(self, 'channel_records'):
+            self.channel_records = OrderedDict()
+
+        from models.neurons import MultiStepLIFNeuron, MultiStepIFNeuron
+
+        for name, module in self.model.named_modules():
+            if isinstance(module, (MultiStepLIFNeuron, MultiStepIFNeuron)):
+                rec = LayerChannelRecord(name=name)
+                self.channel_records[name] = rec
+                hook = module.register_forward_hook(
+                    self._make_channel_hook(name))
+                self.hooks.append(hook)
+
+    def _make_channel_hook(self, name):
+        """Create a hook that records per-channel firing rates from neuron output."""
+        def hook_fn(module, inp, out):
+            spike = out.detach().float()
+            ndim = spike.ndim
+            if ndim == 5:
+                # (T, B, C, H, W)
+                channel_rate = spike.mean(dim=(0, 1, 3, 4))
+            elif ndim == 4:
+                # (T, B, N, C) — transformer token path
+                channel_rate = spike.mean(dim=(0, 1, 2))
+            elif ndim == 3:
+                channel_rate = spike.mean(dim=(0, 1))
+            elif ndim == 2:
+                channel_rate = spike.mean(dim=0)
+            else:
+                return
+            self.channel_records[name].channel_rates.append(channel_rate.cpu())
+        return hook_fn
+
+    def get_channel_firing_rates(self):
+        """Return per-layer mean channel firing rates.
+
+        Returns:
+            OrderedDict mapping layer name to (C,) Tensor of mean firing rates.
+        """
+        if not hasattr(self, 'channel_records'):
+            return OrderedDict()
+        rates = OrderedDict()
+        for name, rec in self.channel_records.items():
+            mean = rec.mean_channel_rates
+            if mean is not None:
+                rates[name] = mean
+        return rates
 
     def _register_conv_linear_hooks(self, module, prefix):
         """Hook Conv2d, Conv1d, Linear layers to track input spike density."""
@@ -331,6 +413,9 @@ class DensityTracker:
             rec.total_ops.clear()
             rec.effective_ops.clear()
         self._attn_captures.clear()
+        if hasattr(self, 'channel_records'):
+            for rec in self.channel_records.values():
+                rec.channel_rates.clear()
 
     def remove_hooks(self):
         """Remove all registered hooks."""

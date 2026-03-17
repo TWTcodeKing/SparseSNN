@@ -220,7 +220,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
 
     # Import SR-STE helper only when needed (avoids import cost for normal runs)
     if structured_sparse and sr_lambda > 0:
-        from models.structured_training import sr_ste_regularizer
+        from sparse.st_train import sr_ste_regularizer
     else:
         sr_ste_regularizer = None
 
@@ -462,7 +462,7 @@ def main():
     structured_sparse = getattr(args, 'structured_sparse', False)
     sr_scheduler = None
     if structured_sparse:
-        from models.structured_training import ProgressiveSparsityScheduler
+        from sparse.st_train import ProgressiveSparsityScheduler
         sr_scheduler = ProgressiveSparsityScheduler(
             start_epoch=getattr(args, 'sr_start_epoch', 50),
             end_epoch=getattr(args, 'sr_end_epoch', 150),
@@ -516,11 +516,11 @@ def main():
 
     # ---- Apply hard 2:4 projection after training ----
     if structured_sparse and is_main_process():
-        from models.structured_training import apply_hard_2_4_projection
+        from sparse.st_train import apply_hard_n_m_projection
         raw_model = model.module if distributed else model
-        proj_stats = apply_hard_2_4_projection(raw_model)
+        proj_stats = apply_hard_n_m_projection(raw_model)
         n_projected = sum(1 for v in proj_stats.values())
-        logger.info(f"Hard 2:4 projection applied to {n_projected} Linear layers")
+        logger.info(f"Hard N:M projection applied to {n_projected} Linear layers")
         # Save the sparse model
         sparse_path = os.path.join(output_dir, 'best_sparse.pth')
         torch.save({

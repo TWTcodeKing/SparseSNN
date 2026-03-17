@@ -291,65 +291,8 @@ def profile_model_firing_rates(
     return rates
 
 
-def compute_permutation_for_2_4(rates: torch.Tensor) -> torch.Tensor:
-    """Given per-channel firing rates (C,), compute optimal permutation.
-
-    Strategy: within each group of 4 contiguous channels, place the 2
-    lowest-firing channels at positions 2,3 (which 2:4 pruning will zero).
-
-    Algorithm:
-    1. Sort channels by firing rate
-    2. Split into high-fire (top half) and low-fire (bottom half)
-    3. Interleave: [high, high, low, low, high, high, low, low, ...]
-
-    If C is not divisible by 4, the remainder channels are appended at the
-    end with the same interleaving pattern (best-effort).
-
-    Args:
-        rates: (C,) tensor of per-channel firing rates.
-
-    Returns:
-        (C,) LongTensor - permutation indices such that
-        permuted_data[..., i] = original_data[..., perm[i]]
-    """
-    C = rates.shape[0]
-    # Sort indices by firing rate (ascending: low fire first)
-    sorted_idx = rates.argsort()  # (C,) low-to-high
-
-    # Split into low-fire (bottom half) and high-fire (top half)
-    half = C // 2
-    low_fire = sorted_idx[:half]  # lowest firing channels
-    high_fire = sorted_idx[half:]  # highest firing channels
-
-    # Handle odd C: if C is odd, high_fire has one more element
-    # We'll build groups of 4: [high, high, low, low]
-    num_groups = C // 4
-    remainder = C % 4
-
-    perm = torch.zeros(C, dtype=torch.long)
-
-    for g in range(num_groups):
-        # Take 2 high-fire and 2 low-fire channels per group
-        h_start = g * 2
-        l_start = g * 2
-        perm[g * 4 + 0] = high_fire[h_start]
-        perm[g * 4 + 1] = high_fire[h_start + 1]
-        perm[g * 4 + 2] = low_fire[l_start]
-        perm[g * 4 + 3] = low_fire[l_start + 1]
-
-    # Handle remainder channels
-    if remainder > 0:
-        base = num_groups * 4
-        h_used = num_groups * 2
-        l_used = num_groups * 2
-        remaining_high = high_fire[h_used:]
-        remaining_low = low_fire[l_used:]
-        # Concatenate remaining: high first, then low
-        remaining = torch.cat([remaining_high, remaining_low])
-        for r in range(remainder):
-            perm[base + r] = remaining[r]
-
-    return perm
+# Re-export from canonical location for backward compatibility
+from sparse.permutation import compute_permutation_for_n_m, compute_permutation_for_2_4
 
 
 def _find_upstream_linear(model: nn.Module, neuron_name: str) -> tuple:

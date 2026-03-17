@@ -153,10 +153,24 @@ def load_training_recipe(recipe_path):
         flat['structured_sparse'] = True
     if 'sr_lambda' in ss:
         flat['sr_lambda'] = float(ss['sr_lambda'])
+    if 'sr_n' in ss:
+        flat['sr_n'] = int(ss['sr_n'])
+    if 'sr_m' in ss:
+        flat['sr_m'] = int(ss['sr_m'])
     if 'start_epoch' in ss:
         flat['sr_start_epoch'] = int(ss['start_epoch'])
     if 'end_epoch' in ss:
         flat['sr_end_epoch'] = int(ss['end_epoch'])
+
+    # Dynamic N:M-ceiling sparse training
+    dyn = recipe.get('dynamic_sparsity', {})
+    if dyn.get('enabled', False):
+        flat['dynamic_sparse'] = True
+    for key in ('dyn_n', 'dyn_m', 'dyn_target_sparsity', 'dyn_grow_ratio',
+                'dyn_alpha', 'dyn_delta_T', 'dyn_T_end_fraction',
+                'dyn_density_exponent', 'dyn_ema_decay'):
+        if key in dyn:
+            flat[key] = dyn[key]
 
     return flat
 
@@ -233,6 +247,7 @@ _DATASET_CONFIG = {
     'cifar100':   {'num_classes': 100,  'img_size': 32,  'in_channels': 3},
     'imagenet':   {'num_classes': 1000, 'img_size': 224, 'in_channels': 3},
     'cifar10dvs': {'num_classes': 10,   'img_size': 128, 'in_channels': 2},
+    'dvs128gesture': {'num_classes': 11, 'img_size': 128, 'in_channels': 2},
 }
 
 
@@ -247,7 +262,8 @@ def build_dataloaders(dataset_name, data_root, batch_size, img_size=None,
                       num_workers=4, distributed=False, **kwargs):
     """Build train/test dataloaders by dataset name."""
     from datasets import (cifar10_dataloaders, cifar100_dataloaders,
-                          imagenet_dataloaders, cifar10dvs_dataloaders)
+                          imagenet_dataloaders, cifar10dvs_dataloaders,
+                          dvs128gesture_dataloaders)
 
     cfg = get_dataset_config(dataset_name)
     if img_size is None:
@@ -268,5 +284,10 @@ def build_dataloaders(dataset_name, data_root, batch_size, img_size=None,
     elif dataset_name == 'cifar10dvs':
         frames = kwargs.pop('frames_number', 16)
         return cifar10dvs_dataloaders(
+            data_root, batch_size, frames_number=frames,
+            num_workers=num_workers, distributed=distributed, **kwargs)
+    elif dataset_name == 'dvs128gesture':
+        frames = kwargs.pop('frames_number', 16)
+        return dvs128gesture_dataloaders(
             data_root, batch_size, frames_number=frames,
             num_workers=num_workers, distributed=distributed, **kwargs)

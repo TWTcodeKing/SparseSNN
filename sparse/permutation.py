@@ -1,12 +1,13 @@
 """
-Activation-aware channel permutation for SNN 2:4 structured sparsity.
+Activation-aware channel permutation for SNN N:M structured sparsity.
 
 The core idea: profile per-channel spike firing rates, learn a channel
-permutation P that groups low-firing channels together, so that when 2:4
-hardware prunes 2 of every 4 weight columns, it naturally hits the
+permutation P that groups low-firing channels together, so that when N:M
+hardware prunes (M-N) of every M weight columns, it naturally hits the
 already-silent channels -- causing negligible information loss.
 
 Modules:
+- compute_permutation_for_n_m: compute optimal channel ordering for N:M pruning
 - ChannelPermutation: applies a fixed channel permutation via index gather
 - PermutedLinear: wraps nn.Linear with input channel permutation + reordered weights
 - PermutedConv2d: wraps nn.Conv2d with input channel permutation + reordered weights
@@ -19,6 +20,8 @@ import torch
 import torch.nn as nn
 from collections import OrderedDict
 from typing import Optional
+
+from sparse.pruning import prune_n_m, prune_n_m_firing_aware
 
 
 class ChannelPermutation(nn.Module):
@@ -98,16 +101,20 @@ class PermutedLinear(nn.Module):
         x_permuted = x[..., self.perm]
         return self.linear(x_permuted)
 
-    def apply_2_4_pruning(self):
-        """Apply 2:4 structured pruning to the (already permuted) weights.
+    def apply_n_m_pruning(self, n: int = 2, m: int = 4):
+        """Apply N:M structured pruning to the (already permuted) weights.
 
-        After permutation, low-firing channels are at positions 2,3 of each
-        group of 4. The 2:4 pruning will keep the top-2 by magnitude in each
-        group, which should align with the high-firing positions 0,1.
+        After permutation, low-firing channels are at positions N..M-1 of each
+        group of M. The N:M pruning will keep the top-N by magnitude in each
+        group, which should align with the high-firing positions 0..N-1.
         """
         with torch.no_grad():
-            self.linear.weight.data = _prune_2_4(self.linear.weight.data)
+            self.linear.weight.data = prune_n_m(self.linear.weight.data, n=n, m=m)
         self._pruned = True
+
+    # Backward-compatible alias
+    def apply_2_4_pruning(self):
+        self.apply_n_m_pruning(n=2, m=4)
 
     def extra_repr(self) -> str:
         return (f'in_features={self.linear.in_features}, '
@@ -179,11 +186,11 @@ class PermutedConv2d(nn.Module):
         x_permuted = x[:, self.perm, :, :]
         return self.conv(x_permuted)
 
-    def apply_2_4_pruning(self):
-        """Apply 2:4 structured pruning to the (already permuted) weights.
+    def apply_n_m_pruning(self, n: int = 2, m: int = 4):
+        """Apply N:M structured pruning to the (already permuted) weights.
 
         Uses NHWC layout for pruning: (C_out, C_in, Kh, Kw) ->
-        (C_out, Kh, Kw, C_in), prune in groups of 4 along C_in,
+        (C_out, Kh, Kw, C_in), prune in groups of M along C_in,
         then convert back to NCHW.
         """
         with torch.no_grad():
@@ -192,10 +199,14 @@ class PermutedConv2d(nn.Module):
             w_nhwc = w.permute(0, 2, 3, 1).contiguous()
             shape_nhwc = w_nhwc.shape
             w_2d = w_nhwc.reshape(-1, w.shape[1])
-            w_2d_pruned = _prune_2_4(w_2d)
+            w_2d_pruned = prune_n_m(w_2d, n=n, m=m)
             w_nhwc_pruned = w_2d_pruned.reshape(shape_nhwc)
             self.conv.weight.data = w_nhwc_pruned.permute(0, 3, 1, 2).contiguous()
         self._pruned = True
+
+    # Backward-compatible alias
+    def apply_2_4_pruning(self):
+        self.apply_n_m_pruning(n=2, m=4)
 
     def extra_repr(self) -> str:
         return (f'in_channels={self.conv.in_channels}, '
@@ -204,92 +215,72 @@ class PermutedConv2d(nn.Module):
                 f'pruned={self._pruned}')
 
 
-def _prune_2_4(weight_2d: torch.Tensor) -> torch.Tensor:
-    """Apply 2:4 structured pruning to a 2D weight matrix.
-
-    For each row, in every group of 4 contiguous columns, keep the top-2
-    by magnitude and zero the other 2.
-
-    Args:
-        weight_2d: (rows, cols) tensor. cols should be divisible by 4.
-
-    Returns:
-        Pruned weight tensor of the same shape.
-    """
-    rows, cols = weight_2d.shape
-    # Handle cols not divisible by 4: only prune the aligned portion
-    num_groups = cols // 4
-    if num_groups == 0:
-        return weight_2d.clone()
-
-    aligned_cols = num_groups * 4
-    w_aligned = weight_2d[:, :aligned_cols].reshape(rows, num_groups, 4)
-
-    # Keep top-2 by magnitude per group
-    _, top_idx = w_aligned.abs().topk(2, dim=2)
-    mask = torch.zeros_like(w_aligned)
-    mask.scatter_(2, top_idx, 1.0)
-
-    result = weight_2d.clone()
-    result[:, :aligned_cols] = (w_aligned * mask).reshape(rows, aligned_cols)
-    return result
-
-
-def _prune_2_4_firing_aware(
-    weight_2d: torch.Tensor,
+def compute_permutation_for_n_m(
     rates: torch.Tensor,
-    lam: float = 0.5,
+    n: int = 2,
+    m: int = 4,
 ) -> torch.Tensor:
-    """Apply 2:4 structured pruning biased by upstream firing rates.
+    """Given per-channel firing rates (C,), compute optimal permutation for N:M pruning.
 
-    Instead of keeping top-2 by magnitude alone, uses a composite score:
-        score[i, c] = |W[i, c]| + lam * scale * r_c
+    Strategy: within each group of M contiguous channels, place the (M-N)
+    lowest-firing channels at positions N..M-1 (which N:M pruning will zero).
 
-    where scale = mean(|W|) / (mean(r) + eps) auto-normalizes the firing
-    rate contribution to be comparable with weight magnitudes.
-
-    High-firing channels get a score bonus, making them less likely to be
-    pruned. Low-firing channels get less bonus, making them more likely to
-    be pruned — even if their weight magnitude is not the smallest.
+    Algorithm:
+    1. Sort channels by firing rate
+    2. Split into high-fire (top N/M fraction) and low-fire (bottom (M-N)/M fraction)
+    3. Interleave: [high*N, low*(M-N), high*N, low*(M-N), ...]
 
     Args:
-        weight_2d: (rows, cols) weight tensor.
-        rates: (cols,) per-channel firing rates from upstream neuron.
-        lam: Controls firing rate influence. 0 = pure magnitude pruning,
-            larger values = stronger preference to keep high-firing channels.
+        rates: (C,) tensor of per-channel firing rates.
+        n: Non-zeros to keep per group (default 2).
+        m: Group size (default 4).
 
     Returns:
-        Pruned weight tensor of the same shape.
+        (C,) LongTensor - permutation indices such that
+        permuted_data[..., i] = original_data[..., perm[i]]
     """
-    rows, cols = weight_2d.shape
-    num_groups = cols // 4
-    if num_groups == 0:
-        return weight_2d.clone()
+    C = rates.shape[0]
+    num_prune = m - n
+    sorted_idx = rates.argsort()  # (C,) low-to-high
 
-    aligned_cols = num_groups * 4
+    # Split: low-fire channels will be pruned, high-fire kept
+    # We need num_groups * num_prune low-fire and num_groups * n high-fire
+    num_groups = C // m
+    remainder = C % m
 
-    # Auto-scale: make firing rate contribution comparable to weight magnitudes
-    w_abs = weight_2d[:, :aligned_cols].abs()
-    w_mean = w_abs.mean().item()
-    r_mean = rates[:aligned_cols].mean().item()
-    scale = w_mean / (r_mean + 1e-8)
+    n_low = num_groups * num_prune
+    low_fire = sorted_idx[:n_low]
+    high_fire = sorted_idx[n_low:]
 
-    # Build score matrix: (rows, aligned_cols)
-    # rates broadcasts across rows: same firing rate bonus for all output neurons
-    rate_bonus = lam * scale * rates[:aligned_cols].unsqueeze(0).to(weight_2d.device)
-    scores = w_abs + rate_bonus  # (rows, aligned_cols)
+    perm = torch.zeros(C, dtype=torch.long)
 
-    # Group and keep top-2 by score per group
-    scores_grouped = scores.reshape(rows, num_groups, 4)
-    _, top_idx = scores_grouped.topk(2, dim=2)
-    mask = torch.zeros_like(scores_grouped)
-    mask.scatter_(2, top_idx, 1.0)
+    for g in range(num_groups):
+        h_start = g * n
+        l_start = g * num_prune
+        # Place N high-fire channels first, then (M-N) low-fire
+        for i in range(n):
+            perm[g * m + i] = high_fire[h_start + i]
+        for i in range(num_prune):
+            perm[g * m + n + i] = low_fire[l_start + i]
 
-    # Apply mask to original weights (not scores)
-    w_grouped = weight_2d[:, :aligned_cols].reshape(rows, num_groups, 4)
-    result = weight_2d.clone()
-    result[:, :aligned_cols] = (w_grouped * mask).reshape(rows, aligned_cols)
-    return result
+    # Handle remainder channels
+    if remainder > 0:
+        base = num_groups * m
+        h_used = num_groups * n
+        l_used = num_groups * num_prune
+        remaining_high = high_fire[h_used:]
+        remaining_low = low_fire[l_used:]
+        remaining = torch.cat([remaining_high, remaining_low])
+        for r in range(remainder):
+            perm[base + r] = remaining[r]
+
+    return perm
+
+
+# Backward-compatible alias
+def compute_permutation_for_2_4(rates: torch.Tensor) -> torch.Tensor:
+    """Compute optimal permutation for 2:4 pruning. See `compute_permutation_for_n_m`."""
+    return compute_permutation_for_n_m(rates, n=2, m=4)
 
 
 def _find_neuron_for_layer(model: nn.Module, layer_name: str) -> Optional[str]:
@@ -473,7 +464,7 @@ def convert_model_with_permutation(
     Returns:
         The modified model (same object).
     """
-    from vis.firing_rate_profile import compute_permutation_for_2_4
+    # compute_permutation_for_n_m is defined in this module
 
     if exclude_names is None:
         exclude_names = ['head']
@@ -542,7 +533,7 @@ def convert_model_with_permutation(
             continue
 
         # Compute permutation
-        perm = compute_permutation_for_2_4(upstream_rates)
+        perm = compute_permutation_for_n_m(upstream_rates)
 
         device = module.weight.device
 
@@ -675,7 +666,7 @@ def apply_firing_aware_pruning(
             }
             continue
 
-        # Apply firing-aware 2:4 pruning
+        # Apply firing-aware N:M pruning
         with torch.no_grad():
             w = module.weight.data
             if is_conv and w.ndim == 4:
@@ -683,10 +674,10 @@ def apply_firing_aware_pruning(
                 w_nhwc = w.permute(0, 2, 3, 1).contiguous()
                 shape_nhwc = w_nhwc.shape
                 w_2d = w_nhwc.reshape(-1, w.shape[1])
-                w_2d_pruned = _prune_2_4_firing_aware(w_2d, upstream_rates, lam)
+                w_2d_pruned = prune_n_m_firing_aware(w_2d, upstream_rates, lam=lam)
                 w_pruned = w_2d_pruned.reshape(shape_nhwc).permute(0, 3, 1, 2).contiguous()
             else:
-                w_pruned = _prune_2_4_firing_aware(w, upstream_rates, lam)
+                w_pruned = prune_n_m_firing_aware(w, upstream_rates, lam=lam)
 
             module.weight.data.copy_(w_pruned)
 
@@ -739,16 +730,18 @@ def _get_weight_2d_for_quality(module: nn.Module) -> tuple:
 def measure_permutation_quality(
     model: nn.Module,
     firing_rates: dict[str, torch.Tensor],
+    n: int = 2,
+    m: int = 4,
 ) -> dict:
-    """Measure how well 2:4-pruned positions align with low-firing channels.
+    """Measure how well N:M-pruned positions align with low-firing channels.
 
-    Since 2:4 pruning operates per-row (each row independently keeps its
-    top-2 by magnitude in every group of 4), alignment is measured per-row
+    Since N:M pruning operates per-row (each row independently keeps its
+    top-N by magnitude in every group of M), alignment is measured per-row
     then averaged across all rows and groups.
 
-    For each (row, group), check whether the 2 pruned positions fall on the
-    2 lowest-firing channels in that group. Alignment = fraction of pruned
-    positions that correspond to low-firing channels.
+    For each (row, group), check whether the (M-N) pruned positions fall on
+    the (M-N) lowest-firing channels in that group. Alignment = fraction of
+    pruned positions that correspond to low-firing channels.
 
     Also computes information loss: the weighted contribution of pruned
     channels, where contribution = firing_rate × |weight|.
@@ -756,10 +749,13 @@ def measure_permutation_quality(
     Args:
         model: Model (may or may not have Permuted* layers).
         firing_rates: {neuron_name: (C,) rates} from profiling.
+        n: Non-zeros to keep per group (default 2).
+        m: Group size (default 4).
 
     Returns:
         {layer_name: {alignment_score, expected_random, information_loss, ...}}
     """
+    num_prune = m - n
     quality = OrderedDict()
 
     for name, module in model.named_modules():
@@ -803,20 +799,20 @@ def measure_permutation_quality(
         if upstream_rates.shape[0] != in_channels:
             continue
 
-        num_groups = in_channels // 4
+        num_groups = in_channels // m
         if num_groups == 0:
             continue
 
         # Get 2D weight view: (rows, in_channels)
         weight_2d, _, _ = _get_weight_2d_for_quality(inner)
 
-        aligned_ch = num_groups * 4
+        aligned_ch = num_groups * m
         rows = weight_2d.shape[0]
-        # (rows, num_groups, 4)
-        w_grouped = weight_2d[:, :aligned_ch].reshape(rows, num_groups, 4)
+        # (rows, num_groups, m)
+        w_grouped = weight_2d[:, :aligned_ch].reshape(rows, num_groups, m)
 
         # Per-row pruning: a position is pruned if it's zero in that row
-        is_pruned = (w_grouped == 0)  # (rows, num_groups, 4)
+        is_pruned = (w_grouped == 0)  # (rows, num_groups, m)
 
         # Get the rates for the current channel ordering
         if has_perm:
@@ -824,12 +820,12 @@ def measure_permutation_quality(
         else:
             current_rates = upstream_rates
 
-        # rates_grouped: (num_groups, 4) — same across all rows
-        rates_grouped = current_rates[:aligned_ch].reshape(num_groups, 4)
+        # rates_grouped: (num_groups, m) — same across all rows
+        rates_grouped = current_rates[:aligned_ch].reshape(num_groups, m)
 
-        # In each group, which 2 positions have the lowest firing rates?
-        _, low_idx = rates_grouped.topk(2, dim=1, largest=False)
-        low_mask = torch.zeros(num_groups, 4, dtype=torch.bool)
+        # In each group, which (M-N) positions have the lowest firing rates?
+        _, low_idx = rates_grouped.topk(num_prune, dim=1, largest=False)
+        low_mask = torch.zeros(num_groups, m, dtype=torch.bool)
         low_mask.scatter_(1, low_idx, True)
         # Broadcast to (rows, num_groups, 4)
         low_mask = low_mask.unsqueeze(0).expand_as(is_pruned)
@@ -856,7 +852,7 @@ def measure_permutation_quality(
 
         quality[name] = {
             'alignment_score': alignment,
-            'expected_random': 0.5,
+            'expected_random': num_prune / m,  # random chance of hitting low-fire
             'information_loss': pruned_contribution,
             'relative_information_loss': relative_loss,
             'sparsity': sparsity,

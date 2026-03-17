@@ -16,12 +16,7 @@ import torch
 import torch.nn as nn
 from typing import Optional
 
-import sys
-import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
-from iengine.semi_structured.pruning import prune_2_4
+from sparse.pruning import prune_2_4
 
 
 def factorize_weight_2_4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

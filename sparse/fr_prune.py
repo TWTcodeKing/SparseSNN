@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from collections import OrderedDict
 from typing import Optional
-
+import torch.nn.functional as F
 from sparse.pruning import prune_n_m, verify_n_m
 from sparse.utils import (
     _find_neuron_for_layer,

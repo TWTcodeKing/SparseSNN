@@ -500,6 +500,11 @@ if __name__ == '__main__':
         print(f"  {name} [{q['type']}]: alignment={q['alignment_score']:.3f}, "
               f"info_loss={q['relative_information_loss']:.4f}")
 
+    # Save original weights (CPU) so quality_after can compute meaningful
+    # information_loss: pruned positions are 0 in the pruned model, so
+    # measure_permutation_quality needs the pre-pruning magnitudes.
+    original_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
     # Apply neuron-aware pruning
     print(f"\n=== Applying neuron-aware {args.n}:{args.m} pruning ===")
     model = apply_neuron_aware_pruning(
@@ -535,7 +540,8 @@ if __name__ == '__main__':
 
     # Measure quality after pruning
     print("\n=== Quality AFTER pruning ===")
-    quality_after = measure_permutation_quality(model, channel_rates)
+    quality_after = measure_permutation_quality(
+        model, channel_rates, reference_state_dict=original_state_dict)
     for name, q in quality_after.items():
         print(f"  {name} [{q['type']}]: alignment={q['alignment_score']:.3f}, "
               f"info_loss={q['relative_information_loss']:.4f}, "

@@ -593,6 +593,7 @@ def measure_permutation_quality(
     firing_rates: dict[str, torch.Tensor],
     n: int = 2,
     m: int = 4,
+    reference_state_dict: dict = None,
 ) -> dict:
     """Measure how well N:M-pruned positions align with low-firing channels.
 
@@ -612,6 +613,11 @@ def measure_permutation_quality(
         firing_rates: {neuron_name: (C,) rates} from profiling.
         n: Non-zeros to keep per group (default 2).
         m: Group size (default 4).
+        reference_state_dict: Optional state dict from the dense (pre-pruning)
+            model. When provided, original weight magnitudes are used for
+            information_loss at pruned positions instead of the post-pruning
+            zeros. Required to get meaningful information_loss on a pruned model;
+            without it, pruned positions always have |W|=0 so info_loss=0.
 
     Returns:
         {layer_name: {alignment_score, expected_random, information_loss, ...}}
@@ -699,10 +705,26 @@ def measure_permutation_quality(
         else:
             alignment = float('nan')
 
-        # Information loss: sum of rate_c * |w| at pruned positions
-        # This measures actual signal energy removed by pruning
+        # Information loss: sum of rate_c * |w_orig| at pruned positions.
+        # Uses reference (pre-pruning) weights when available so that pruned
+        # positions — which are exactly 0 in the post-pruning model — still
+        # reflect the energy that was removed.  Without a reference, pruned
+        # positions have |W|=0 and information_loss would always be 0.
         rates_broadcast = rates_grouped.unsqueeze(0).expand(rows, -1, -1)
-        weighted_contribution = rates_broadcast * w_grouped.abs().cpu()
+
+        ref_key = name + '.weight'
+        if reference_state_dict is not None and ref_key in reference_state_dict:
+            ref_w = reference_state_dict[ref_key].float().cpu()
+            if isinstance(inner, nn.Conv2d):
+                ref_w = ref_w.permute(0, 2, 3, 1).reshape(rows, -1)[:, :aligned_ch]
+            else:
+                ref_w = ref_w[:, :aligned_ch]
+            ref_grouped = ref_w.reshape(rows, num_groups, m)
+            abs_weight = ref_grouped.abs()
+        else:
+            abs_weight = w_grouped.abs().cpu()
+
+        weighted_contribution = rates_broadcast * abs_weight
         total_contribution = weighted_contribution.sum().item()
         pruned_contribution = weighted_contribution[is_pruned.cpu()].sum().item()
         relative_loss = pruned_contribution / max(total_contribution, 1e-8)
@@ -808,6 +830,9 @@ if __name__ == '__main__':
               f"info_loss={q['relative_information_loss']:.4f}, "
               f"sparsity={q['sparsity']:.3f}")
 
+    # Save original weights for meaningful information_loss in quality_after
+    original_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
     # Apply pruning
     if args.method == 'firing_aware':
         print(f"\n--- Applying firing-aware 2:4 pruning (lam={args.lam}) ---")
@@ -826,7 +851,8 @@ if __name__ == '__main__':
 
     # Measure quality after pruning
     print("\n--- Quality AFTER pruning ---")
-    quality_after = measure_permutation_quality(model, firing_rates)
+    quality_after = measure_permutation_quality(
+        model, firing_rates, reference_state_dict=original_state_dict)
     for name, q in quality_after.items():
         print(f"  {name} [{q['type']}]: alignment={q['alignment_score']:.3f}, "
               f"info_loss={q['relative_information_loss']:.4f}, "

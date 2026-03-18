@@ -22,6 +22,12 @@ from collections import OrderedDict
 from typing import Optional
 
 from sparse.pruning import prune_n_m, prune_n_m_firing_aware
+from sparse.utils import (
+    _find_neuron_for_layer,
+    _get_in_channels,
+    _is_eligible_for_permutation,
+    _get_upstream_entry,
+)
 
 
 class ChannelPermutation(nn.Module):
@@ -283,162 +289,17 @@ def compute_permutation_for_2_4(rates: torch.Tensor) -> torch.Tensor:
     return compute_permutation_for_n_m(rates, n=2, m=4)
 
 
-def _find_neuron_for_layer(model: nn.Module, layer_name: str) -> Optional[str]:
-    """Find the upstream spiking neuron whose output feeds into a given layer.
-
-    Handles naming conventions for both Linear and Conv2d layers across
-    all SNN architectures in this codebase:
-
-    Transformer (Spikformer/QKFormer/MaxFormer) naming patterns:
-        *_linear / *_conv -> upstream *_lif neuron
-        proj_linear -> attn_lif (upstream)
-        fc2_linear / fc2_conv -> fc1_lif
-        proj_conv1 -> proj_lif (upstream of proj_conv1 is proj_lif)
-
-    ResNet (SEW/MS) naming patterns:
-        *.conv1 (in SeqToANNContainer) -> *.sn1 is downstream, not upstream
-        For ResNets: *.conv_bn1 -> upstream is *.sn1 (neuron fires first)
-        *.conv_bn2 -> upstream is *.sn2
-
-    Args:
-        model: The model.
-        layer_name: Full name of the Linear or Conv2d module.
-
-    Returns:
-        Name of the upstream neuron, or None if not found.
-    """
-    modules_dict = dict(model.named_modules())
-
-    candidates = []
-
-    # Pattern: *_linear -> *_lif, *_conv -> *_lif
-    for suffix, replacement in [('_linear', '_lif'), ('_conv', '_lif')]:
-        if suffix in layer_name:
-            # proj_linear -> attn_lif
-            if layer_name.endswith('proj_linear') or layer_name.endswith('proj_conv'):
-                candidates.append(layer_name.rsplit('proj', 1)[0] + 'attn_lif')
-            # fc2_* -> fc1_lif
-            if 'fc2' in layer_name:
-                candidates.append(layer_name.replace('fc2' + suffix, 'fc1_lif'))
-            # Generic: replace suffix with _lif
-            candidates.append(layer_name.rsplit(suffix, 1)[0] + '_lif')
-
-    # ResNet patterns: conv_bn1 -> sn1 (in MS-ResNet, neuron is upstream of conv)
-    if 'conv_bn' in layer_name:
-        import re
-        m = re.search(r'conv_bn(\d+)', layer_name)
-        if m:
-            candidates.append(layer_name.rsplit('conv_bn', 1)[0] + 'sn' + m.group(1))
-
-    # Numbered conv patterns: proj_conv1 -> proj_lif, proj_conv2 -> proj_lif1
-    import re
-    m = re.search(r'_conv(\d+)$', layer_name)
-    if m:
-        num = int(m.group(1))
-        base = layer_name.rsplit('_conv', 1)[0]
-        if num == 0:
-            candidates.append(base + '_lif')
-        else:
-            # proj_conv1 -> proj_lif, proj_conv2 -> proj_lif1, proj_conv3 -> proj_lif2
-            candidates.append(base + '_lif' + (str(num - 1) if num > 1 else ''))
-
-    # Depthwise conv patterns: conv -> conv_neuron, dwconv -> dwconv_neuron
-    if layer_name.endswith('conv') or layer_name.endswith('dwconv'):
-        candidates.append(layer_name + '_neuron')
-
-    for cand in candidates:
-        if cand in modules_dict:
-            return cand
-
-    return None
-
-
-def _get_in_channels(module: nn.Module) -> int:
-    """Get the input channel count for a Linear, Conv2d, or Permuted* module."""
-    if isinstance(module, PermutedLinear):
-        return module.linear.in_features
-    elif isinstance(module, PermutedConv2d):
-        return module.conv.in_channels
-    elif isinstance(module, nn.Linear):
-        return module.in_features
-    elif isinstance(module, nn.Conv2d):
-        return module.in_channels
-    raise TypeError(f"Unsupported module type: {type(module)}")
-
-
 def _get_upstream_rates(
     model: nn.Module,
     layer_name: str,
     firing_rates: dict[str, torch.Tensor],
 ) -> Optional[torch.Tensor]:
-    """Get firing rates of the upstream neuron for a given Linear or Conv2d layer.
+    """Get (C,) firing rates of the upstream neuron for a layer.
 
-    Tries to find matching neuron firing rates by:
-    1. Looking for an exact upstream neuron match via naming patterns
-    2. Looking for neuron names that share a common prefix with the layer name
-    3. Falling back to any neuron with matching channel count
-
-    Args:
-        model: The model.
-        layer_name: Full name of the Linear or Conv2d module.
-        firing_rates: {neuron_name: (C,) rates} from profiling.
-
-    Returns:
-        (in_channels,) tensor of firing rates, or None if not found.
+    Thin wrapper around _get_upstream_entry for channel-level rate dicts.
     """
-    modules_dict = dict(model.named_modules())
-    layer_mod = modules_dict[layer_name]
-    in_channels = _get_in_channels(layer_mod)
-
-    # Strategy 1: known naming patterns
-    neuron_name = _find_neuron_for_layer(model, layer_name)
-    if neuron_name and neuron_name in firing_rates:
-        rates = firing_rates[neuron_name]
-        if rates.shape[0] == in_channels:
-            return rates
-
-    # Strategy 2: look for a neuron in the same parent module whose channel
-    # count matches the layer's in_channels
-    parts = layer_name.rsplit('.', 1)
-    parent_prefix = parts[0] if len(parts) == 2 else ''
-
-    best_match = None
-    best_depth = -1
-    for neuron_name, rates in firing_rates.items():
-        if rates.shape[0] != in_channels:
-            continue
-        if parent_prefix and neuron_name.startswith(parent_prefix):
-            depth = len(neuron_name.split('.'))
-            if depth > best_depth:
-                best_depth = depth
-                best_match = neuron_name
-
-    if best_match:
-        return firing_rates[best_match]
-
-    # Strategy 3: look for any matching channel count (less reliable)
-    for neuron_name, rates in firing_rates.items():
-        if rates.shape[0] == in_channels:
-            return rates
-
-    return None
-
-
-def _is_eligible_for_permutation(module: nn.Module) -> bool:
-    """Check if a module is eligible for channel permutation.
-
-    Eligible: nn.Linear with in_features >= 4, or nn.Conv2d with
-    in_channels >= 4 and groups == 1 (not depthwise).
-    """
-    if isinstance(module, nn.Linear):
-        return module.in_features >= 4
-    if isinstance(module, nn.Conv2d):
-        # Skip depthwise convolutions: each output channel sees only one
-        # input channel, so permutation has no effect on 2:4 pruning.
-        if module.groups == module.in_channels and module.in_channels > 1:
-            return False
-        return module.in_channels >= 4
-    return False
+    return _get_upstream_entry(model, layer_name, firing_rates,
+                               get_channels=lambda r: r.shape[0])
 
 
 def convert_model_with_permutation(

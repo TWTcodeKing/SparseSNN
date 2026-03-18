@@ -41,7 +41,7 @@ from tengine.utils import (
     set_seed, build_model, build_model_from_config, load_model_config,
     build_dataloaders, get_dataset_config,
 )
-from vis.density_hooks import DensityTracker, compute_overall_spatial_density
+from utils.density_hooks import DensityTracker, compute_overall_spatial_density
 
 
 def parse_args():

@@ -1,0 +1,45 @@
+# N:M-Ceiling Dynamic Sparse Training recipe for Spikformer
+#
+# Mask-based topology exploration with N:M as a ceiling constraint.
+# Prune-by-magnitude, grow-by-gradient, with cosine-annealed exploration.
+# The model learns its own sparsity level — no fixed target.
+#
+# Inspired by SRigL (Lasby et al., ICLR 2024).
+
+optimizer:
+  type: adamw
+  lr: 1e-4
+  weight_decay: 0.06
+
+scheduler:
+  type: cosine
+  warmup_epochs: 10
+  min_lr: 1e-6
+
+epochs: 200
+batch_size: 128
+
+augmentation:
+  auto_aug: true
+  cutout: true
+  mixup_alpha: 0.0
+  cutmix_alpha: 0.0
+  random_erasing: 0.0
+
+regularization:
+  label_smoothing: 0.1
+
+snn:
+  T: 4
+
+dynamic_sparsity:
+  enabled: true
+  dyn_n: 2                    # N:M ceiling — max non-zeros per group
+  dyn_m: 4                    # group size (4 for NVIDIA Sparse Tensor Cores)
+  # dyn_target_sparsity:      # omitted = None → learn sparsity automatically
+  dyn_grow_ratio: 0.5         # regrow 50% of pruned → net sparsification each cycle
+  dyn_alpha: 0.3              # initial drop fraction (cosine-annealed)
+  dyn_delta_T: 100            # mask update interval in steps
+  dyn_T_end_fraction: 0.75    # stop mask updates at 75% of training
+  dyn_density_exponent: 1.0   # activation-density weighting power
+  dyn_ema_decay: 0.99         # EMA smoothing for density tracker

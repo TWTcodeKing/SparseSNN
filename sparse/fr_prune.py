@@ -17,13 +17,11 @@ from typing import Optional
 import torch.nn.functional as F
 from sparse.pruning import prune_n_m, verify_n_m
 from sparse.utils import (
-    _find_neuron_for_layer,
     _is_eligible_for_permutation,
     _get_in_channels,
     _get_upstream_entry,
 )
 from utils.profiling import (
-    NeuronFiringRateProfiler,
     compute_effective_rates_conv,
     compute_enhanced_rates_linear,
     profile_neuron_firing_rates,

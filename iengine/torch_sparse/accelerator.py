@@ -1,16 +1,19 @@
 """TorchSparseAccelerator — CSR sparse backend using torch.sparse.mm.
 
-Instruments nn.Linear layers with forward hooks and monkey-patches SSA
-modules to use sparse matmul when spike activations are sufficiently sparse.
+Instruments nn.Linear and nn.Conv2d layers with forward hooks, and
+monkey-patches SSA modules to use sparse matmul when spike activations
+are sufficiently sparse.
 """
 
 import torch.nn as nn
 
 from iengine.common.base import SparseAccelerator
 from iengine.common.hooks import monkey_patch_forward
-from .sparse_linear import make_sparse_linear_forward, SparseLinearStats
-from .sparse_attention import (
-    make_sparse_ssa_forward, SparseAttentionStats
+from iengine.common.stats import LinearStats, AttentionStats
+from .conversion import (
+    make_sparse_linear_forward,
+    make_sparse_conv2d_forward,
+    make_sparse_ssa_forward,
 )
 
 
@@ -20,12 +23,14 @@ class TorchSparseAccelerator(SparseAccelerator):
     Exploits spike sparsity in SNN activations by:
     1. Intercepting nn.Linear forward passes and using torch.sparse.mm
        when input density is below threshold.
-    2. Monkey-patching SSA (Spiking Self-Attention) forward to use
+    2. Intercepting nn.Conv2d forward passes via im2col + CSR sparse GEMM.
+    3. Monkey-patching SSA (Spiking Self-Attention) forward to use
        sparse matmul for q@k.T computation.
 
     Config options:
         density_threshold (float): Max density for sparse path. Default 0.15.
-        enable_linear (bool): Enable sparse Linear hooks. Default True.
+        enable_linear (bool):    Enable sparse Linear hooks. Default True.
+        enable_conv2d (bool):    Enable sparse Conv2d hooks. Default True.
         enable_attention (bool): Enable sparse SSA patching. Default True.
     """
 
@@ -33,131 +38,121 @@ class TorchSparseAccelerator(SparseAccelerator):
         super().__init__(config)
         self._density_threshold = self.config.get('density_threshold', 0.15)
         self._enable_linear = self.config.get('enable_linear', True)
+        self._enable_conv2d = self.config.get('enable_conv2d', True)
         self._enable_attention = self.config.get('enable_attention', True)
 
-        self._linear_stats = {}
-        self._attention_stats = {}
-        self._original_forwards = {}  # {module_name: (module, original_forward)}
-        self._enabled_ref = [True]  # mutable ref for runtime toggle
+        self._linear_stats = LinearStats()
+        self._conv_stats = LinearStats()
+        self._attention_stats = {}  # {name: AttentionStats}
+        self._original_forwards = {}
+        self._enabled_ref = [True]
 
     def prepare(self, model):
-        """Instrument model for sparse execution.
-
-        Scans for nn.Linear modules and registers forward hooks.
-        Finds SSA modules by class name and monkey-patches their forward.
-        """
         if self._enable_linear:
-            self._patch_linear_modules(model)
-
+            self._patch_linear(model)
+        if self._enable_conv2d:
+            self._patch_conv2d(model)
         if self._enable_attention:
-            self._patch_ssa_modules(model)
-
+            self._patch_ssa(model)
         self.attach_profiler(model)
         return model
 
-    def _patch_linear_modules(self, model):
-        """Monkey-patch forward on all nn.Linear modules for sparse execution."""
+    def _patch_linear(self, model):
         for name, module in model.named_modules():
             if isinstance(module, nn.Linear):
-                new_forward = make_sparse_linear_forward(
-                    module=module,
-                    original_forward=module.forward,
-                    layer_name=name,
-                    stats_dict=self._linear_stats,
-                    density_threshold=self._density_threshold,
-                    enabled_ref=self._enabled_ref,
-                )
-                original = monkey_patch_forward(module, new_forward)
+                new_fwd = make_sparse_linear_forward(
+                    module, module.forward, name, self._linear_stats,
+                    self._density_threshold, self._enabled_ref)
+                original = monkey_patch_forward(module, new_fwd)
                 self._original_forwards[name] = (module, original)
 
-    def _patch_ssa_modules(self, model):
-        """Find SSA modules by class name and monkey-patch forward."""
+    def _patch_conv2d(self, model):
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Conv2d) and module.groups == 1:
+                new_fwd = make_sparse_conv2d_forward(
+                    module, module.forward, name, self._conv_stats,
+                    self._density_threshold, self._enabled_ref)
+                original = monkey_patch_forward(module, new_fwd)
+                self._original_forwards[name] = (module, original)
+
+    def _patch_ssa(self, model):
         for name, module in model.named_modules():
             if module.__class__.__name__ == 'SSA':
-                new_forward = make_sparse_ssa_forward(
-                    ssa_module=module,
-                    stats_dict=self._attention_stats,
-                    layer_name=name,
-                    density_threshold=self._density_threshold,
-                    enabled_ref=self._enabled_ref,
-                )
-                original = monkey_patch_forward(module, new_forward)
+                attn_stats = AttentionStats()
+                self._attention_stats[name] = attn_stats
+                new_fwd = make_sparse_ssa_forward(
+                    module, attn_stats, name,
+                    self._density_threshold, self._enabled_ref)
+                original = monkey_patch_forward(module, new_fwd)
                 self._original_forwards[name] = (module, original)
 
     def cleanup(self, model):
-        """Restore all original forward methods (Linear + SSA)."""
         self.detach_profiler()
-        for name, (module, original_forward) in self._original_forwards.items():
-            module.forward = original_forward
+        for name, (module, original_fwd) in self._original_forwards.items():
+            module.forward = original_fwd
         self._original_forwards.clear()
-
         return model
 
     def get_stats(self):
-        """Return sparse execution statistics.
-
-        Returns dict with:
-            - total_ops: total multiply-accumulate operations
-            - effective_ops: non-zero operations actually computed
-            - density: effective_ops / total_ops
-            - per_layer: {layer_name: {total_ops, effective_ops, density, type}}
-        """
-        total_ops = 0
-        effective_ops = 0
+        total_ops = self._linear_stats.total_ops + self._conv_stats.total_ops
+        effective_ops = self._linear_stats.effective_ops + self._conv_stats.effective_ops
         per_layer = {}
 
-        # Linear layer stats
-        for name, stats in self._linear_stats.items():
-            total_ops += stats.total_ops
-            effective_ops += stats.effective_ops
+        # Linear stats
+        for name, s in self._linear_stats.per_layer.items():
             per_layer[name] = {
                 'type': 'linear',
-                'total_ops': stats.total_ops,
-                'effective_ops': stats.effective_ops,
-                'density': stats.density,
-                'total_calls': stats.total_calls,
-                'sparse_calls': stats.sparse_calls,
+                'total_ops': s['total_ops'],
+                'effective_ops': s['effective_ops'],
+                'density': sum(s['densities']) / len(s['densities']) if s['densities'] else 1.0,
+                'total_calls': s['sparse_calls'] + s['dense_calls'],
+                'sparse_calls': s['sparse_calls'],
+            }
+
+        # Conv2d stats
+        for name, s in self._conv_stats.per_layer.items():
+            per_layer[name] = {
+                'type': 'conv2d',
+                'total_ops': s['total_ops'],
+                'effective_ops': s['effective_ops'],
+                'density': sum(s['densities']) / len(s['densities']) if s['densities'] else 1.0,
+                'total_calls': s['sparse_calls'] + s['dense_calls'],
+                'sparse_calls': s['sparse_calls'],
             }
 
         # Attention stats
-        for name, stats in self._attention_stats.items():
-            total_ops += stats.total_ops
-            effective_ops += stats.effective_ops
+        for name, astats in self._attention_stats.items():
+            total_ops += astats.total_ops
+            effective_ops += astats.effective_ops
             per_layer[name] = {
                 'type': 'attention',
-                'total_ops': stats.total_ops,
-                'effective_ops': stats.effective_ops,
-                'density': stats.density,
-                'total_calls': stats.total_calls,
-                'sparse_qk_calls': stats.sparse_qk_calls,
-                'sparse_av_calls': stats.sparse_av_calls,
+                'total_ops': astats.total_ops,
+                'effective_ops': astats.effective_ops,
+                'density': astats.density,
+                'total_calls': astats.total_calls,
+                'sparse_qk_calls': astats.sparse_qk_calls,
             }
-
-        density = effective_ops / max(total_ops, 1)
 
         return {
             'total_ops': total_ops,
             'effective_ops': effective_ops,
-            'density': density,
+            'density': effective_ops / max(total_ops, 1),
             'per_layer': per_layer,
         }
 
     def enable(self):
-        """Enable sparse execution."""
         super().enable()
         self._enabled_ref[0] = True
 
     def disable(self):
-        """Disable sparse execution (fall back to dense)."""
         super().disable()
         self._enabled_ref[0] = False
 
     def reset_stats(self):
-        """Clear all accumulated statistics."""
-        for stats in self._linear_stats.values():
-            stats.reset()
-        for stats in self._attention_stats.values():
-            stats.reset()
+        self._linear_stats.reset()
+        self._conv_stats.reset()
+        for s in self._attention_stats.values():
+            s.reset()
 
     @property
     def name(self):

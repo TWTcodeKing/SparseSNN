@@ -398,7 +398,6 @@ def main():
         model_name = os.path.splitext(os.path.basename(args.config))[0]
     else:
         # ResNet models: direct factory
-        model_kwargs = {'num_classes': num_classes}
         model_kwargs = {'in_channels': in_channels}
         if 'sew_' in args.model:
             model_kwargs['T'] = args.T
@@ -406,7 +405,7 @@ def main():
             model_kwargs['connect_f'] = args.connect_f
         else:
             model_kwargs['time_window'] = args.T
-        model = build_model(args.model, **model_kwargs)
+        model = build_model(args.model, num_classes=num_classes,**model_kwargs)
         model_name = args.model
 
     model = model.to(device)

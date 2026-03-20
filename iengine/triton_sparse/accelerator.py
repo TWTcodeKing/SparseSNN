@@ -1,174 +1,130 @@
-"""TritonSparseAccelerator: Triton-based sparse acceleration backend for SNN models.
+"""TritonSparseAccelerator — Triton GPU kernel backend for SNN sparsity.
 
-Instruments a model with:
-1. Sparse Conv2d hooks (im2col + Triton SpMM skipping zero columns)
-2. Block-sparse attention for SSA modules (Spikformer only)
-
-Config options:
-    density_threshold: float = 0.5   -- max im2col column density for sparse conv path
-    block_size: int = 16             -- block tile size for block-sparse attention
-    min_tensor_size: int = 4096      -- minimum M*K_nz elements to justify Triton launch
-    min_seq_len: int = 32            -- minimum sequence length N for block-sparse attention
+Instruments Conv2d layers with im2col + Triton SpMM and SSA modules
+with block-sparse attention, exploiting binary spike sparsity.
 """
 
 import torch.nn as nn
 
 from iengine.common.base import SparseAccelerator
 from iengine.common.hooks import monkey_patch_forward
-from .sparse_conv import make_sparse_conv2d_forward
-from .block_sparse_attn import apply_block_sparse_attention
+from iengine.common.stats import LinearStats, AttentionStats
+from .conversion import make_sparse_conv2d_forward, make_block_sparse_ssa_forward
 
 
 class TritonSparseAccelerator(SparseAccelerator):
-    """Triton GPU kernel backend for sparse SNN inference.
+    """Triton-based sparse inference backend for SNNs.
 
-    Exploits spike sparsity in two ways:
-    - Conv2d layers: im2col + SpMM that skips zero columns entirely
-    - SSA attention: block-sparse matmul that skips zero block tiles
+    1. Conv2d layers: im2col + Triton SpMM skipping zero columns.
+    2. SSA attention: block-sparse Q @ K^T via Triton kernel.
 
-    Performance note: For small CIFAR tensors (32x32), the Triton kernel launch
-    overhead may negate sparsity savings. This backend is most beneficial for
-    larger inputs (ImageNet 224x224) or deeper models with many Conv2d layers.
+    Config options:
+        density_threshold (float): Max density for sparse Conv2d (default 0.5).
+        block_size (int):          Tile size for block-sparse attention (default 16).
+        min_tensor_size (int):     Min elements to justify Triton launch (default 4096).
+        min_seq_len (int):         Min sequence length N for sparse attention (default 32).
+        enable_conv2d (bool):      Enable sparse Conv2d (default True).
+        enable_attention (bool):   Enable block-sparse attention (default True).
     """
 
     def __init__(self, config=None):
         super().__init__(config)
-        self._patched_modules = []  # list of (module, original_forward) for cleanup
-        self._stats = {}
-
-        # Config with defaults
         self._density_threshold = self.config.get('density_threshold', 0.5)
         self._block_size = self.config.get('block_size', 16)
         self._min_tensor_size = self.config.get('min_tensor_size', 4096)
         self._min_seq_len = self.config.get('min_seq_len', 32)
+        self._enable_conv2d = self.config.get('enable_conv2d', True)
+        self._enable_attention = self.config.get('enable_attention', True)
 
-    def prepare(self, model: nn.Module) -> nn.Module:
-        """Instrument model for Triton sparse execution.
+        self._conv_stats = LinearStats()
+        self._attention_stats = {}
+        self._original_forwards = {}
+        self._enabled_ref = [True]
 
-        1. Scan for nn.Conv2d modules, register sparse forward hooks.
-        2. Scan for SSA modules, apply block-sparse attention monkey-patch.
-
-        Args:
-            model: The SNN model (Spikformer, SEW-ResNet, MS-ResNet).
-
-        Returns:
-            The same model, now instrumented with sparse hooks/patches.
-        """
-        self._stats = {
-            'total_ops': 0,
-            'effective_ops': 0,
-            'sparse_launches': 0,
-            'dense_fallback': 0,
-            'skipped_zero': 0,
-            'attn_total_blocks': 0,
-            'attn_computed_blocks': 0,
-            'attn_sparse_calls': 0,
-            'attn_dense_fallback': 0,
-        }
-
-        # Monkey-patch Conv2d forwards
-        num_conv = 0
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Conv2d):
-                new_forward = make_sparse_conv2d_forward(
-                    module=module,
-                    original_forward=module.forward,
-                    stats=self._stats,
-                    density_threshold=self._density_threshold,
-                    min_tensor_size=self._min_tensor_size,
-                )
-                original = monkey_patch_forward(module, new_forward)
-                self._patched_modules.append((module, original))
-                num_conv += 1
-
-        # Apply block-sparse attention to SSA modules
-        ssa_patches = apply_block_sparse_attention(
-            model,
-            block_size=self._block_size,
-            min_seq_len=self._min_seq_len,
-            stats=self._stats,
-        )
-        self._patched_modules.extend(ssa_patches)
-
-        num_ssa = len(ssa_patches)
-        print(f"[TritonSparseAccelerator] Prepared: "
-              f"{num_conv} Conv2d hooks, {num_ssa} SSA patches")
-        print(f"  Config: density_threshold={self._density_threshold}, "
-              f"block_size={self._block_size}, "
-              f"min_tensor_size={self._min_tensor_size}")
-
+    def prepare(self, model):
+        if self._enable_conv2d:
+            self._patch_conv2d(model)
+        if self._enable_attention:
+            self._patch_ssa(model)
         self.attach_profiler(model)
         return model
 
-    def cleanup(self, model: nn.Module) -> nn.Module:
-        """Remove all hooks and restore original forward methods.
+    def _patch_conv2d(self, model):
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Conv2d) and module.groups == 1:
+                new_fwd = make_sparse_conv2d_forward(
+                    module, module.forward, name, self._conv_stats,
+                    self._density_threshold, self._min_tensor_size,
+                    self._enabled_ref)
+                original = monkey_patch_forward(module, new_fwd)
+                self._original_forwards[name] = (module, original)
 
-        Args:
-            model: The instrumented model.
+    def _patch_ssa(self, model):
+        for name, module in model.named_modules():
+            if module.__class__.__name__ == 'SSA':
+                attn_stats = AttentionStats()
+                self._attention_stats[name] = attn_stats
+                new_fwd = make_block_sparse_ssa_forward(
+                    module, attn_stats, name,
+                    self._block_size, self._min_seq_len,
+                    self._enabled_ref)
+                original = monkey_patch_forward(module, new_fwd)
+                self._original_forwards[name] = (module, original)
 
-        Returns:
-            The model with all instrumentation removed.
-        """
+    def cleanup(self, model):
         self.detach_profiler()
-        # Restore all original forwards (Conv2d + SSA)
-        num_restored = len(self._patched_modules)
-        for module, original_forward in self._patched_modules:
-            module.forward = original_forward
-        self._patched_modules.clear()
-
-        print(f"[TritonSparseAccelerator] Cleanup: {num_restored} forwards restored")
-
+        for _, (module, original_fwd) in self._original_forwards.items():
+            module.forward = original_fwd
+        self._original_forwards.clear()
         return model
 
-    def get_stats(self) -> dict:
-        """Return sparse execution statistics.
+    def get_stats(self):
+        total_ops = self._conv_stats.total_ops
+        effective_ops = self._conv_stats.effective_ops
+        per_layer = {}
 
-        Returns dict with:
-            - total_ops: Total MACs across all Conv2d layers
-            - effective_ops: Non-zero MACs actually computed
-            - density: effective_ops / total_ops
-            - sparse_launches: Number of Triton kernel launches for Conv2d
-            - dense_fallback: Times Conv2d fell back to dense
-            - skipped_zero: Conv2d calls with entirely zero input
-            - attn_total_blocks: Total attention blocks across all SSA calls
-            - attn_computed_blocks: Non-zero attention blocks computed
-            - attn_block_density: Fraction of attention blocks that were non-zero
-            - per_layer: {} (per-layer stats not tracked in this backend)
-        """
-        total = self._stats.get('total_ops', 0)
-        effective = self._stats.get('effective_ops', 0)
-        density = effective / max(total, 1)
+        for name, s in self._conv_stats.per_layer.items():
+            per_layer[name] = {
+                'type': 'conv2d',
+                'total_ops': s['total_ops'],
+                'effective_ops': s['effective_ops'],
+                'density': sum(s['densities']) / len(s['densities']) if s['densities'] else 1.0,
+                'total_calls': s['sparse_calls'] + s['dense_calls'],
+                'sparse_calls': s['sparse_calls'],
+            }
 
-        attn_total = self._stats.get('attn_total_blocks', 0)
-        attn_computed = self._stats.get('attn_computed_blocks', 0)
-        attn_density = attn_computed / max(attn_total, 1)
+        for name, astats in self._attention_stats.items():
+            total_ops += astats.total_ops
+            effective_ops += astats.effective_ops
+            per_layer[name] = {
+                'type': 'attention',
+                'total_ops': astats.total_ops,
+                'effective_ops': astats.effective_ops,
+                'density': astats.density,
+                'total_calls': astats.total_calls,
+                'sparse_qk_calls': astats.sparse_qk_calls,
+            }
 
         return {
-            'total_ops': total,
-            'effective_ops': effective,
-            'density': density,
-            'sparse_launches': self._stats.get('sparse_launches', 0),
-            'dense_fallback': self._stats.get('dense_fallback', 0),
-            'skipped_zero': self._stats.get('skipped_zero', 0),
-            'attn_total_blocks': attn_total,
-            'attn_computed_blocks': attn_computed,
-            'attn_block_density': attn_density,
-            'attn_sparse_calls': self._stats.get('attn_sparse_calls', 0),
-            'attn_dense_fallback': self._stats.get('attn_dense_fallback', 0),
-            'per_layer': {},
+            'total_ops': total_ops,
+            'effective_ops': effective_ops,
+            'density': effective_ops / max(total_ops, 1),
+            'per_layer': per_layer,
         }
 
-    @property
-    def name(self) -> str:
-        return 'TritonSparse'
-
     def enable(self):
-        """Enable sparse execution."""
         super().enable()
-        # Hooks check self._enabled via the stats dict
-        self._stats['_enabled'] = True
+        self._enabled_ref[0] = True
 
     def disable(self):
-        """Disable sparse execution (hooks become no-ops)."""
         super().disable()
-        self._stats['_enabled'] = False
+        self._enabled_ref[0] = False
+
+    def reset_stats(self):
+        self._conv_stats.reset()
+        for s in self._attention_stats.values():
+            s.reset()
+
+    @property
+    def name(self):
+        return 'TritonSparse'

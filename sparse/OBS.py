@@ -75,9 +75,17 @@ def collect_hessians(
         def hook_fn(module, inp, out):
             x = inp[0].detach().float()
             if isinstance(mod, nn.Conv2d):
-                # x: (B*T, C_in, H, W) → (C_in, B*T*H*W)
-                b, c, h, w = x.shape
-                x = x.permute(1, 0, 2, 3).reshape(c, -1)
+                # im2col unfolding: (B, C_in, H, W) → (B, C_in*Kh*Kw, L)
+                # Then (C_in*Kh*Kw, B*L) for Hessian H = X @ X^T
+                # This matches the 2D weight shape (C_out, C_in*Kh*Kw)
+                # used by SparseConv2d and OBS pruning.
+                import torch.nn.functional as F
+                x_unf = F.unfold(
+                    x, mod.kernel_size,
+                    dilation=mod.dilation, padding=mod.padding,
+                    stride=mod.stride,
+                )  # (B, C_in*Kh*Kw, L)
+                x = x_unf.permute(1, 0, 2).reshape(x_unf.shape[1], -1)  # (K, B*L)
             elif isinstance(mod, nn.Linear):
                 # x: (..., in_features) → (in_features, n)
                 x = x.reshape(-1, x.shape[-1]).T
@@ -263,25 +271,25 @@ def apply_obs_pruning(
             continue
 
         H = hessians[name]
-        in_ch = _get_in_channels(module)
         is_conv = isinstance(module, nn.Conv2d)
 
         W = module.weight.data.cpu().float()
         if is_conv:
+            # im2col layout: (C_out, C_in*Kh*Kw) — matches unfolded Hessian
             orig_shape = W.shape
-            W_2d = W.permute(0, 2, 3, 1).reshape(-1, in_ch).contiguous()
+            W_2d = W.reshape(W.shape[0], -1).contiguous()
         else:
             W_2d = W
             orig_shape = None
 
+        cols = W_2d.shape[1]
         W_orig_2d = W_2d.clone()
 
         # --- OBS prune ---
         W_pruned = obs_prune_layer(W_2d, H.cpu(), n=n, m=m, percdamp=percdamp)
 
         # --- Metrics ---
-        # Relative output error using H diagonal as activation magnitude proxy
-        r_proxy = H.cpu().diag().sqrt().clamp(min=1e-8)[:in_ch]
+        r_proxy = H.cpu().diag().sqrt().clamp(min=1e-8)[:cols]
         err = ((W_pruned - W_orig_2d) @ r_proxy).norm().item()
         ref = (W_orig_2d @ r_proxy).norm().item()
         rel_err = err / (ref + 1e-8)
@@ -295,9 +303,7 @@ def apply_obs_pruning(
 
         # --- Write back ---
         if is_conv:
-            C_out, C_in, Kh, Kw = orig_shape
-            W_back = (W_pruned.reshape(C_out, Kh, Kw, C_in)
-                      .permute(0, 3, 1, 2).contiguous())
+            W_back = W_pruned.reshape(orig_shape).contiguous()
         else:
             W_back = W_pruned
         module.weight.data.copy_(W_back)

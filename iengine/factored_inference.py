@@ -387,44 +387,46 @@ class FactoredInferenceEngine:
 
         speedup = dense_ms / max(fact_ms, 1e-6)
 
-        # ── FP16 full-model comparison ────────────────────────────────
-        # Eliminates dtype cast overhead in FactorizedLinear
+        # ── FP16 + torch.compile comparison ──────────────────────────
+        # Eliminates dtype cast overhead + Python hook overhead
         print(f"\n{'='*70}")
-        print("  FP16 Full-Model Comparison (no dtype cast overhead)")
+        print("  FP16 + torch.compile Comparison")
         print(f"{'='*70}")
 
-        # Dense fp16
-        model_fp16 = copy.deepcopy(model).half()
-        print("  Running dense fp16 baseline (warmup)...")
+        # Dense fp16 compiled
+        model_fp16 = torch.compile(copy.deepcopy(model).half())
+        print("  Running dense fp16 compiled (warmup)...")
         self._run_eval(model_fp16, dataloader, device, warmup=warmup, iterations=5,
                         input_dtype=torch.float16)
-        print("  Running dense fp16 baseline (accurate)...")
+        print("  Running dense fp16 compiled (accurate)...")
         dense_fp16_acc, dense_fp16_ms = self._run_eval(
             model_fp16, dataloader, device, warmup=0, iterations=iterations,
             input_dtype=torch.float16,
         )
-        print(f"    Dense fp16: {dense_fp16_ms:.3f} ms/sample, Acc: {dense_fp16_acc:.2f}%")
+        print(f"    Dense fp16 compiled: {dense_fp16_ms:.3f} ms/sample, Acc: {dense_fp16_acc:.2f}%")
         del model_fp16
 
-        # Factored fp16 (model.half() then factorize — no casts needed)
+        # Factored fp16 compiled (model.half() then factorize — no casts)
         model_fact_fp16 = copy.deepcopy(model).half()
         self.prepare(model_fact_fp16)
-        print("  Running factored fp16 (warmup)...")
-        self._run_eval(model_fact_fp16, dataloader, device, warmup=warmup, iterations=5,
+        FactorizedLinear.PROFILE = False
+        model_fact_fp16_c = torch.compile(model_fact_fp16)
+        print("  Running factored fp16 compiled (warmup)...")
+        self._run_eval(model_fact_fp16_c, dataloader, device, warmup=warmup, iterations=5,
                         input_dtype=torch.float16)
-        print("  Running factored fp16 (accurate)...")
+        print("  Running factored fp16 compiled (accurate)...")
         fact_fp16_acc, fact_fp16_ms = self._run_eval(
-            model_fact_fp16, dataloader, device, warmup=0, iterations=iterations,
+            model_fact_fp16_c, dataloader, device, warmup=0, iterations=iterations,
             input_dtype=torch.float16,
         )
-        print(f"    Factored fp16: {fact_fp16_ms:.3f} ms/sample, Acc: {fact_fp16_acc:.2f}%")
+        print(f"    Factored fp16 compiled: {fact_fp16_ms:.3f} ms/sample, Acc: {fact_fp16_acc:.2f}%")
 
         fp16_speedup = dense_fp16_ms / max(fact_fp16_ms, 1e-6)
-        print(f"\n  FP16 Speedup: {fp16_speedup:.2f}x")
+        print(f"\n  FP16 compiled Speedup: {fp16_speedup:.2f}x")
         print(f"  FP16 Acc delta: {fact_fp16_acc - dense_fp16_acc:+.2f}%")
 
         self.cleanup(model_fact_fp16)
-        del model_fact_fp16
+        del model_fact_fp16, model_fact_fp16_c
 
         # Cleanup fp32 factored model
         self.cleanup(model_fact)

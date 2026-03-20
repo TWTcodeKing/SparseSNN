@@ -68,8 +68,8 @@ class FactorizedLinear(nn.Module):
         W_24, W_res = factorize_weight_2_4(weight)
 
         # Store residual as dense fp16 parameter (no grad for inference)
-        self.W_res = nn.Parameter(W_res.half(), requires_grad=False)
-
+        # self.W_res = nn.Parameter(W_res.half(), requires_grad=False)
+        self.W_res = nn.Parameter(W_res, requires_grad=False)
         # Convert W_24 to SparseSemiStructuredTensor for hardware acceleration
         self._has_semi_structured = False
         self._semi_structured_error = None
@@ -77,26 +77,28 @@ class FactorizedLinear(nn.Module):
             from torch.sparse import SparseSemiStructuredTensor, to_sparse_semi_structured
             SparseSemiStructuredTensor._FORCE_CUTLASS = True
             # Must be on CUDA for semi-structured conversion
-            w24_cuda_fp16 = W_24.half().cuda()
+            # w24_cuda_fp16 = W_24.half().cuda()
+            w24_cuda = W_24.cuda()
             self.W_24 = nn.Parameter(
-                to_sparse_semi_structured(w24_cuda_fp16),
+                # to_sparse_semi_structured(w24_cuda_fp16),
+                to_sparse_semi_structured(w24_cuda),
                 requires_grad=False,
             )
             self._has_semi_structured = True
         except ImportError as e:
             self._semi_structured_error = f'ImportError: {e}'
-            self.W_24 = nn.Parameter(W_24.half(), requires_grad=False)
+            self.W_24 = nn.Parameter(W_24, requires_grad=False)
         except RuntimeError as e:
             self._semi_structured_error = f'RuntimeError: {e}'
-            self.W_24 = nn.Parameter(W_24.half(), requires_grad=False)
+            self.W_24 = nn.Parameter(W_24, requires_grad=False)
         except Exception as e:
             self._semi_structured_error = f'{type(e).__name__}: {e}'
-            self.W_24 = nn.Parameter(W_24.half(), requires_grad=False)
+            self.W_24 = nn.Parameter(W_24, requires_grad=False)
 
         # Bias
         if original_linear.bias is not None:
             self.bias = nn.Parameter(
-                original_linear.bias.data.half(), requires_grad=False
+                original_linear.bias.data, requires_grad=False
             )
         else:
             self.bias = None
@@ -113,62 +115,52 @@ class FactorizedLinear(nn.Module):
             pass
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Fast path: no profiling, no dtype check (for compiled fp16 models)
+        if not FactorizedLinear.PROFILE:
+            x_2d = x.reshape(-1, x.shape[-1])
+            output = (torch.nn.functional.linear(x_2d, self.W_24)
+                      + torch.nn.functional.linear(x_2d, self.W_res))
+            if self.bias is not None:
+                output = output + self.bias
+            return output.reshape(x.shape[:-1] + (self.out_features,))
+
+        # Profiled path: full instrumentation
         orig_shape = x.shape
         orig_dtype = x.dtype
-        need_cast = (orig_dtype != torch.float16)
-        profiling = FactorizedLinear.PROFILE
+        te_start = torch.cuda.Event(enable_timing=True)
+        te_end = torch.cuda.Event(enable_timing=True)
+        te_start.record()
 
-        if profiling:
-            te_start = torch.cuda.Event(enable_timing=True)
-            te_end = torch.cuda.Event(enable_timing=True)
-            te_start.record()
-
-        # Flatten to 2D for matmul: (..., in_features) -> (batch, in_features)
         x_2d = x.reshape(-1, x.shape[-1])
-        if need_cast:
-            x_2d = x_2d.half()
+        if orig_dtype != x_2d.dtype:
+            pass  # already correct dtype from model.half()
 
-        # ── Path 1: Main branch (W_24 @ x) — Sparse Tensor Core ──
-        if profiling:
-            t0 = torch.cuda.Event(enable_timing=True)
-            t1 = torch.cuda.Event(enable_timing=True)
-            t0.record()
+        t0 = torch.cuda.Event(enable_timing=True)
+        t1 = torch.cuda.Event(enable_timing=True)
+        t0.record()
         main = torch.nn.functional.linear(x_2d, self.W_24)
-        if profiling:
-            t1.record()
+        t1.record()
 
-        # ── Path 2: Residual branch (W_res @ x) — dense fp16 ──
-        if profiling:
-            t2 = torch.cuda.Event(enable_timing=True)
-            t3 = torch.cuda.Event(enable_timing=True)
-            t2.record()
+        t2 = torch.cuda.Event(enable_timing=True)
+        t3 = torch.cuda.Event(enable_timing=True)
+        t2.record()
         residual = torch.nn.functional.linear(x_2d, self.W_res)
-        if profiling:
-            t3.record()
+        t3.record()
 
-        # ── Combine ──
         output = main + residual
         if self.bias is not None:
             output = output + self.bias
 
-        # Restore shape and dtype
-        out_shape = orig_shape[:-1] + (self.out_features,)
-        if need_cast:
-            result = output.reshape(out_shape).to(orig_dtype)
-        else:
-            result = output.reshape(out_shape)
+        result = output.reshape(orig_shape[:-1] + (self.out_features,))
 
-        # ── Defer profiling event resolution (NO sync here!) ──
-        if profiling:
-            te_end.record()
-            lid = self._layer_name or id(self)
-            density = float((x_2d != 0).float().mean())
-            FactorizedLinear._profile_events.append(
-                (lid, t0, t1, t2, t3, te_start, te_end,
-                 (self.out_features, self.in_features),
-                 self._has_semi_structured, density)
-            )
-
+        te_end.record()
+        lid = self._layer_name or id(self)
+        density = float((x_2d != 0).float().mean())
+        FactorizedLinear._profile_events.append(
+            (lid, t0, t1, t2, t3, te_start, te_end,
+             (self.out_features, self.in_features),
+             self._has_semi_structured, density)
+        )
         return result
 
     @classmethod

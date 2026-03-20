@@ -1,15 +1,15 @@
-"""Post-training inference accelerator for SR-STE trained models.
+"""Post-training 2:4 sparse inference benchmark.
 
-Takes a model trained with SR-STE 2:4 structured sparsity regularization,
-applies hard 2:4 projection, converts to SparseSemiStructuredTensor, and
-benchmarks latency vs dense baseline.
+Takes a dense or SR-STE trained SNN model, applies hard 2:4 projection,
+converts to SparseSemiStructuredTensor (Linear + Conv2d), and benchmarks
+latency vs dense fp16 baseline with torch.compile.
 
 Usage:
-    uv run python -m iengine.structured_sparse.semi_structured_path \
+    python -m iengine.semi_structured.inference \
         --config configs/spikformer/spikformer_cifar.yaml \
         --dataset cifar100 --data-root /home/twt/datasets/ \
-        --checkpoint output/.../best_sparse.pth \
-        --gpu-ids 0
+        --checkpoint output/.../best.pth \
+        --gpu-ids 0 --compile
 """
 
 import argparse
@@ -24,15 +24,17 @@ import torch.nn as nn
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from models import reset_net
-from sparse.st_train import apply_hard_n_m_projection as apply_hard_2_4_projection
-from iengine.semi_structured.pruning import prune_2_4, verify_2_4
-from iengine.semi_structured.conversion import (
+from sparse.pruning import prune_2_4, verify_2_4
+from .conversion import (
     _dims_valid_for_semi_structured,
     _should_exclude,
     _make_semi_structured_forward,
+    _reshape_pre_hook,
+    _reshape_post_hook,
     _DENSE_WEIGHT_ATTR,
     _CONVERTED_FLAG,
     _FP16_HOOK_ATTR,
+    convert_to_semi_structured,
 )
 from tengine.utils import (
     set_seed,
@@ -49,6 +51,7 @@ def convert_srste_model(
     model: nn.Module,
     exclude_names: list = None,
     exclude_head: bool = True,
+    model_is_fp16: bool = False,
 ) -> dict:
     """Convert an SR-STE trained model to semi-structured sparse format.
 
@@ -57,12 +60,16 @@ def convert_srste_model(
         1. Hard-project to exact 2:4 (in case training ended mid-anneal)
         2. Convert to fp16
         3. Convert to SparseSemiStructuredTensor
-        4. Monkey-patch forward for fp16 handling
+        4. If model is fp32: monkey-patch forward for fp16 handling
+           If model is fp16: no monkey-patch needed (no dtype cast overhead)
 
     Args:
         model: SR-STE trained model on CUDA. Modified in-place.
         exclude_names: Module name prefixes to skip.
         exclude_head: If True, exclude modules named 'head'.
+        model_is_fp16: If True, skip the monkey-patched forward wrapper
+            that does fp32↔fp16 casts.  Set this when the entire model
+            has already been converted to fp16 via model.half().
 
     Returns:
         Dict of per-layer conversion info.
@@ -133,10 +140,17 @@ def convert_srste_model(
                     requires_grad=False,
                 )
 
-        # Monkey-patch forward for fp32->fp16 input cast and ND->2D flattening
-        _original_forward = module.forward
-        module.forward = _make_semi_structured_forward(_original_forward)
-        setattr(module, _FP16_HOOK_ATTR, _original_forward)
+        # SparseSemiStructuredTensor requires 2D input — always need reshape.
+        # When model is fp16: use lightweight pre/post hooks (no dtype cast,
+        #   minimal Python overhead via PyTorch's native hook dispatch).
+        # When model is fp32: monkey-patch forward with dtype cast wrapper.
+        if model_is_fp16:
+            module.register_forward_pre_hook(_reshape_pre_hook)
+            module.register_forward_hook(_reshape_post_hook)
+        else:
+            _original_forward = module.forward
+            module.forward = _make_semi_structured_forward(_original_forward)
+            setattr(module, _FP16_HOOK_ATTR, _original_forward)
 
         info['converted'] = True
         info['reason'] = 'success'
@@ -148,7 +162,7 @@ def convert_srste_model(
 
 
 @torch.no_grad()
-def _evaluate(model, loader, device, max_samples=None):
+def _evaluate(model, loader, device, max_samples=None, input_dtype=None):
     """Evaluate model accuracy."""
     model.eval()
     top1 = AverageMeter('Acc@1')
@@ -157,6 +171,8 @@ def _evaluate(model, loader, device, max_samples=None):
 
     for images, targets in loader:
         images = images.to(device, non_blocking=True)
+        if input_dtype is not None:
+            images = images.to(dtype=input_dtype)
         targets = targets.to(device, non_blocking=True)
 
         output = model(images)
@@ -175,12 +191,15 @@ def _evaluate(model, loader, device, max_samples=None):
 
 
 @torch.no_grad()
-def _benchmark_latency(model, loader, device, n_warmup=10, n_measure=50):
+def _benchmark_latency(model, loader, device, n_warmup=10, n_measure=50,
+                       input_dtype=None):
     """Benchmark per-sample inference latency."""
     model.eval()
     # Get a single batch for latency measurement
     images, _ = next(iter(loader))
     images = images.to(device)
+    if input_dtype is not None:
+        images = images.to(dtype=input_dtype)
 
     # Warmup
     for _ in range(n_warmup):
@@ -205,58 +224,98 @@ def benchmark_structured_sparse(
     device,
     max_samples=500,
     exclude_head=True,
+    use_compile=True,
 ):
-    """Full benchmark: dense baseline vs SR-STE semi-structured sparse.
+    """Benchmark dense fp16 vs 2:4 sparse fp16 — fair same-dtype comparison.
+
+    SparseSemiStructuredTensor requires fp16 inputs, so both dense and sparse
+    baselines run entirely in fp16.
+
+    When use_compile=True (default), both models are wrapped with
+    torch.compile to eliminate Python-level overhead from reshape hooks.
+    This gives a fair kernel-level comparison.
 
     Args:
-        model: Trained model (already on device, with SR-STE trained weights).
+        model: Trained model (already on device, fp32 weights).
         test_loader: Test data loader.
         device: CUDA device.
         max_samples: Max samples for accuracy evaluation.
         exclude_head: Whether to exclude classification head from conversion.
+        use_compile: Whether to apply torch.compile to both models.
 
     Returns:
         Dict with dense and sparse metrics and comparison.
     """
+    import copy
     results = {}
 
-    # ---- Dense baseline ----
-    print("--- Dense Baseline ---")
-    dense_acc = _evaluate(model, test_loader, device, max_samples)
-    dense_latency = _benchmark_latency(model, test_loader, device)
+    compile_tag = " + torch.compile" if use_compile else ""
+
+    # ---- Dense fp16 baseline ----
+    print(f"--- Dense Baseline (fp16{compile_tag}) ---")
+    model_dense_fp16 = copy.deepcopy(model).half()
+    if use_compile:
+        model_dense_fp16 = torch.compile(model_dense_fp16)
+    dense_acc = _evaluate(model_dense_fp16, test_loader, device,
+                          max_samples, input_dtype=torch.float16)
+    dense_latency = _benchmark_latency(model_dense_fp16, test_loader, device,
+                                       input_dtype=torch.float16)
     results['dense'] = {**dense_acc, 'latency_ms': dense_latency}
     print(f"  Acc@1: {dense_acc['acc1']:.2f}%  |  Latency: {dense_latency:.3f} ms/sample")
+    del model_dense_fp16
 
-    # ---- Hard project + convert to semi-structured ----
-    print("\n--- Applying SR-STE Hard Projection + Semi-Structured Conversion ---")
-    proj_stats = apply_hard_2_4_projection(model)
-    n_projected = sum(1 for v in proj_stats.values() if v['projected'])
-    print(f"  Hard-projected {n_projected} Linear layers to 2:4")
+    # ---- Build sparse fp16 model ----
+    print(f"\n--- Applying 2:4 Pruning + Semi-Structured Conversion (fp16{compile_tag}) ---")
+    model_sparse = copy.deepcopy(model)
 
-    conv_info = convert_srste_model(model, exclude_head=exclude_head)
-    n_converted = sum(1 for v in conv_info.values() if v['converted'])
-    print(f"  Converted {n_converted} layers to SparseSemiStructuredTensor")
+    # convert_to_semi_structured handles both Linear and Conv2d:
+    #   - 2:4 magnitude pruning
+    #   - fp16 conversion
+    #   - SparseSemiStructuredTensor wrapping (Linear) / SparseConv2d replacement (Conv2d)
+    model_sparse = model_sparse.to(device)
+    conv_info = convert_to_semi_structured(
+        model_sparse, exclude_head=exclude_head, convert_conv2d=True)
+    n_lin = sum(1 for v in conv_info.values() if v['converted'] and v['type'] == 'Linear')
+    n_conv = sum(1 for v in conv_info.values() if v['converted'] and v['type'] == 'Conv2d')
+    print(f"  Converted {n_lin} Linear + {n_conv} Conv2d to SparseSemiStructuredTensor")
 
-    # ---- Sparse evaluation ----
-    print("\n--- Sparse (2:4 Semi-Structured) ---")
-    sparse_acc = _evaluate(model, test_loader, device, max_samples)
-    sparse_latency = _benchmark_latency(model, test_loader, device)
+    # Convert remaining non-sparse layers to fp16 for fair comparison
+    # (SparseConv2d and converted Linear are already fp16;
+    #  this catches BN, LIF neurons, unconverted layers, etc.)
+    model_sparse = model_sparse.half()
+
+    if use_compile:
+        model_sparse = torch.compile(model_sparse)
+
+    # ---- Sparse fp16 evaluation ----
+    print(f"\n--- Sparse 2:4 (fp16{compile_tag}) ---")
+    sparse_acc = _evaluate(model_sparse, test_loader, device,
+                           max_samples, input_dtype=torch.float16)
+    sparse_latency = _benchmark_latency(model_sparse, test_loader, device,
+                                        input_dtype=torch.float16)
     results['sparse'] = {**sparse_acc, 'latency_ms': sparse_latency}
     print(f"  Acc@1: {sparse_acc['acc1']:.2f}%  |  Latency: {sparse_latency:.3f} ms/sample")
+
+    del model_sparse
 
     # ---- Comparison ----
     acc_drop = dense_acc['acc1'] - sparse_acc['acc1']
     speedup = dense_latency / sparse_latency if sparse_latency > 0 else float('inf')
+
     results['comparison'] = {
         'acc_drop': acc_drop,
         'speedup': speedup,
-        'projection_stats': proj_stats,
         'conversion_info': conv_info,
     }
 
-    print(f"\n--- Comparison ---")
-    print(f"  Accuracy drop: {acc_drop:+.2f}%")
+    print(f"\n{'='*60}")
+    print(f"  Summary (fp16{compile_tag})")
+    print(f"{'='*60}")
+    print(f"  Dense fp16:    {dense_latency:.3f} ms/sample  Acc: {dense_acc['acc1']:.2f}%")
+    print(f"  Sparse fp16:   {sparse_latency:.3f} ms/sample  Acc: {sparse_acc['acc1']:.2f}%")
     print(f"  Speedup:       {speedup:.2f}x")
+    print(f"  Accuracy drop: {acc_drop:+.2f}%")
+    print(f"{'='*60}")
 
     return results
 
@@ -282,6 +341,11 @@ def parse_args():
                         action='store_false')
     parser.add_argument('--T', type=int, default=None,
                         help='Override number of timesteps')
+    parser.add_argument('--compile', action='store_true', default=True,
+                        help='Use torch.compile to remove hook/reshape overhead '
+                             '(default: True)')
+    parser.add_argument('--no-compile', dest='compile', action='store_false',
+                        help='Disable torch.compile (eager mode)')
     return parser.parse_args()
 
 
@@ -325,10 +389,12 @@ def main():
     print(f"Model loaded. Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Run benchmark
+    print(f"torch.compile: {'enabled' if args.compile else 'disabled'}")
     results = benchmark_structured_sparse(
         model, test_loader, device,
         max_samples=args.max_samples,
         exclude_head=args.exclude_head,
+        use_compile=args.compile,
     )
 
     return results

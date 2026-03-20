@@ -54,9 +54,9 @@ class BasicBlock18(nn.Module):
 class MSResNet18(nn.Module):
     """MS-ResNet for ResNet-18/34 configuration."""
 
-    def __init__(self, block, num_block, in_channels, num_classes=1000, time_window=None):
+    def __init__(self, block, num_block, in_channels, num_classes=1000, T=None):
         super().__init__()
-        self.time_window = time_window or _TIME_WINDOW
+        self.time_window = T or _TIME_WINDOW
         self.in_channels = 64
 
         self.conv1 = SeqToANNContainer(
@@ -179,11 +179,11 @@ class MSResNet104(nn.Module):
         return output
 
 
-def ms_resnet18(num_classes=1000, time_window=6, **kwargs):
-    return MSResNet18(BasicBlock18, [2, 2, 2, 2], **kwargs)
+def ms_resnet18(num_classes=1000,**kwargs):
+    return MSResNet18(BasicBlock18, [2, 2, 2, 2], num_classes=num_classes,**kwargs)
 
-def ms_resnet34(num_classes=1000, time_window=6, **kwargs):
-    return MSResNet18(BasicBlock18, [3, 4, 6, 3], **kwargs)
+def ms_resnet34(num_classes=1000, **kwargs):
+    return MSResNet18(BasicBlock18, [3, 4, 6, 3], num_classes=num_classes, **kwargs)
 
-def ms_resnet104(num_classes=1000, time_window=6, **kwargs):
-    return MSResNet104(BasicBlock104, [3, 8, 32, 8], **kwargs)
+def ms_resnet104(num_classes=1000, **kwargs):
+    return MSResNet104(BasicBlock104, [3, 8, 32, 8], num_classes=num_classes,**kwargs)

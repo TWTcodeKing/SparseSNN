@@ -1,183 +1,151 @@
-"""Sputnik sparse acceleration backend for SNN models.
+"""SputnikAccelerator — Google Sputnik CUDA SpMM backend for SNNs.
 
-Instruments a model with Sputnik SpMM hooks on nn.Linear layers and
-monkey-patches SSA attention modules for sparse execution.
+Instruments nn.Linear layers and SSA attention modules with Sputnik
+sparse kernels.  Gracefully degrades if torch_sputnik is not installed.
 """
 
 import torch.nn as nn
 
 from iengine.common.base import SparseAccelerator
 from iengine.common.hooks import monkey_patch_forward
-from .sparse_linear import (
-    _check_sputnik, SputnikLinearStats, make_sparse_linear_forward,
-)
-from .sparse_attention import (
-    SputnikAttentionStats, make_sparse_ssa_forward,
-)
+from iengine.common.stats import LinearStats, AttentionStats
+from .kernels import check_sputnik
+from .conversion import make_sparse_linear_forward, make_sparse_ssa_forward
 
 
 class SputnikAccelerator(SparseAccelerator):
     """Sparse acceleration using Google Research's Sputnik CUDA kernels.
 
-    Uses Sputnik SpMM for:
-    1. nn.Linear layers: sparse_activation @ weight.T (activation sparsity)
-    2. SSA attention: sparse_Q @ K.T (spike sparsity in queries)
+    1. nn.Linear: Sputnik SpMM for sparse activations.
+    2. SSA attention: Sputnik SpMM for sparse Q @ K^T.
 
     Config options:
-        density_threshold (float): Max density to use sparse path. Default 0.15.
-        min_elements (int): Min tensor elements for sparse path. Default 4096.
-        hook_linear (bool): Whether to hook nn.Linear layers. Default True.
-        hook_attention (bool): Whether to patch SSA attention. Default True.
-        exclude_layers (list): Layer name patterns to skip. Default [].
+        density_threshold (float): Max density for sparse path (default 0.15).
+        min_elements (int):        Min tensor elements for sparse (default 4096).
+        hook_linear (bool):        Hook nn.Linear layers (default True).
+        hook_attention (bool):     Hook SSA modules (default True).
+        exclude_layers (list):     Layer name patterns to skip.
     """
 
-    def __init__(self, config: dict = None):
+    def __init__(self, config=None):
         super().__init__(config)
-        self._linear_stats = SputnikLinearStats()
-        self._attn_stats = SputnikAttentionStats()
-        self._original_forwards = {}  # module_id -> (module, original_forward)
-        self._enabled_ref = [True]  # mutable reference for hooks
-
-        # Config
         self._density_threshold = self.config.get('density_threshold', 0.15)
         self._min_elements = self.config.get('min_elements', 4096)
         self._hook_linear = self.config.get('hook_linear', True)
         self._hook_attention = self.config.get('hook_attention', True)
         self._exclude_layers = self.config.get('exclude_layers', [])
 
-        # Check availability
-        self._available = _check_sputnik()
+        self._linear_stats = LinearStats()
+        self._attention_stats = {}  # {name: AttentionStats}
+        self._original_forwards = {}
+        self._enabled_ref = [True]
+
+        self._available = check_sputnik()
         if not self._available:
-            print(
-                "[SputnikAccelerator] WARNING: torch_sputnik not installed.\n"
-                "  Sparse acceleration will be disabled.\n"
-                "  Build from source: bash iengine/sputnik_sparse/build.sh\n"
-                "  See iengine/sputnik_sparse/INSTALL.md for details."
-            )
+            print("[SputnikAccelerator] WARNING: torch_sputnik not installed.\n"
+                  "  Build: bash iengine/sputnik_sparse/build.sh")
 
     @property
-    def available(self) -> bool:
-        """Whether the Sputnik backend is available."""
+    def available(self):
         return self._available
 
-    def prepare(self, model: nn.Module) -> nn.Module:
-        """Instrument model with Sputnik sparse hooks.
-
-        Registers forward hooks on nn.Linear layers and monkey-patches
-        SSA.forward() for sparse attention computation.
-
-        Args:
-            model: The SNN model to instrument.
-
-        Returns:
-            The same model with hooks attached.
-        """
+    def prepare(self, model):
         if not self._available:
-            print("[SputnikAccelerator] Skipping prepare — torch_sputnik not available.")
+            print("[SputnikAccelerator] Skipping — torch_sputnik not available.")
             return model
 
-        self._linear_stats.reset()
-        self._attn_stats.reset()
-        self._enabled_ref[0] = True
-
-        # Monkey-patch nn.Linear layers
         if self._hook_linear:
-            count = 0
-            for name, module in model.named_modules():
-                if isinstance(module, nn.Linear):
-                    if any(ex in name for ex in self._exclude_layers):
-                        continue
-                    new_forward = make_sparse_linear_forward(
-                        module=module,
-                        original_forward=module.forward,
-                        layer_name=name,
-                        stats=self._linear_stats,
-                        density_threshold=self._density_threshold,
-                        min_elements=self._min_elements,
-                        enabled_ref=self._enabled_ref,
-                    )
-                    original = monkey_patch_forward(module, new_forward)
-                    self._original_forwards[id(module)] = (module, original)
-                    count += 1
-            print(f"[SputnikAccelerator] Patched {count} nn.Linear layers")
-
-        # Monkey-patch SSA attention modules
+            self._patch_linear(model)
         if self._hook_attention:
-            count = 0
-            for name, module in model.named_modules():
-                if module.__class__.__name__ == 'SSA':
-                    if any(ex in name for ex in self._exclude_layers):
-                        continue
-                    sparse_fwd = make_sparse_ssa_forward(
-                        ssa_module=module,
-                        module_name=name,
-                        stats=self._attn_stats,
-                        density_threshold=self._density_threshold,
-                        min_elements=self._min_elements,
-                        enabled_ref=self._enabled_ref,
-                    )
-                    original = monkey_patch_forward(module, sparse_fwd)
-                    self._original_forwards[id(module)] = (module, original)
-                    count += 1
-            print(f"[SputnikAccelerator] Patched {count} SSA attention modules")
-
+            self._patch_ssa(model)
         self.attach_profiler(model)
         return model
 
-    def cleanup(self, model: nn.Module) -> nn.Module:
-        """Remove all hooks and restore original forward methods.
+    def _should_skip(self, name):
+        return any(ex in name for ex in self._exclude_layers)
 
-        Args:
-            model: The instrumented model.
+    def _patch_linear(self, model):
+        count = 0
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear) and not self._should_skip(name):
+                new_fwd = make_sparse_linear_forward(
+                    module, module.forward, name, self._linear_stats,
+                    self._density_threshold, self._min_elements,
+                    self._enabled_ref)
+                original = monkey_patch_forward(module, new_fwd)
+                self._original_forwards[name] = (module, original)
+                count += 1
+        print(f"[SputnikAccelerator] Patched {count} Linear layers")
 
-        Returns:
-            The model with all instrumentation removed.
-        """
+    def _patch_ssa(self, model):
+        count = 0
+        for name, module in model.named_modules():
+            if module.__class__.__name__ == 'SSA' and not self._should_skip(name):
+                attn_stats = AttentionStats()
+                self._attention_stats[name] = attn_stats
+                new_fwd = make_sparse_ssa_forward(
+                    module, attn_stats, name,
+                    self._density_threshold, self._min_elements,
+                    self._enabled_ref)
+                original = monkey_patch_forward(module, new_fwd)
+                self._original_forwards[name] = (module, original)
+                count += 1
+        print(f"[SputnikAccelerator] Patched {count} SSA modules")
+
+    def cleanup(self, model):
         self.detach_profiler()
-        # Restore all original forwards (Linear + SSA)
-        n_restored = 0
-        for module, original_forward in self._original_forwards.values():
-            module.forward = original_forward
-            n_restored += 1
+        for _, (module, original_fwd) in self._original_forwards.items():
+            module.forward = original_fwd
         self._original_forwards.clear()
-        print(f"[SputnikAccelerator] Restored {n_restored} forward methods")
-
         return model
 
-    def get_stats(self) -> dict:
-        """Return sparse execution statistics.
-
-        Returns:
-            dict with total_ops, effective_ops, density, per_layer, and
-            backend-specific counters.
-        """
-        linear = self._linear_stats.to_dict()
-        attn = self._attn_stats.to_dict()
-
-        total_ops = linear['total_ops'] + attn['total_ops']
-        effective_ops = linear['effective_ops'] + attn['effective_ops']
-        density = effective_ops / total_ops if total_ops > 0 else 1.0
-
-        # Merge per-layer stats
+    def get_stats(self):
+        total_ops = self._linear_stats.total_ops
+        effective_ops = self._linear_stats.effective_ops
         per_layer = {}
-        per_layer.update(linear.get('per_layer', {}))
-        per_layer.update(attn.get('per_layer', {}))
+
+        for name, s in self._linear_stats.per_layer.items():
+            per_layer[name] = {
+                'type': 'linear',
+                'total_ops': s['total_ops'],
+                'effective_ops': s['effective_ops'],
+                'density': sum(s['densities']) / len(s['densities']) if s['densities'] else 1.0,
+                'total_calls': s['sparse_calls'] + s['dense_calls'],
+                'sparse_calls': s['sparse_calls'],
+            }
+
+        for name, astats in self._attention_stats.items():
+            total_ops += astats.total_ops
+            effective_ops += astats.effective_ops
+            per_layer[name] = {
+                'type': 'attention',
+                'total_ops': astats.total_ops,
+                'effective_ops': astats.effective_ops,
+                'density': astats.density,
+                'total_calls': astats.total_calls,
+                'sparse_qk_calls': astats.sparse_qk_calls,
+            }
 
         return {
             'total_ops': total_ops,
             'effective_ops': effective_ops,
-            'density': density,
+            'density': effective_ops / max(total_ops, 1),
             'per_layer': per_layer,
-            'linear': linear,
-            'attention': attn,
         }
 
     def enable(self):
-        """Enable sparse execution."""
         super().enable()
         self._enabled_ref[0] = True
 
     def disable(self):
-        """Disable sparse execution (fall back to dense)."""
         super().disable()
         self._enabled_ref[0] = False
+
+    def reset_stats(self):
+        self._linear_stats.reset()
+        for s in self._attention_stats.values():
+            s.reset()
+
+    @property
+    def name(self):
+        return 'Sputnik'

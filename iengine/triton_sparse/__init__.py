@@ -1,28 +1,19 @@
-"""Triton-based sparse acceleration backend for Spiking Neural Networks.
+"""Triton-based sparse acceleration backend for SNNs.
 
-Provides GPU kernels that exploit spike sparsity:
-- Sparse Conv2d: im2col + SpMM that skips zero columns via Triton kernel
-- Block-sparse attention: block-sparse matmul for SSA (Spikformer)
+Custom GPU kernels that exploit SNN binary spike sparsity:
+  - Conv2d: im2col + SpMM skipping zero columns
+  - SSA attention: block-sparse Q @ K^T
 
-Usage:
-    from iengine.triton_sparse import TritonSparseAccelerator
+Note: Kernel launch overhead dominates for small tensors (CIFAR).
+Best suited for larger inputs or very sparse activations (<15%).
 
-    accel = TritonSparseAccelerator(config={
-        'density_threshold': 0.5,
-        'block_size': 16,
-        'min_tensor_size': 4096,
-    })
-    model = accel.prepare(model)
-    output = model(input)
-    stats = accel.get_stats()
-    model = accel.cleanup(model)
+Provides:
+  - accelerator: TritonSparseAccelerator (SparseAccelerator interface)
+  - kernels:     Raw Triton JIT kernel definitions
+  - inference:   benchmark_triton_sparse() — single entry point
 """
 
 from .accelerator import TritonSparseAccelerator
-from .kernels import sparse_matmul_kernel, block_sparse_matmul_kernel
+from .inference import benchmark_triton_sparse
 
-__all__ = [
-    'TritonSparseAccelerator',
-    'sparse_matmul_kernel',
-    'block_sparse_matmul_kernel',
-]
+__all__ = ['TritonSparseAccelerator', 'benchmark_triton_sparse']

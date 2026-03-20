@@ -15,7 +15,6 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from iengine.common.base import SparseAccelerator
-from .pruning import prune_model_linear
 from .conversion import (
     convert_linear_to_semi_structured,
     restore_dense,

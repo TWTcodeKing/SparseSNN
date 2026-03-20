@@ -95,6 +95,7 @@ def benchmark_torch_sparse(
     use_compile: bool = True,
     n_warmup: int = 50,
     n_measure: int = 200,
+    fuse_neurons: bool = False,
 ) -> dict:
     """Benchmark dense vs CSR-sparse inference for SNN models.
 
@@ -117,12 +118,15 @@ def benchmark_torch_sparse(
     Returns:
         Dict with keys: dense, sparse, comparison, exec_stats.
     """
+    from iengine.common.neuron_utils import maybe_fuse_neurons
     results = {}
     compile_tag = " + torch.compile" if use_compile else ""
+    neuron_tag = " + fused neurons" if fuse_neurons else ""
 
     # ---- Dense baseline ----
-    print(f"--- Dense Baseline{compile_tag} ---")
+    print(f"--- Dense Baseline{compile_tag}{neuron_tag} ---")
     model_dense = copy.deepcopy(model)
+    maybe_fuse_neurons(model_dense, fuse=fuse_neurons)
     if use_compile:
         model_dense = torch.compile(model_dense)
     dense_acc = _evaluate(model_dense, test_loader, device, max_samples)
@@ -146,6 +150,7 @@ def benchmark_torch_sparse(
         'enable_attention': enable_attention,
     })
     model_sparse = copy.deepcopy(model)
+    maybe_fuse_neurons(model_sparse, fuse=fuse_neurons)
     accel.prepare(model_sparse)
 
     sparse_acc = _evaluate(model_sparse, test_loader, device, max_samples)
@@ -225,6 +230,8 @@ def parse_args():
     parser.add_argument('--no-attention', action='store_true')
     parser.add_argument('--compile', action='store_true', default=True)
     parser.add_argument('--no-compile', dest='compile', action='store_false')
+    parser.add_argument('--fuse-neurons', action='store_true', default=False,
+                        help='Replace LIF/IF neurons with fused Triton kernels')
     parser.add_argument('--seed', type=int, default=42)
     return parser.parse_args()
 
@@ -273,6 +280,7 @@ def main():
         use_compile=args.compile,
         n_warmup=args.n_warmup,
         n_measure=args.n_measure,
+        fuse_neurons=args.fuse_neurons,
     )
 
 

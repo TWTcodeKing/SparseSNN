@@ -252,6 +252,7 @@ class FactoredInferenceEngine:
         device: torch.device,
         warmup: int = 10,
         iterations: int = 100,
+        fuse_neurons: bool = False,
     ) -> dict:
         """Benchmark factorized inference vs dense baseline.
 
@@ -277,6 +278,11 @@ class FactoredInferenceEngine:
                 - conversion_info: per-layer conversion details
         """
         model.eval()
+
+        from iengine.common.neuron_utils import maybe_fuse_neurons
+        if fuse_neurons:
+            print("  Fusing LIF/IF neurons with Triton kernels...")
+            maybe_fuse_neurons(model, fuse=True)
 
         exclude_names = list(self.config.get('exclude_names', []))
 
@@ -394,7 +400,9 @@ class FactoredInferenceEngine:
         print(f"{'='*70}")
 
         # Dense fp16 compiled
-        model_fp16 = torch.compile(copy.deepcopy(model).half())
+        model_fp16_raw = copy.deepcopy(model).half()
+        maybe_fuse_neurons(model_fp16_raw, fuse=fuse_neurons, verbose=False)
+        model_fp16 = torch.compile(model_fp16_raw)
         print("  Running dense fp16 compiled (warmup)...")
         self._run_eval(model_fp16, dataloader, device, warmup=warmup, iterations=5,
                         input_dtype=torch.float16)
@@ -408,6 +416,7 @@ class FactoredInferenceEngine:
 
         # Factored fp16 compiled (model.half() then factorize — no casts)
         model_fact_fp16 = copy.deepcopy(model).half()
+        maybe_fuse_neurons(model_fact_fp16, fuse=fuse_neurons, verbose=False)
         self.prepare(model_fact_fp16)
         FactorizedLinear.PROFILE = False
         model_fact_fp16_c = torch.compile(model_fact_fp16)
@@ -581,6 +590,8 @@ def parse_args():
                         help='Batch size for evaluation')
     parser.add_argument('--exclude-names', nargs='*', default=None,
                         help='Module names to exclude from factorization')
+    parser.add_argument('--fuse-neurons', action='store_true', default=False,
+                        help='Replace LIF/IF neurons with fused Triton kernels')
     return parser.parse_args()
 
 
@@ -614,13 +625,8 @@ def main():
         })
         model = build_model_from_config(model_cfg)
     elif args.model is not None:
-        model_kwargs = {'num_classes': num_classes}
-        if 'sew_' in args.model:
-            model_kwargs['T'] = args.T
-            model_kwargs['connect_f'] = 'ADD'
-        else:
-            model_kwargs['time_window'] = args.T
-        model = build_model(args.model, **model_kwargs)
+        model = build_model(args.model, num_classes=num_classes,
+                            in_channels=in_channels, T=args.T)
     else:
         raise ValueError("Must provide either --config or --model")
 
@@ -659,6 +665,7 @@ def main():
     results = engine.benchmark(
         model, val_loader, device,
         warmup=args.warmup, iterations=args.iterations,
+        fuse_neurons=args.fuse_neurons,
     )
 
     # Print summary

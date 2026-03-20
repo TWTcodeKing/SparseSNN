@@ -225,6 +225,7 @@ def benchmark_structured_sparse(
     max_samples=500,
     exclude_head=True,
     use_compile=True,
+    fuse_neurons=False,
 ):
     """Benchmark dense fp16 vs 2:4 sparse fp16 — fair same-dtype comparison.
 
@@ -247,13 +248,16 @@ def benchmark_structured_sparse(
         Dict with dense and sparse metrics and comparison.
     """
     import copy
+    from iengine.common.neuron_utils import maybe_fuse_neurons
     results = {}
 
     compile_tag = " + torch.compile" if use_compile else ""
+    neuron_tag = " + fused neurons" if fuse_neurons else ""
 
     # ---- Dense fp16 baseline ----
-    print(f"--- Dense Baseline (fp16{compile_tag}) ---")
+    print(f"--- Dense Baseline (fp16{compile_tag}{neuron_tag}) ---")
     model_dense_fp16 = copy.deepcopy(model).half()
+    maybe_fuse_neurons(model_dense_fp16, fuse=fuse_neurons)
     if use_compile:
         model_dense_fp16 = torch.compile(model_dense_fp16)
     dense_acc = _evaluate(model_dense_fp16, test_loader, device,
@@ -283,6 +287,7 @@ def benchmark_structured_sparse(
     # (SparseConv2d and converted Linear are already fp16;
     #  this catches BN, LIF neurons, unconverted layers, etc.)
     model_sparse = model_sparse.half()
+    maybe_fuse_neurons(model_sparse, fuse=fuse_neurons)
 
     if use_compile:
         model_sparse = torch.compile(model_sparse)
@@ -309,10 +314,10 @@ def benchmark_structured_sparse(
     }
 
     print(f"\n{'='*60}")
-    print(f"  Summary (fp16{compile_tag})")
+    print(f"  Summary (fp16{compile_tag}{neuron_tag})")
     print(f"{'='*60}")
-    print(f"  Dense fp16:    {dense_latency:.3f} ms/sample  Acc: {dense_acc['acc1']:.2f}%")
-    print(f"  Sparse fp16:   {sparse_latency:.3f} ms/sample  Acc: {sparse_acc['acc1']:.2f}%")
+    print(f"  Dense fp16:      {dense_latency:.3f} ms/sample  Acc: {dense_acc['acc1']:.2f}%")
+    print(f"  Sparse fp16:     {sparse_latency:.3f} ms/sample  Acc: {sparse_acc['acc1']:.2f}%")
     print(f"  Speedup:       {speedup:.2f}x")
     print(f"  Accuracy drop: {acc_drop:+.2f}%")
     print(f"{'='*60}")
@@ -324,8 +329,10 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='Benchmark SR-STE structured sparse model with semi-structured acceleration'
     )
-    parser.add_argument('--config', type=str, required=True,
+    parser.add_argument('--config', type=str, default=None,
                         help='Model config YAML path')
+    parser.add_argument('--model', type=str, default=None,
+                        help='ResNet model name (e.g. ms_resnet34)')
     parser.add_argument('--dataset', type=str, required=True,
                         choices=['cifar10', 'cifar100', 'imagenet', 'cifar10dvs'])
     parser.add_argument('--data-root', type=str, required=True,
@@ -346,6 +353,8 @@ def parse_args():
                              '(default: True)')
     parser.add_argument('--no-compile', dest='compile', action='store_false',
                         help='Disable torch.compile (eager mode)')
+    parser.add_argument('--fuse-neurons', action='store_true', default=False,
+                        help='Replace LIF/IF neurons with fused Triton kernels')
     return parser.parse_args()
 
 
@@ -358,26 +367,31 @@ def main():
     torch.cuda.set_device(device)
 
     print(f"Device: {device} ({torch.cuda.get_device_name(device)})")
-    print(f"Config: {args.config}")
     print(f"Dataset: {args.dataset}")
     print(f"Checkpoint: {args.checkpoint}")
 
     # Build dataloader
+    ds_config = get_dataset_config(args.dataset)
     _, test_loader = build_dataloaders(
         args.dataset, args.data_root, args.batch_size,
         num_workers=4, distributed=False,
     )
 
     # Load model
-    config = load_model_config(args.config)
-    ds_config = get_dataset_config(args.dataset)
-    config.update(ds_config)
-    if args.T is not None:
-        config['T'] = args.T
-    elif 'T' not in config:
-        config['T'] = 4
-
-    model = build_model_from_config(config)
+    if args.config:
+        config = load_model_config(args.config)
+        config.update(ds_config)
+        if args.T is not None:
+            config['T'] = args.T
+        elif 'T' not in config:
+            config['T'] = 4
+        model = build_model_from_config(config)
+    elif args.model:
+        from tengine.utils import build_model
+        model = build_model(args.model, num_classes=ds_config['num_classes'],
+                            in_channels=ds_config['in_channels'], T=args.T or 4)
+    else:
+        raise ValueError("Must provide --config or --model")
 
     # Load checkpoint
     ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
@@ -395,6 +409,7 @@ def main():
         max_samples=args.max_samples,
         exclude_head=args.exclude_head,
         use_compile=args.compile,
+        fuse_neurons=args.fuse_neurons,
     )
 
     return results

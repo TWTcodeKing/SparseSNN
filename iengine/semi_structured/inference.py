@@ -115,17 +115,15 @@ def convert_srste_model(
             # Back up original dense weight
             setattr(module, _DENSE_WEIGHT_ATTR, module.weight.data.clone().cpu())
 
-            # Hard-project to 2:4 (in case not already exact)
-            w_projected = prune_2_4(module.weight.data)
-
-            # Convert to fp16
-            w_fp16 = w_projected.half()
-
-            # Verify 2:4 pattern
+            # Convert to fp16, then check/apply 2:4
+            w_fp16 = module.weight.data.half()
             if not verify_2_4(w_fp16):
-                info['reason'] = 'failed 2:4 verification after projection'
-                conversion_info[name] = info
-                continue
+                # Not yet 2:4 — apply magnitude pruning
+                w_fp16 = prune_2_4(w_fp16)
+                if not verify_2_4(w_fp16):
+                    info['reason'] = 'failed 2:4 verification after projection'
+                    conversion_info[name] = info
+                    continue
 
             # Convert to SparseSemiStructuredTensor
             module.weight = nn.Parameter(

@@ -384,10 +384,12 @@ def convert_to_semi_structured(
 
             if is_linear:
                 w_fp16 = module.weight.data.half()
-                w_pruned = prune_2_4(w_fp16)
+                # Skip re-pruning if already 2:4 (e.g. from OBS)
+                if not verify_2_4(w_fp16):
+                    w_fp16 = prune_2_4(w_fp16)
 
                 module.weight = nn.Parameter(
-                    to_sparse_semi_structured(w_pruned),
+                    to_sparse_semi_structured(w_fp16),
                     requires_grad=False,
                 )
                 if module.bias is not None:
@@ -402,9 +404,11 @@ def convert_to_semi_structured(
 
             else:  # Conv2d
                 w_2d_fp16 = _conv2d_weight_to_2d(module.weight.data).half()
-                w_2d_pruned = prune_2_4(w_2d_fp16)
+                # Skip re-pruning if already 2:4
+                if not verify_2_4(w_2d_fp16):
+                    w_2d_fp16 = prune_2_4(w_2d_fp16)
 
-                w_sparse = to_sparse_semi_structured(w_2d_pruned)
+                w_sparse = to_sparse_semi_structured(w_2d_fp16)
 
                 # Prepare bias in fp16
                 if module.bias is not None:

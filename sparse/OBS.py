@@ -1,28 +1,164 @@
 """SparseGPT-style Optimal Brain Surgeon for N:M structured pruning of SNNs.
 
-Training-free, calibration-only approach:
-  1. Collect per-layer Hessians H = X·Xᵀ from ~128 forward passes (no labels)
-  2. Use second-order OBS importance w²/[H⁻¹]_{pp} to select N:M masks
-  3. Apply closed-form OBS weight updates that optimally compensate survivors
-  4. Compensation propagates across M-groups via sequential column processing
+Strictly follows the SparseGPT algorithm (Frantar & Alistarh, ICML 2023):
+  1. Collect per-layer Hessians H = X·Xᵀ from calibration forward passes
+  2. Compute upper Cholesky of H⁻¹ for efficient row-wise access
+  3. Block-wise column processing with intra-block + cross-block compensation
+  4. N:M mask selection via OBS saliency: w²/[H⁻¹]²_{ii}
+
+Key differences from vanilla SparseGPT:
+  - Conv2d support via im2col Hessian (weight reshaped to 2D)
+  - Dead column handling for SNN binary activations (many zero-firing neurons)
+  - Pluggable scorer interface for future SNN-specific metrics (firing rates, etc.)
+  - CUTLASS dimension validation (rows%32==0, cols%64==0 for 2:4 Sparse TC)
 
 Reference:
     Frantar & Alistarh, "SparseGPT: Massive Language Models Can Be Accurately
-    Pruned in One-Shot", ICML 2023.  Adapted here for SNN binary activations.
+    Pruned in One-Shot", ICML 2023.
 """
 
 import argparse
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from collections import OrderedDict
-from typing import Optional
+from typing import Optional, Callable
 
 from sparse.pruning import verify_n_m
-from sparse.utils import _is_eligible_for_permutation, _get_in_channels
 
 
 # ---------------------------------------------------------------------------
-# Hessian collection
+# Layer eligibility (separate from permutation eligibility)
+# ---------------------------------------------------------------------------
+
+# CUTLASS 2:4 requirements for SparseSemiStructuredTensor (fp16)
+_CUTLASS_ROW_ALIGN = 32
+_CUTLASS_COL_ALIGN = 64
+
+
+def _is_eligible_for_obs(module: nn.Module) -> bool:
+    """Check if a module is eligible for OBS pruning.
+
+    Eligible: nn.Linear or nn.Conv2d (groups=1) with enough input features
+    for at least one N:M group (>= 4 for 2:4).
+    """
+    if isinstance(module, nn.Linear):
+        return module.in_features >= 4
+    if isinstance(module, nn.Conv2d):
+        if module.groups != 1:
+            return False
+        return module.in_channels >= 1  # im2col may expand to >= 4
+    return False
+
+
+def _get_weight_2d(module: nn.Module) -> tuple[torch.Tensor, tuple]:
+    """Get the 2D weight view for OBS.
+
+    Linear: (out_features, in_features) — already 2D.
+    Conv2d: (C_out, C_in*Kh*Kw) — im2col layout.
+
+    Returns:
+        (W_2d, orig_shape) where orig_shape is the Conv2d weight shape
+        (None for Linear).
+    """
+    W = module.weight.data
+    if isinstance(module, nn.Conv2d):
+        orig_shape = W.shape
+        return W.reshape(W.shape[0], -1).contiguous(), orig_shape
+    return W, None
+
+
+def _check_cutlass_dims(w_2d_shape: tuple[int, int]) -> tuple[bool, str]:
+    """Check if a 2D weight shape satisfies CUTLASS 2:4 Sparse TC requirements.
+
+    Returns:
+        (ok, reason) where ok=True if dimensions are aligned.
+    """
+    rows, cols = w_2d_shape
+    ok = (rows % _CUTLASS_ROW_ALIGN == 0) and (cols % _CUTLASS_COL_ALIGN == 0)
+    if ok:
+        return True, ''
+    return False, (f'({rows},{cols}): need rows%{_CUTLASS_ROW_ALIGN}==0, '
+                   f'cols%{_CUTLASS_COL_ALIGN}==0')
+
+
+def _detect_neuron_fed_layers(
+    model: nn.Module,
+    eligible: OrderedDict,
+    neuron_types: tuple,
+) -> dict[str, bool]:
+    """Detect which eligible layers receive input from a spiking neuron.
+
+    Uses forward hooks to trace actual execution order. A Linear/Conv2d is
+    "neuron-fed" if ANY spiking neuron has fired before it in the forward
+    pass. Only the very first Linear/Conv2d layers (before any neuron has
+    executed) are considered "dense-input" — these receive raw images.
+
+    This correctly handles cross-container boundaries (e.g., LIF in
+    patch_embed feeds q_linear in block.0.attn).
+    """
+    import torch
+
+    # Track execution order via hooks
+    exec_order = []  # list of (name, is_neuron, is_eligible)
+    hooks = []
+    modules_dict = dict(model.named_modules())
+
+    for name, mod in model.named_modules():
+        is_neuron = isinstance(mod, neuron_types)
+        is_elig = name in eligible
+
+        if is_neuron or is_elig:
+            def make_hook(n, is_n, is_e):
+                def hook(module, inp, out):
+                    exec_order.append((n, is_n, is_e))
+                return hook
+            hooks.append(mod.register_forward_hook(make_hook(name, is_neuron, is_elig)))
+
+    # Single dummy forward pass to trace execution order
+    device = next(model.parameters()).device
+    # Infer input shape from first Conv2d or model config
+    first_conv = None
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            first_conv = m
+            break
+    in_ch = first_conv.in_channels if first_conv else 3
+    # Try common image sizes
+    from models.neurons import reset_net
+    with torch.no_grad():
+        try:
+            model(torch.randn(1, in_ch, 32, 32, device=device))
+        except Exception:
+            try:
+                model(torch.randn(1, in_ch, 224, 224, device=device))
+            except Exception:
+                pass
+        reset_net(model)
+
+    for h in hooks:
+        h.remove()
+
+    # Walk execution order: layers before any neuron fires are "dense-input"
+    result = {}
+    neuron_has_fired = False
+    for name, is_neuron, is_elig in exec_order:
+        if is_neuron:
+            neuron_has_fired = True
+        if is_elig:
+            result[name] = neuron_has_fired
+
+    # Any eligible layers not seen in exec_order → assume dense
+    for name in eligible:
+        if name not in result:
+            result[name] = False
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Hessian collection — following SparseGPT add_batch
 # ---------------------------------------------------------------------------
 
 def collect_hessians(
@@ -32,17 +168,17 @@ def collect_hessians(
     max_batches: int = 128,
     exclude_names: Optional[list] = None,
 ) -> dict[str, torch.Tensor]:
-    """Collect per-layer Hessians H = X·Xᵀ / n from calibration data.
+    """Collect per-layer Hessians H = 2/n * Σ(X·Xᵀ) from calibration data.
 
-    Registers forward hooks on eligible Linear/Conv2d layers to accumulate
-    the input covariance matrix incrementally (never stores full X).
+    Uses running-average accumulation matching SparseGPT's add_batch:
+    H is rescaled at each batch so the result is a stable average.
 
-    For Conv2d: H is (C_in, C_in), aggregated over spatial positions.
-    For Linear: H is (in_features, in_features).
+    For Conv2d layers, input is unfolded via im2col to match the 2D weight
+    layout (C_out, C_in*Kh*Kw).
 
     Args:
         model:         SNN model (eval mode, on device).
-        dataloader:    Calibration data (no labels needed, only forward pass).
+        dataloader:    Calibration data (no labels needed).
         device:        Compute device.
         max_batches:   Number of calibration batches (default 128).
         exclude_names: Layer name prefixes to skip (default ['head']).
@@ -55,18 +191,31 @@ def collect_hessians(
     if exclude_names is None:
         exclude_names = ['head']
 
-    # Identify eligible layers
     eligible = OrderedDict()
     for name, module in model.named_modules():
         if not isinstance(module, (nn.Linear, nn.Conv2d)):
             continue
-        if not _is_eligible_for_permutation(module):
+        if not _is_eligible_for_obs(module):
             continue
         if any(name == e or name.startswith(e + '.') for e in exclude_names):
             continue
         eligible[name] = module
 
-    # Incremental accumulation: H += x @ x^T,  n_samples += x.shape[1]
+    # Structural check: which layers receive input from a spiking neuron?
+    # Walk model modules in forward order. A Linear/Conv2d is "neuron-fed"
+    # if the most recent preceding module (in the sequential child list of
+    # its parent) is or contains a spiking neuron. This correctly handles
+    # the first layer (receives dense images, no upstream neuron).
+    from models.neurons import (
+        MultiStepLIFNeuron, MultiStepIFNeuron, LIFNeuron, IFNeuron,
+    )
+    _NEURON_TYPES = (MultiStepLIFNeuron, MultiStepIFNeuron, LIFNeuron, IFNeuron)
+
+    input_from_neuron = _detect_neuron_fed_layers(model, eligible, _NEURON_TYPES)
+    # Reset neuron states after the detection forward pass
+    reset_net(model)
+
+    # Per-layer accumulators
     hessians: dict[str, torch.Tensor] = {}
     n_samples: dict[str, int] = {}
     hooks = []
@@ -74,12 +223,8 @@ def collect_hessians(
     def _make_hook(name, mod):
         def hook_fn(module, inp, out):
             x = inp[0].detach().float()
+
             if isinstance(mod, nn.Conv2d):
-                # im2col unfolding: (B, C_in, H, W) → (B, C_in*Kh*Kw, L)
-                # Then (C_in*Kh*Kw, B*L) for Hessian H = X @ X^T
-                # This matches the 2D weight shape (C_out, C_in*Kh*Kw)
-                # used by SparseConv2d and OBS pruning.
-                import torch.nn.functional as F
                 x_unf = F.unfold(
                     x, mod.kernel_size,
                     dilation=mod.dilation, padding=mod.padding,
@@ -87,17 +232,25 @@ def collect_hessians(
                 )  # (B, C_in*Kh*Kw, L)
                 x = x_unf.permute(1, 0, 2).reshape(x_unf.shape[1], -1)  # (K, B*L)
             elif isinstance(mod, nn.Linear):
-                # x: (..., in_features) → (in_features, n)
-                x = x.reshape(-1, x.shape[-1]).T
+                x = x.reshape(-1, x.shape[-1]).T  # (d_in, n)
             else:
                 return
-            n = x.shape[1]
+
+            n_new = x.shape[1]
+            d = x.shape[0]
+
             if name not in hessians:
-                d = x.shape[0]
                 hessians[name] = torch.zeros(d, d, device=x.device, dtype=torch.float32)
                 n_samples[name] = 0
-            hessians[name].addmm_(x, x.T)
-            n_samples[name] += n
+
+            # Running-average Hessian (SparseGPT add_batch style)
+            n_old = n_samples[name]
+            n_total = n_old + n_new
+            hessians[name] *= n_old / n_total
+            x_scaled = math.sqrt(2.0 / n_total) * x
+            hessians[name].addmm_(x_scaled, x_scaled.T)
+            n_samples[name] = n_total
+
         return hook_fn
 
     for name, mod in eligible.items():
@@ -117,18 +270,51 @@ def collect_hessians(
     for h in hooks:
         h.remove()
 
-    # Normalize
-    for name in hessians:
-        if n_samples[name] > 0:
-            hessians[name] /= n_samples[name]
-
+    # Report neuron-fed vs dense-input detection
+    n_neuron = sum(1 for v in input_from_neuron.values() if v)
+    n_dense = sum(1 for v in input_from_neuron.values() if not v)
+    dense_layers = [n for n, v in input_from_neuron.items() if not v]
     print(f"Collected Hessians for {len(hessians)} layers "
           f"({min(batch_idx + 1, max_batches)} batches)")
-    return hessians
+    print(f"  Neuron-fed: {n_neuron}, Dense-input: {n_dense}")
+    if dense_layers:
+        print(f"  Dense-input layers: {', '.join(dense_layers)}")
+
+    return hessians, input_from_neuron
 
 
 # ---------------------------------------------------------------------------
-# Per-layer OBS N:M pruning
+# Scorer interface — pluggable mask selection for future SNN metrics
+# ---------------------------------------------------------------------------
+
+def default_obs_scorer(
+    W_block: torch.Tensor,
+    Hinv_diag: torch.Tensor,
+    col_offset: int,
+    m: int,
+    **kwargs,
+) -> torch.Tensor:
+    """Default SparseGPT saliency scorer: w² / [H⁻¹]²_{ii}.
+
+    Args:
+        W_block:     (rows, m) weight values for the current M-group.
+        Hinv_diag:   (m,) diagonal of Hinv for these m columns.
+        col_offset:  Global column index of the first column in this group.
+        m:           Group size.
+        **kwargs:    Reserved for future SNN-specific scorers.
+
+    Returns:
+        (rows, m) saliency scores — lower = safer to prune.
+    """
+    return W_block ** 2 / (Hinv_diag.unsqueeze(0) ** 2)
+
+
+# Type alias for scorer functions
+Scorer = Callable[..., torch.Tensor]
+
+
+# ---------------------------------------------------------------------------
+# Per-layer OBS solver — strictly follows SparseGPT fasterprune
 # ---------------------------------------------------------------------------
 
 def obs_prune_layer(
@@ -136,92 +322,128 @@ def obs_prune_layer(
     H: torch.Tensor,
     n: int = 2,
     m: int = 4,
+    blocksize: int = 128,
     percdamp: float = 0.01,
-) -> torch.Tensor:
-    """SparseGPT-style OBS N:M pruning for a single layer.
+    scorer: Optional[Scorer] = None,
+    scorer_kwargs: Optional[dict] = None,
+) -> tuple[torch.Tensor, float]:
+    """SparseGPT OBS N:M pruning for a single layer.
 
-    Processes columns left-to-right in M-groups:
-      1. Score weights in the group: s = w² / [H⁻¹]_{pp}
-      2. Keep top-N per row (prune M−N lowest)
-      3. Apply OBS compensation: δw = −w_p / [H⁻¹]_{pp} · H⁻¹[p, :]
-      4. Compensation propagates to all later columns
+    Algorithm (matching SparseGPT fasterprune):
+      1. Dampen H, compute upper Cholesky of H⁻¹
+      2. Process columns in blocks of `blocksize`:
+         a. Within block, process column-by-column:
+            - At each M-group boundary, select N:M mask via scorer
+            - Zero pruned weights, apply intra-block OBS compensation
+         b. After block, apply cross-block compensation to all remaining cols
+      3. Return pruned+compensated weights and total OBS loss
 
     Args:
-        W_2d:     (rows, cols) weight matrix (NHWC-reshaped for Conv2d).
-        H:        (cols, cols) Hessian = X·Xᵀ / n_samples.
-        n, m:     N:M sparsity (default 2:4).
-        percdamp: Dampening as fraction of mean(diag(H)).
-                  Critical for SNNs — sparse binary activations make H
-                  near-singular.  Default 0.01.
+        W_2d:       (rows, cols) weight matrix.
+        H:          (cols, cols) Hessian (output of collect_hessians).
+        n, m:       N:M sparsity (default 2:4).
+        blocksize:  Column block size for batched updates (default 128).
+        percdamp:   Dampening as fraction of mean(diag(H)).
+        scorer:     Custom saliency scorer (default: w²/d² SparseGPT).
+        scorer_kwargs: Extra kwargs passed to scorer (e.g. firing rates).
 
     Returns:
-        (rows, cols) weight tensor with N:M pattern and OBS compensation.
+        (W_pruned, loss) — pruned weight tensor and scalar OBS loss.
     """
+    if scorer is None:
+        scorer = default_obs_scorer
+    if scorer_kwargs is None:
+        scorer_kwargs = {}
+
     rows, cols = W_2d.shape
-    num_groups = cols // m
-    aligned = num_groups * m
+    W = W_2d.clone().float()
+    Hs = H.clone().float()
 
-    if num_groups == 0:
-        return W_2d.clone()
-
-    W = W_2d[:, :aligned].clone().float()
-    Hs = H[:aligned, :aligned].clone().float()
+    # --- Dead columns (never-activated inputs in SNN) ---
+    dead = Hs.diag() == 0
+    Hs[dead, dead] = 1
+    W[:, dead] = 0
 
     # --- Dampening ---
     damp = percdamp * Hs.diag().mean()
-    idx = torch.arange(aligned, device=Hs.device)
-    Hs[idx, idx] += damp
+    diag_idx = torch.arange(cols, device=Hs.device)
+    Hs[diag_idx, diag_idx] += damp
 
-    # --- H⁻¹ via Cholesky ---
-    dead = Hs.diag() == 0
-    Hs[dead, dead] = 1          # avoid zero-diagonal entries
+    # --- Upper Cholesky of H⁻¹ (SparseGPT key step) ---
+    # H = L L^T  →  H⁻¹ = cholesky_inverse(L)  →  Hinv = cholesky(H⁻¹, upper=True)
+    # Hinv is upper triangular: Hinv[i,j]=0 for j<i
+    # This ensures compensation from column i only affects columns j>i.
     try:
         L = torch.linalg.cholesky(Hs)
-        H_inv = torch.cholesky_inverse(L)
+        H_inv_full = torch.cholesky_inverse(L)
+        Hinv = torch.linalg.cholesky(H_inv_full, upper=True)
     except RuntimeError:
-        # Aggressive fallback dampening
-        Hs[idx, idx] += 10 * damp
+        # Fallback: more aggressive dampening
+        Hs[diag_idx, diag_idx] += 10 * damp
         L = torch.linalg.cholesky(Hs)
-        H_inv = torch.cholesky_inverse(L)
-    H_inv[dead, :] = 0
-    H_inv[:, dead] = 0
+        H_inv_full = torch.cholesky_inverse(L)
+        Hinv = torch.linalg.cholesky(H_inv_full, upper=True)
 
-    # --- Process M-groups sequentially ---
-    for g in range(num_groups):
-        j0, j1 = g * m, (g + 1) * m
+    Losses = torch.zeros(rows, device=W.device)
 
-        # Score weights in this group (second-order importance)
-        group_w = W[:, j0:j1]                                     # (rows, m)
-        h_diag = H_inv[j0:j1, j0:j1].diag().clamp(min=1e-10)     # (m,)
-        scores = group_w ** 2 / h_diag.unsqueeze(0)                # (rows, m)
+    # --- Block-wise column processing ---
+    num_prune = m - n
 
-        # Keep top-n per row; prune the rest
-        _, keep = scores.topk(n, dim=1)                # (rows, n)
-        prune = torch.ones(rows, m, dtype=torch.bool, device=W.device)
-        prune.scatter_(1, keep, False)
+    for i1 in range(0, cols, blocksize):
+        i2 = min(i1 + blocksize, cols)
+        count = i2 - i1
 
-        # OBS compensation, column by column within the group
-        for k in range(m):
-            col = j0 + k
-            pruned_rows = prune[:, k]          # (rows,) bool
-            if not pruned_rows.any():
-                continue
+        W1 = W[:, i1:i2].clone()                    # (rows, count)
+        Q1 = torch.zeros_like(W1)                    # pruned output
+        Err1 = torch.zeros_like(W1)                  # scaled errors for cross-block
+        Losses1 = torch.zeros_like(W1)               # per-element loss
+        Hinv1 = Hinv[i1:i2, i1:i2]                   # block diagonal of upper Cholesky
 
-            q = W[pruned_rows, col].clone()
-            W[pruned_rows, col] = 0.0
+        # N:M mask for this block — initially all False (nothing pruned)
+        mask1 = torch.zeros(rows, count, dtype=torch.bool, device=W.device)
 
-            # Update all later columns for pruned rows:
-            # δw[:, col+1:] = −(q / H_inv[col,col]) * H_inv[col, col+1:]
-            if col + 1 < aligned:
-                scale = q / H_inv[col, col].clamp(min=1e-10)       # (n_pruned,)
-                W[pruned_rows, col + 1:] -= (
-                    scale.unsqueeze(1) * H_inv[col, col + 1:aligned].unsqueeze(0)
-                )
+        for i in range(count):
+            w = W1[:, i]                              # (rows,)
+            d = Hinv1[i, i]                           # scalar diagonal
 
-    # Reassemble with unaligned tail (left untouched)
-    W_out = W_2d.clone()
-    W_out[:, :aligned] = W
-    return W_out
+            # At each M-group boundary, select which columns to prune
+            global_col = i1 + i
+            if global_col % m == 0:
+                group_end = min(i + m, count)
+                group_len = group_end - i
+                if group_len == m:
+                    # Full M-group: use scorer to rank columns
+                    group_diag = torch.diag(Hinv1)[i:group_end]
+                    group_w = W1[:, i:group_end]
+                    scores = scorer(
+                        group_w, group_diag, col_offset=global_col, m=m,
+                        **scorer_kwargs,
+                    )
+                    # Prune the num_prune lowest-scoring per row
+                    _, prune_idx = scores.topk(num_prune, dim=1, largest=False)
+                    mask1[:, i:group_end].scatter_(1, prune_idx, True)
+
+            q = w.clone()
+            q[mask1[:, i]] = 0.0                      # zero pruned weights
+
+            Q1[:, i] = q
+            Losses1[:, i] = (w - q) ** 2 / d ** 2
+
+            # Intra-block OBS compensation
+            err1 = (w - q) / d                         # (rows,)
+            W1[:, i:] -= err1.unsqueeze(1) * Hinv1[i, i:].unsqueeze(0)
+            Err1[:, i] = err1
+
+        # Write pruned block back
+        W[:, i1:i2] = Q1
+        Losses += torch.sum(Losses1, dim=1) / 2
+
+        # Cross-block compensation: propagate errors to all remaining columns
+        if i2 < cols:
+            W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
+
+    loss = Losses.sum().item()
+    return W.reshape_as(W_2d), loss
 
 
 # ---------------------------------------------------------------------------
@@ -233,27 +455,46 @@ def apply_obs_pruning(
     hessians: dict[str, torch.Tensor],
     n: int = 2,
     m: int = 4,
+    blocksize: int = 128,
     percdamp: float = 0.01,
     exclude_names: Optional[list] = None,
-) -> nn.Module:
+    scorer: Optional[Scorer] = None,
+    scorer_kwargs: Optional[dict] = None,
+    warn_cutlass: bool = True,
+    input_from_neuron: Optional[dict[str, bool]] = None,
+    skip_dense_input: bool = True,
+) -> tuple[nn.Module, dict]:
     """Apply OBS N:M pruning to all eligible layers in-place.
 
     Args:
-        model:         SNN model (dense weights). Modified in-place.
-        hessians:      {layer_name: H} from collect_hessians.
-        n, m:          N:M parameters (default 2:4).
-        percdamp:      Hessian dampening fraction.
-        exclude_names: Layer name prefixes to skip (default ['head']).
+        model:           SNN model (dense weights). Modified in-place.
+        hessians:        {layer_name: H} from collect_hessians.
+        n, m:            N:M parameters (default 2:4).
+        blocksize:       Column block size for SparseGPT (default 128).
+        percdamp:        Hessian dampening fraction.
+        exclude_names:   Layer name prefixes to skip (default ['head']).
+        scorer:          Custom saliency scorer (default: SparseGPT w²/d²).
+        scorer_kwargs:   Extra kwargs passed to scorer per layer.
+        warn_cutlass:    Warn about layers ineligible for CUTLASS 2:4 Sparse TC.
+        input_from_neuron: {layer_name: bool} from collect_hessians. True if
+            the layer's input comes directly from a spiking neuron. If None,
+            all layers are assumed to be neuron-fed.
+        skip_dense_input: Skip layers whose inputs do NOT come from a
+            spiking neuron (e.g., the first Conv2d receiving dense RGB
+            images). These layers have no activation sparsity to exploit,
+            and pruning them wastes accuracy. Default True.
 
     Returns:
-        The modified model (same object).
+        (model, stats) — the modified model and per-layer statistics dict.
     """
     if exclude_names is None:
         exclude_names = ['head']
+    if input_from_neuron is None:
+        input_from_neuron = {}
 
-    print(f"\n=== OBS {n}:{m} pruning (percdamp={percdamp}) ===\n")
-    print(f"{'Layer':<42} {'Type':>6} {'shape':>14} {'rel_err':>8}  ok")
-    print("-" * 80)
+    print(f"\n=== OBS {n}:{m} pruning (blocksize={blocksize}, percdamp={percdamp}) ===\n")
+    print(f"{'Layer':<42} {'Type':>6} {'shape':>16} {'Input':>6} {'loss':>10} {'rel_err':>8}  {'2:4':>3}  CUTLASS")
+    print("-" * 110)
 
     stats = OrderedDict()
     skipped = []
@@ -261,68 +502,95 @@ def apply_obs_pruning(
     for name, module in model.named_modules():
         if not isinstance(module, (nn.Linear, nn.Conv2d)):
             continue
-        if not _is_eligible_for_permutation(module):
+        if not _is_eligible_for_obs(module):
             continue
         if any(name == e or name.startswith(e + '.') for e in exclude_names):
-            skipped.append(name)
+            skipped.append((name, 'excluded'))
             continue
         if name not in hessians:
-            skipped.append(name)
+            skipped.append((name, 'no Hessian'))
+            continue
+
+        # Skip layers whose input does NOT come from a spiking neuron
+        is_neuron_fed = input_from_neuron.get(name, True)  # default True if unknown
+        if skip_dense_input and not is_neuron_fed:
+            skipped.append((name, 'dense input'))
             continue
 
         H = hessians[name]
         is_conv = isinstance(module, nn.Conv2d)
+        W_2d, orig_shape = _get_weight_2d(module)
+        W_2d = W_2d.cpu().float()
+        W_orig = W_2d.clone()
 
-        W = module.weight.data.cpu().float()
-        if is_conv:
-            # im2col layout: (C_out, C_in*Kh*Kw) — matches unfolded Hessian
-            orig_shape = W.shape
-            W_2d = W.reshape(W.shape[0], -1).contiguous()
-        else:
-            W_2d = W
-            orig_shape = None
+        r, c = W_2d.shape
 
-        cols = W_2d.shape[1]
-        W_orig_2d = W_2d.clone()
+        # OBS prune
+        W_pruned, loss = obs_prune_layer(
+            W_2d, H.cpu(), n=n, m=m, blocksize=blocksize,
+            percdamp=percdamp, scorer=scorer, scorer_kwargs=scorer_kwargs or {},
+        )
 
-        # --- OBS prune ---
-        W_pruned = obs_prune_layer(W_2d, H.cpu(), n=n, m=m, percdamp=percdamp)
-
-        # --- Metrics ---
-        r_proxy = H.cpu().diag().sqrt().clamp(min=1e-8)[:cols]
-        err = ((W_pruned - W_orig_2d) @ r_proxy).norm().item()
-        ref = (W_orig_2d @ r_proxy).norm().item()
+        # Reconstruction error metric
+        r_proxy = H.cpu().diag().sqrt().clamp(min=1e-8)[:c]
+        err = ((W_pruned - W_orig) @ r_proxy).norm().item()
+        ref = (W_orig @ r_proxy).norm().item()
         rel_err = err / (ref + 1e-8)
 
         pattern_ok = verify_n_m(W_pruned, n=n, m=m)
-        ltype = 'Conv2d' if is_conv else 'Linear'
-        r, c = W_2d.shape
-        ok_str = '✓' if pattern_ok else '✗'
-        print(f"  {name:<40} {ltype:>6} {f'({r},{c})':>14} "
-              f"{rel_err:>8.4f}  {ok_str}")
+        cutlass_ok, cutlass_reason = _check_cutlass_dims((r, c))
 
-        # --- Write back ---
+        ltype = 'Conv2d' if is_conv else 'Linear'
+        ok_str = 'ok' if pattern_ok else 'FAIL'
+        cut_str = 'ok' if cutlass_ok else cutlass_reason
+        inp_str = 'neuron' if is_neuron_fed else 'dense'
+
+        print(f"  {name:<40} {ltype:>6} {f'({r},{c})':>16} {inp_str:>6} "
+              f"{loss:>10.2f} {rel_err:>8.4f}  {ok_str:>4}  {cut_str}")
+
+        # Write back
         if is_conv:
             W_back = W_pruned.reshape(orig_shape).contiguous()
         else:
             W_back = W_pruned
         module.weight.data.copy_(W_back)
 
-        stats[name] = {'rel_err': rel_err, 'pattern_ok': pattern_ok}
+        stats[name] = {
+            'type': ltype,
+            'shape_2d': (r, c),
+            'input_from_neuron': is_neuron_fed,
+            'loss': loss,
+            'rel_err': rel_err,
+            'pattern_ok': pattern_ok,
+            'cutlass_ok': cutlass_ok,
+            'cutlass_reason': cutlass_reason,
+        }
 
-    # --- Summary ---
+    # Summary
     if stats:
         mean_err = sum(s['rel_err'] for s in stats.values()) / len(stats)
-        bad = [n_ for n_, s in stats.items() if not s['pattern_ok']]
-        print(f"\n  Pruned {len(stats)} layers  |  mean rel_error: {mean_err:.4f}")
-        if bad:
-            print(f"  WARNING: N:M pattern broken in {len(bad)} layer(s): {bad}")
-        else:
-            print(f"  N:M pattern preserved in all {len(stats)} layers ✓")
-    if skipped:
-        print(f"  Skipped {len(skipped)} layer(s): {', '.join(skipped)}")
+        total_loss = sum(s['loss'] for s in stats.values())
+        bad_nm = [n_ for n_, s in stats.items() if not s['pattern_ok']]
+        bad_cut = [n_ for n_, s in stats.items() if not s['cutlass_ok']]
 
-    return model
+        print(f"\n  Pruned {len(stats)} layers  |  total_loss: {total_loss:.2f}  |  "
+              f"mean rel_err: {mean_err:.4f}")
+        if bad_nm:
+            print(f"  WARNING: N:M pattern broken in {len(bad_nm)} layer(s): {bad_nm}")
+        else:
+            print(f"  All {len(stats)} layers satisfy {n}:{m} pattern")
+        if bad_cut and warn_cutlass:
+            print(f"  NOTE: {len(bad_cut)} layer(s) ineligible for CUTLASS 2:4 Sparse TC:")
+            for n_ in bad_cut:
+                print(f"    {n_}: {stats[n_]['cutlass_reason']}")
+    if skipped:
+        skip_summary = {}
+        for n_, reason in skipped:
+            skip_summary.setdefault(reason, []).append(n_)
+        for reason, names in skip_summary.items():
+            print(f"  Skipped {len(names)} layer(s) ({reason}): {', '.join(names)}")
+
+    return model, stats
 
 
 # ---------------------------------------------------------------------------
@@ -348,12 +616,12 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--n', type=int, default=2)
     parser.add_argument('--m', type=int, default=4)
+    parser.add_argument('--blocksize', type=int, default=128,
+                        help='Column block size for SparseGPT (default 128)')
     parser.add_argument('--percdamp', type=float, default=0.01,
-                        help='Hessian dampening fraction (default 0.01). '
-                             'Increase for SNNs with very low firing rates.')
+                        help='Hessian dampening fraction (default 0.01)')
     parser.add_argument('--calib-batches', type=int, default=128,
-                        help='Number of calibration batches for Hessian '
-                             'estimation (default 128)')
+                        help='Number of calibration batches (default 128)')
     parser.add_argument('--exclude', type=str, nargs='*', default=['head'],
                         help='Layer name prefixes to skip (default: head)')
     parser.add_argument('--evaluate', action='store_true',
@@ -384,34 +652,32 @@ if __name__ == '__main__':
     else:
         parser.error('Must specify --config or --model')
 
-    # Load dense checkpoint
     ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     dense_state = ckpt['model'] if 'model' in ckpt else ckpt
     model.load_state_dict(dense_state)
     model = model.to(device)
     print(f"Loaded dense checkpoint from {args.checkpoint}")
 
-    # Build calibration dataloader (training set for Hessian estimation)
     train_loader, val_loader = build_dataloaders(
         args.dataset, args.data_root, args.batch_size,
         img_size=ds_cfg['img_size'], num_workers=4,
     )
 
-    # Step 1: Collect Hessians
+    # Step 1: Collect Hessians (also detects neuron-fed vs dense-input layers)
     print(f"\n--- Collecting Hessians ({args.calib_batches} batches) ---")
-    hessians = collect_hessians(
+    hessians, input_from_neuron = collect_hessians(
         model, train_loader, device,
         max_batches=args.calib_batches, exclude_names=args.exclude,
     )
 
-    # Save original state for later comparison
     original_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
-    # Step 2: Apply OBS pruning
-    model = apply_obs_pruning(
+    # Step 2: Apply OBS pruning (skips non-neuron-fed layers by default)
+    model, stats = apply_obs_pruning(
         model, hessians,
-        n=args.n, m=args.m, percdamp=args.percdamp,
-        exclude_names=args.exclude,
+        n=args.n, m=args.m, blocksize=args.blocksize,
+        percdamp=args.percdamp, exclude_names=args.exclude,
+        input_from_neuron=input_from_neuron,
     )
 
     # Save
@@ -422,9 +688,11 @@ if __name__ == '__main__':
             'original_state': original_state,
             'params': {
                 'n': args.n, 'm': args.m,
+                'blocksize': args.blocksize,
                 'percdamp': args.percdamp,
                 'calib_batches': args.calib_batches,
             },
+            'stats': dict(stats),
         }, args.output)
         print(f"\nSaved OBS-pruned model to {args.output}")
 
@@ -439,6 +707,5 @@ if __name__ == '__main__':
                 reset_net(model)
                 correct += outputs.argmax(1).eq(targets).sum().item()
                 total += targets.size(0)
-
         acc = 100.0 * correct / total
         print(f"\nEvaluation accuracy: {acc:.2f}%  ({correct}/{total})")

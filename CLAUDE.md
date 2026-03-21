@@ -2,9 +2,19 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Project Goals
+
+SparseSNN targets three key optimizations for SNN inference acceleration:
+
+1. **Accelerate LIF/IF neuron computation** — Spiking neurons (membrane potential update + threshold + reset) are the dominant bottleneck (50-93% of inference latency). Custom fused CUDA/Triton kernels can eliminate per-op overhead by fusing the entire neuron dynamics into a single kernel.
+
+2. **Accelerate SSA (Spiking Self-Attention)** — SSA variants (in `models/spikformer.py`, `models/qkformer.py`, `models/metaformer.py`, `models/maxformer.py`) account for 24-37% of Spikformer inference. Binary spike Q/K/V enable sparse attention optimizations (block-sparse, activation-sparse matmul).
+
+3. **Lossless 2:4 structured weight sparsification** — Convert dense SNN weights to NVIDIA 2:4 Sparse Tensor Core format with minimal accuracy loss. Uses OBS (Optimal Brain Surgeon) with second-order Hessian information for calibration-only conversion (no retraining). Achieves 1.11-1.17x end-to-end speedup; scales with model size and batch size.
+
 ## Project Overview
 
-SparseSNN is a Spiking Neural Network (SNN) training framework implementing multiple SNN architectures with standalone spiking neuron primitives (no spikingjelly dependency). It supports single-GPU and multi-GPU (DDP) training on CIFAR-10, CIFAR-100, ImageNet, CIFAR-10-DVS, and DVS128 Gesture.
+SparseSNN is a Spiking Neural Network (SNN) training and inference framework implementing multiple SNN architectures with standalone spiking neuron primitives (no spikingjelly dependency). It supports single-GPU and multi-GPU (DDP) training on CIFAR-10, CIFAR-100, ImageNet, CIFAR-10-DVS, and DVS128 Gesture.
 
 ## Common Commands
 

@@ -4,5 +4,7 @@ __pycache__/
 *.pth
 output/
 sweep_results/
+checkpoints/
+obs_pt/
 .venv/
 third_party/

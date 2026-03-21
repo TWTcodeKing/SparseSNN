@@ -1,7 +1,11 @@
 """Shared utilities for sparse/ submodules.
 
-Provides upstream-neuron lookup helpers used by both permutation.py and
-fr_prune.py. This module must not import from permutation.py or fr_prune.py
+Provides:
+  - Upstream-neuron lookup helpers (used by permutation.py, fr_prune.py, OBS)
+  - Spiking neuron parameter accessors (_get_inner_neuron, _get_vth, _set_vth, etc.)
+  - Calibration data collectors (collect_firing_rates, collect_membrane_potentials)
+
+This module must not import from permutation.py or fr_prune.py
 at module level to avoid circular imports.
 """
 
@@ -175,3 +179,166 @@ def _get_upstream_entry(
             return entry
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Spiking neuron parameter accessors
+# ---------------------------------------------------------------------------
+
+def _get_neuron_types():
+    """Lazy import to avoid circular dependencies."""
+    from models.neurons import (
+        MultiStepLIFNeuron, MultiStepIFNeuron, LIFNeuron, IFNeuron,
+    )
+    return (MultiStepLIFNeuron, MultiStepIFNeuron, LIFNeuron, IFNeuron)
+
+
+def _get_inner_neuron(module):
+    """Get the inner LIFNeuron/IFNeuron from a MultiStep wrapper."""
+    from models.neurons import MultiStepLIFNeuron, MultiStepIFNeuron
+    if isinstance(module, (MultiStepLIFNeuron, MultiStepIFNeuron)):
+        return module.neuron
+    return module
+
+
+def _get_vth(neuron) -> float:
+    """Get v_threshold as float."""
+    vth = neuron.v_threshold
+    return vth.item() if isinstance(vth, torch.Tensor) else float(vth)
+
+
+def _set_vth(neuron, value: float):
+    """Set v_threshold."""
+    if isinstance(neuron.v_threshold, nn.Parameter):
+        neuron.v_threshold.data.fill_(value)
+    elif isinstance(neuron.v_threshold, torch.Tensor):
+        neuron.v_threshold.fill_(value)
+    else:
+        neuron.v_threshold = value
+
+
+def _get_tau(neuron) -> Optional[float]:
+    """Get tau as float (None if IFNeuron)."""
+    from models.neurons import IFNeuron
+    if isinstance(neuron, IFNeuron):
+        return None
+    tau = neuron.tau
+    return tau.item() if isinstance(tau, torch.Tensor) else float(tau)
+
+
+def _set_tau(neuron, value: float):
+    """Set tau."""
+    if isinstance(neuron.tau, nn.Parameter):
+        neuron.tau.data.fill_(value)
+    elif isinstance(neuron.tau, torch.Tensor):
+        neuron.tau.fill_(value)
+    else:
+        neuron.tau = value
+
+
+# ---------------------------------------------------------------------------
+# Calibration data collectors
+# ---------------------------------------------------------------------------
+
+def collect_firing_rates(
+    model: nn.Module,
+    dataloader,
+    device: torch.device,
+    max_batches: int = 64,
+) -> dict[str, float]:
+    """Collect mean firing rate for each spiking neuron layer.
+
+    Returns:
+        {neuron_name: mean_firing_rate} across all spatial/channel dims.
+    """
+    from models.neurons import reset_net
+    NEURON_TYPES = _get_neuron_types()
+
+    rates = {}
+    counts = {}
+    hooks = []
+
+    for name, module in model.named_modules():
+        if not isinstance(module, NEURON_TYPES):
+            continue
+        if name.endswith('.neuron'):
+            continue
+
+        def make_hook(n):
+            def hook(mod, inp, out):
+                rate = out.detach().float().mean().item()
+                if n not in rates:
+                    rates[n] = 0.0
+                    counts[n] = 0
+                rates[n] += rate
+                counts[n] += 1
+            return hook
+        hooks.append(module.register_forward_hook(make_hook(name)))
+
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= max_batches:
+                break
+            model(batch[0].to(device))
+            reset_net(model)
+
+    for h in hooks:
+        h.remove()
+
+    return {n: rates[n] / max(counts[n], 1) for n in rates}
+
+
+def collect_membrane_potentials(
+    model: nn.Module,
+    dataloader,
+    device: torch.device,
+    max_batches: int = 32,
+) -> dict[str, torch.Tensor]:
+    """Collect membrane potential values (pre-threshold) for each neuron.
+
+    Returns:
+        {neuron_name: 1D tensor of sampled membrane potential values}
+    """
+    from models.neurons import reset_net
+    NEURON_TYPES = _get_neuron_types()
+
+    potentials = {}
+    hooks = []
+
+    for name, module in model.named_modules():
+        if not isinstance(module, NEURON_TYPES):
+            continue
+        if name.endswith('.neuron'):
+            continue
+
+        inner = _get_inner_neuron(module)
+
+        def make_hook(n, inner_neuron):
+            def hook(mod, inp, out):
+                v = inner_neuron.v
+                if isinstance(v, torch.Tensor):
+                    if n not in potentials:
+                        potentials[n] = []
+                    v_flat = v.detach().float().reshape(-1)
+                    n_sample = max(v_flat.numel() // 10, 1000)
+                    if v_flat.numel() > n_sample:
+                        idx = torch.randperm(v_flat.numel(), device=v.device)[:n_sample]
+                        v_flat = v_flat[idx]
+                    potentials[n].append(v_flat.cpu())
+            return hook
+
+        hooks.append(module.register_forward_hook(make_hook(name, inner)))
+
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= max_batches:
+                break
+            model(batch[0].to(device))
+            reset_net(model)
+
+    for h in hooks:
+        h.remove()
+
+    return {n: torch.cat(potentials[n]) for n in potentials if potentials[n]}

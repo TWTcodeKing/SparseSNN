@@ -309,6 +309,90 @@ def default_obs_scorer(
     return W_block ** 2 / (Hinv_diag.unsqueeze(0) ** 2)
 
 
+def wanda_scorer(
+    W_block: torch.Tensor,
+    Hinv_diag: torch.Tensor,
+    col_offset: int,
+    m: int,
+    H_diag: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> torch.Tensor:
+    """Wanda saliency scorer: |w| · √(H_{jj}).
+
+    Derived from OBS via diagonal approximation of H⁻¹:
+        S_q = w² / [H⁻¹]_{qq}  ≈  w² · H_{qq}  =  (|w| · √H_{qq})²
+
+    For binary SNN spikes: H_{jj} = firing_rate_j, so this becomes:
+        S_q = |w| · √(firing_rate_j)
+
+    This is the Wanda metric (Sun et al., 2023), which is a principled
+    first-order approximation to the full OBS objective. It requires no
+    matrix inversion and is numerically stable for any layer size.
+
+    Args:
+        W_block:     (rows, m) weight values.
+        Hinv_diag:   (m,) diagonal of Hinv (NOT used by this scorer).
+        col_offset:  Global column index of the first column.
+        m:           Group size.
+        H_diag:      (cols,) diagonal of the original H (= firing rates for SNNs).
+                     Must be provided via scorer_kwargs={'H_diag': H.diag()}.
+
+    Returns:
+        (rows, m) saliency scores — lower = safer to prune.
+    """
+    if H_diag is None:
+        # Fallback to OBS scorer if H_diag not provided
+        return W_block ** 2 / (Hinv_diag.unsqueeze(0) ** 2)
+    h_diag_block = H_diag[col_offset:col_offset + m].clamp(min=1e-10)
+    return W_block.abs() * h_diag_block.sqrt().unsqueeze(0)
+
+
+def hybrid_scorer(
+    W_block: torch.Tensor,
+    Hinv_diag: torch.Tensor,
+    col_offset: int,
+    m: int,
+    H_diag: Optional[torch.Tensor] = None,
+    lam: float = 0.5,
+    **kwargs,
+) -> torch.Tensor:
+    """Hybrid scorer: OBS saliency + Wanda firing-rate term.
+
+    Combines the full second-order OBS score with the diagonal (firing rate)
+    term from Wanda. The motivation: OBS captures weight-Hessian interactions
+    but can be noisy for ill-conditioned layers. The Wanda term adds a stable
+    activation-magnitude signal that is especially informative for SNNs.
+
+        score = (1-λ) · w²/d² + λ · |w|·√(H_{jj})
+
+    Both terms are normalized to [0,1] per group before combining, so λ
+    directly controls the interpolation.
+
+    For binary SNNs: H_{jj} = firing_rate_j, making the Wanda term equivalent
+    to weighting by √(firing_rate). Channels with higher firing rates are
+    more important and less likely to be pruned.
+
+    Args:
+        lam: Interpolation weight for Wanda term. 0 = pure OBS, 1 = pure Wanda.
+             Default 0.5 (equal mix).
+    """
+    # OBS term: w² / d²
+    obs_scores = W_block ** 2 / (Hinv_diag.unsqueeze(0) ** 2)
+
+    if H_diag is None or lam == 0.0:
+        return obs_scores
+
+    # Wanda term: |w| · √(H_{jj})
+    h_diag_block = H_diag[col_offset:col_offset + m].clamp(min=1e-10)
+    wanda_scores = W_block.abs() * h_diag_block.sqrt().unsqueeze(0)
+
+    # Normalize each to [0,1] per group for fair combination
+    obs_max = obs_scores.max(dim=1, keepdim=True).values.clamp(min=1e-10)
+    wanda_max = wanda_scores.max(dim=1, keepdim=True).values.clamp(min=1e-10)
+
+    return (1 - lam) * (obs_scores / obs_max) + lam * (wanda_scores / wanda_max)
+
+
 # Type alias for scorer functions
 Scorer = Callable[..., torch.Tensor]
 
@@ -361,6 +445,16 @@ def obs_prune_layer(
 
     # --- Dead columns (never-activated inputs in SNN) ---
     dead = Hs.diag() == 0
+    dead_ratio = dead.float().mean().item()
+
+    # Fall back to magnitude pruning if activations are too sparse for OBS.
+    # Criteria: too many dead columns, or Hessian diagonal too small overall
+    # (near-zero firing rates make the inverse numerically unstable).
+    diag_mean = Hs.diag().mean().item()
+    if dead_ratio > 0.5 or diag_mean < 1e-4:
+        from sparse.pruning import prune_n_m
+        return prune_n_m(W_2d, n=n, m=m), 0.0
+
     Hs[dead, dead] = 1
     W[:, dead] = 0
 
@@ -525,10 +619,15 @@ def apply_obs_pruning(
 
         r, c = W_2d.shape
 
+        # Build scorer kwargs — auto-inject H_diag for Wanda/hybrid scorers
+        layer_scorer_kwargs = dict(scorer_kwargs or {})
+        if scorer in (wanda_scorer, hybrid_scorer) and 'H_diag' not in layer_scorer_kwargs:
+            layer_scorer_kwargs['H_diag'] = H.cpu().diag()
+
         # OBS prune
         W_pruned, loss = obs_prune_layer(
             W_2d, H.cpu(), n=n, m=m, blocksize=blocksize,
-            percdamp=percdamp, scorer=scorer, scorer_kwargs=scorer_kwargs or {},
+            percdamp=percdamp, scorer=scorer, scorer_kwargs=layer_scorer_kwargs,
         )
 
         # Reconstruction error metric
@@ -624,6 +723,12 @@ if __name__ == '__main__':
                         help='Number of calibration batches (default 128)')
     parser.add_argument('--exclude', type=str, nargs='*', default=['head'],
                         help='Layer name prefixes to skip (default: head)')
+    parser.add_argument('--scorer', type=str, default='obs',
+                        choices=['obs', 'wanda', 'hybrid'],
+                        help='Saliency scorer: obs (default SparseGPT w²/d²), '
+                             'wanda (|w|·√firing_rate), hybrid (interpolation)')
+    parser.add_argument('--lam', type=float, default=0.5,
+                        help='Hybrid scorer interpolation: 0=pure OBS, 1=pure Wanda')
     parser.add_argument('--evaluate', action='store_true',
                         help='Run evaluation after pruning')
     parser.add_argument('--output', type=str, default=None,
@@ -663,21 +768,27 @@ if __name__ == '__main__':
         img_size=ds_cfg['img_size'], num_workers=4,
     )
 
-    # Step 1: Collect Hessians (also detects neuron-fed vs dense-input layers)
+    # Resolve scorer
+    scorer_map = {'obs': default_obs_scorer, 'wanda': wanda_scorer, 'hybrid': hybrid_scorer}
+    scorer_fn = scorer_map[args.scorer]
+    scorer_kwargs = {}
+    if args.scorer == 'hybrid':
+        scorer_kwargs['lam'] = args.lam
+    print(f"Scorer: {args.scorer}" + (f" (lam={args.lam})" if args.scorer == 'hybrid' else ''))
+
+    original_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
     print(f"\n--- Collecting Hessians ({args.calib_batches} batches) ---")
     hessians, input_from_neuron = collect_hessians(
         model, train_loader, device,
         max_batches=args.calib_batches, exclude_names=args.exclude,
     )
-
-    original_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-
-    # Step 2: Apply OBS pruning (skips non-neuron-fed layers by default)
     model, stats = apply_obs_pruning(
         model, hessians,
         n=args.n, m=args.m, blocksize=args.blocksize,
         percdamp=args.percdamp, exclude_names=args.exclude,
         input_from_neuron=input_from_neuron,
+        scorer=scorer_fn, scorer_kwargs=scorer_kwargs,
     )
 
     # Save

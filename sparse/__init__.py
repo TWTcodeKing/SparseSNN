@@ -2,11 +2,16 @@
 
 Submodules:
     pruning      — canonical N:M structured pruning primitives
+    OBS          — SparseGPT-style OBS for N:M pruning (baseline)
+    snn_obs      — SNN-aware OBS: spike-weighted Hessian + threshold calibration
     st_train     — SR-STE regularized training toward N:M sparsity
     permutation  — activation-aware channel permutation for N:M alignment
     comp_2_4     — dense-sparse weight factorization (W = W_24 + W_residual)
-    fr_prune     — neuron-level firing-rate-aware N:M pruning (spatial/token granularity)
-    convert      — element-wise N:M compensation (S2SC: Spike-to-Structured-Sparse Conversion)
+    fr_prune     — neuron-level firing-rate-aware N:M pruning
+    convert      — element-wise N:M compensation
+
+Shared utilities in sparse.utils:
+    Neuron param accessors, firing rate / membrane potential collectors.
 
 Profiling utilities are in utils.profiling and re-exported here for convenience.
 """

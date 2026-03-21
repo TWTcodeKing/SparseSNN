@@ -121,12 +121,8 @@ def main():
         model = build_model_from_config(model_cfg)
         model_name = os.path.splitext(os.path.basename(args.config))[0]
     else:
-        model_kwargs = {'num_classes': num_classes}
-        if 'sew_' in args.model:
-            model_kwargs['T'] = args.T
-        else:
-            model_kwargs['time_window'] = args.T
-        model = build_model(args.model, **model_kwargs)
+        model = build_model(args.model, num_classes=num_classes,
+                            in_channels=ds_cfg['in_channels'], T=args.T)
         model_name = args.model
 
     # ---- Load checkpoint ----

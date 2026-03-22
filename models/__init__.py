@@ -27,14 +27,16 @@ from .sewresnet import (
     sew_resnet18, sew_resnet34, sew_resnet50, sew_resnet101, sew_resnet152,
 )
 from .msresnet import (
-    ms_resnet18, ms_resnet34, ms_resnet104,
+    ms_resnet18, ms_resnet34, ms_resnet50, ms_resnet104,
 )
+from .dvs_sewresnet import DVSSEWResNet, dvs_sew_resnet
+from .spikingresformer import SpikingResformer, spikingresformer, build_spikingresformer
 
 # ---- SNN Transformer variants (config-based builders) ----
 from .spikformer import Spikformer, build_spikformer
 from .metaformer import SpikeDrivenTransformerV2, build_metaformer
 from .qkformer import QKFormer, build_qkformer
-from .maxformer import MaxFormer, build_maxformer
+from .maxformer import MaxFormer, build_maxformer, MS_QKFormer, build_ms_qkformer
 
 # arch name -> build function mapping
 ARCH_BUILDERS = {
@@ -42,4 +44,6 @@ ARCH_BUILDERS = {
     'metaformer': build_metaformer,
     'qkformer': build_qkformer,
     'maxformer': build_maxformer,
+    'ms_qkformer': build_ms_qkformer,
+    'spikingresformer': build_spikingresformer,
 }

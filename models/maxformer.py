@@ -283,6 +283,107 @@ class EmbedMax(nn.Module):
         return x
 
 
+class PatchEmbedInitMaxPool(nn.Module):
+    """Initial patch embedding using stride-1 convs + MaxPool (MS_QKFormer style).
+
+    Original PatchEmbedInit from ms_qkformer.py:
+        Conv3x3(stride=1) → BN → MaxPool(3,2) → LIF →
+        Conv3x3(stride=1) → BN → MaxPool(3,2) →
+        Conv3x3(stride=1) → BN
+        + residual: Conv1x1(stride=2) → BN from after first MaxPool
+
+    Key names match EmbedOrigImageNet:
+        embed1.embed_conv/bn → proj_conv/bn
+        embed2.embed_conv/bn → proj_conv1/bn1
+        embed3.embed_conv/bn → proj_conv2/bn2
+        embed4.embed_conv/bn → rpe_conv/bn
+    """
+
+    def __init__(self, in_channels=3, embed_dims=256):
+        super().__init__()
+        half = embed_dims // 2
+
+        # Stage 1: Conv3x3(stride=1) → BN → MaxPool
+        self.embed1 = nn.Module()
+        self.embed1.embed_conv = nn.Conv2d(in_channels, half, 3, stride=1, padding=1, bias=False)
+        self.embed1.embed_bn = nn.BatchNorm2d(half)
+        self.maxpool1 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.lif1 = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
+
+        # Stage 2: Conv3x3(stride=1) → BN → MaxPool
+        self.embed2 = nn.Module()
+        self.embed2.embed_conv = nn.Conv2d(half, embed_dims, 3, stride=1, padding=1, bias=False)
+        self.embed2.embed_bn = nn.BatchNorm2d(embed_dims)
+        self.maxpool2 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.lif2 = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
+
+        # Stage 3: Conv3x3(stride=1) → BN
+        self.embed3 = nn.Module()
+        self.embed3.embed_conv = nn.Conv2d(embed_dims, embed_dims, 3, stride=1, padding=1, bias=False)
+        self.embed3.embed_bn = nn.BatchNorm2d(embed_dims)
+
+        # Residual: Conv1x1(stride=2) → BN from after first MaxPool
+        self.embed4 = nn.Module()
+        self.embed4.embed_conv = nn.Conv2d(half, embed_dims, 1, stride=2, padding=0, bias=False)
+        self.embed4.embed_bn = nn.BatchNorm2d(embed_dims)
+
+    def forward(self, x):
+        T, B, C, H, W = x.shape
+
+        # Stage 1: Conv → BN → MaxPool
+        x = self.embed1.embed_conv(x.flatten(0, 1).contiguous())
+        x = self.embed1.embed_bn(x)
+        x = self.maxpool1(x).reshape(T, B, -1, H // 2, W // 2).contiguous()
+
+        # LIF1 then flatten — save x_feat AFTER lif, flattened (for residual)
+        x = self.lif1(x).flatten(0, 1).contiguous()
+        x_feat = x  # post-LIF, flattened (T*B, C, H/2, W/2)
+
+        # Stage 2: Conv → BN → MaxPool
+        x = self.embed2.embed_conv(x)
+        x = self.embed2.embed_bn(x)
+        x = self.maxpool2(x).reshape(T, B, -1, H // 4, W // 4).contiguous()
+
+        # LIF2 then Stage 3: Conv → BN
+        x = self.lif2(x).flatten(0, 1).contiguous()
+        x = self.embed3.embed_conv(x)
+        x = self.embed3.embed_bn(x)
+
+        # Residual from x_feat (post-LIF1, flattened)
+        x_feat = self.embed4.embed_conv(x_feat)
+        x_feat = self.embed4.embed_bn(x_feat)
+
+        x = (x + x_feat).reshape(T, B, -1, H // 4, W // 4).contiguous()
+        return x
+
+
+class Embed1Max(nn.Module):
+    """QKFormer-style 2x downsampling: MaxPool on main path, stride-2 conv on residual.
+
+    Main: MaxEmbed(Conv3x3 + BN + MaxPool) → Embed(Conv3x3 + BN)
+    Residual: Embed(Conv1x1, stride=2) — no MaxPool on residual
+    """
+
+    def __init__(self, in_channels=2, embed_dims=256):
+        super().__init__()
+        self.max_embed1 = MaxEmbed(in_channels=in_channels, out_channels=embed_dims,
+                                   kernel_size=3, stride=1, padding=1)
+        self.embed1 = Embed(in_channels=embed_dims, out_channels=embed_dims,
+                            kernel_size=3, stride=1, padding=1)
+        self.max_embed2 = Embed(in_channels=in_channels, out_channels=embed_dims,
+                                kernel_size=1, stride=2, padding=0, shortcut=True)
+
+    def forward(self, x):
+        T, B, C, H, W = x.shape
+        x, x_feat = self.max_embed1(x, dual=True)
+        x = x.reshape(T, B, -1, H // 2, W // 2).contiguous()
+        x = self.embed1(x)
+
+        x_feat = self.max_embed2(x_feat)
+        x = (x + x_feat).reshape(T, B, -1, H // 2, W // 2).contiguous()
+        return x
+
+
 # ---------------------------------------------------------------------------
 # MaxFormer
 # ---------------------------------------------------------------------------
@@ -369,15 +470,173 @@ class MaxFormer(nn.Module):
         return x
 
 
-def build_maxformer(config):
-    """Build a MaxFormer model from a config dict.
+class Token_QK_Attention(nn.Module):
+    """Token Q-K Attention (no V) used in MS_QKFormer stages 1-2.
 
-    Config keys (from YAML):
-        embed_dims, mlp_ratios, depths
-    Runtime keys (merged by training script):
-        num_classes, T, in_channels
+    Q channels are summed to produce scalar attention, element-wise multiplied with K.
+    Uses Conv1d for Q/K/proj projections.
     """
+
+    def __init__(self, dim, num_heads=8):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.dim = dim
+        self.num_heads = num_heads
+
+        self.proj_lif = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
+
+        self.q_conv = nn.Conv1d(dim, dim, kernel_size=1, stride=1, bias=False)
+        self.q_bn = nn.BatchNorm1d(dim)
+        self.q_lif = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
+
+        self.k_conv = nn.Conv1d(dim, dim, kernel_size=1, stride=1, bias=False)
+        self.k_bn = nn.BatchNorm1d(dim)
+        self.k_lif = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
+
+        self.attn_lif = MultiStepLIFNeuron(tau=2.0, v_threshold=0.5, detach_reset=True)
+
+        self.proj_conv = nn.Conv1d(dim, dim, kernel_size=1, stride=1)
+        self.proj_bn = nn.BatchNorm1d(dim)
+
+    def forward(self, x):
+        T, B, C, H, W = x.shape
+        identity = x
+        N = H * W
+
+        x = self.proj_lif(x)
+        x = x.flatten(3)  # (T, B, C, N)
+        x_for_qk = x.flatten(0, 1)  # (T*B, C, N)
+
+        q = self.q_bn(self.q_conv(x_for_qk)).reshape(T, B, C, N)
+        q = self.q_lif(q)
+        q = q.reshape(T, B, self.num_heads, C // self.num_heads, N)
+
+        k = self.k_bn(self.k_conv(x_for_qk)).reshape(T, B, C, N)
+        k = self.k_lif(k)
+        k = k.reshape(T, B, self.num_heads, C // self.num_heads, N)
+
+        # Sum Q over head_dim → scalar attention per head/token
+        attn = q.sum(dim=3, keepdim=True)  # (T, B, heads, 1, N)
+        attn = self.attn_lif(attn)
+
+        # Element-wise multiply with K
+        x = torch.mul(attn, k)  # (T, B, heads, head_dim, N)
+        x = x.reshape(T, B, C, N)
+        x = x.flatten(0, 1)
+        x = self.proj_bn(self.proj_conv(x)).reshape(T, B, C, H, W)
+
+        x = x + identity
+        return x
+
+
+class Block_QKA(nn.Module):
+    """Block with Token Q-K Attention + S_MLP."""
+
+    def __init__(self, dim, num_heads=8, mlp_ratio=4.):
+        super().__init__()
+        self.attn = Token_QK_Attention(dim, num_heads=num_heads)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = S_MLP(in_features=dim, hidden_features=mlp_hidden_dim)
+
+    def forward(self, x):
+        x = self.attn(x)
+        x = self.mlp(x)
+        return x
+
+
+class MS_QKFormer(nn.Module):
+    """MS_QKFormer: QKFormer attention (stages 1-2) + SSA (stage 3).
+
+    Same hierarchical structure as MaxFormer but with Token Q-K Attention
+    blocks in stages 1-2 instead of DWConv/MaxPool mixers.
+    """
+
+    def __init__(self, in_channels=3, num_classes=1000, embed_dims=512,
+                 mlp_ratios=4, depths=10, T=4):
+        super().__init__()
+        self.num_classes = num_classes
+        self.depths = depths
+        self.T = T
+
+        self.patch_embed1 = PatchEmbedInitMaxPool(in_channels=in_channels,
+                                                  embed_dims=embed_dims // 4)
+
+        self.stage1 = nn.ModuleList([
+            Block_QKA(dim=embed_dims // 4, num_heads=embed_dims // 64,
+                      mlp_ratio=mlp_ratios)
+            for _ in range(1)
+        ])
+
+        self.patch_embed2 = Embed1Max(in_channels=embed_dims // 4,
+                                      embed_dims=embed_dims // 2)
+
+        self.stage2 = nn.ModuleList([
+            Block_QKA(dim=embed_dims // 2, num_heads=embed_dims // 64,
+                      mlp_ratio=mlp_ratios)
+            for _ in range(2)
+        ])
+
+        self.patch_embed3 = Embed1Max(in_channels=embed_dims // 2,
+                                      embed_dims=embed_dims)
+
+        self.stage3 = nn.ModuleList([
+            Block_SSA(dim=embed_dims, mlp_ratio=mlp_ratios,
+                      num_heads=embed_dims // 64)
+            for _ in range(7)
+        ])
+
+        self.head_lif = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
+        self.head = nn.Linear(embed_dims, num_classes) if num_classes > 0 else nn.Identity()
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d):
+            _trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward_features(self, x):
+        x = self.patch_embed1(x)
+        for blk in self.stage1:
+            x = blk(x)
+        x = self.patch_embed2(x)
+        for blk in self.stage2:
+            x = blk(x)
+        x = self.patch_embed3(x)
+        for blk in self.stage3:
+            x = blk(x)
+        return x.flatten(3).mean(3)
+
+    def forward(self, x):
+        if len(x.shape) < 5:
+            x = (x.unsqueeze(0)).repeat(self.T, 1, 1, 1, 1)
+        else:
+            x = x.transpose(0, 1).contiguous()
+        x = self.forward_features(x)
+        x = self.head_lif(x)
+        x = self.head(x)
+        x = x.mean(0)
+        return x
+
+
+def build_maxformer(config):
+    """Build a MaxFormer model from a config dict."""
     return MaxFormer(
+        T=config['T'],
+        embed_dims=config['embed_dims'],
+        mlp_ratios=config.get('mlp_ratios', 4),
+        in_channels=config.get('in_channels', 3),
+        num_classes=config['num_classes'],
+        depths=config.get('depths', 10),
+    )
+
+
+def build_ms_qkformer(config):
+    """Build a MS_QKFormer model from a config dict."""
+    return MS_QKFormer(
         T=config['T'],
         embed_dims=config['embed_dims'],
         mlp_ratios=config.get('mlp_ratios', 4),

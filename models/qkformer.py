@@ -368,7 +368,9 @@ class QKFormer(nn.Module):
         return x.flatten(3).mean(3)
 
     def forward(self, x):
-        x = (x.unsqueeze(0)).repeat(self.T, 1, 1, 1, 1)
+        if x.dim() == 4:
+            x = (x.unsqueeze(0)).repeat(self.T, 1, 1, 1, 1)
+        # else: (T, B, C, H, W) DVS input
         x = self.forward_features(x)
         x = self.head(x.mean(0))
         return x

@@ -199,7 +199,8 @@ def _populate_resnet_registry():
     import models as M
     for name in ['sew_resnet18', 'sew_resnet34', 'sew_resnet50',
                  'sew_resnet101', 'sew_resnet152',
-                 'ms_resnet18', 'ms_resnet34', 'ms_resnet104']:
+                 'ms_resnet18', 'ms_resnet34', 'ms_resnet50', 'ms_resnet104',
+                 'dvs_sew_resnet']:
         fn = getattr(M, name, None)
         if fn:
             _RESNET_REGISTRY[name] = fn

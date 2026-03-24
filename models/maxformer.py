@@ -68,6 +68,17 @@ class S_MLP(nn.Module):
 # Mixer Blocks
 # ---------------------------------------------------------------------------
 
+class Block_identity(nn.Module):
+    """Identity mixer block — MLP only, no spatial mixing."""
+    def __init__(self, dim, mlp_ratio=4.):
+        super().__init__()
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = S_MLP(in_features=dim, hidden_features=mlp_hidden_dim)
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
 class Block_Max(nn.Module):
     """MaxPool mixer block."""
     def __init__(self, dim, mlp_ratio=4.):
@@ -261,6 +272,31 @@ class EmbedOrigImageNet(nn.Module):
         return x
 
 
+class EmbedOrig(nn.Module):
+    """CIFAR initial patch embedding — no spatial downsampling.
+
+    Conv3x3(stride=1) → BN, then parallel Conv3x3 + Conv1x1 shortcut, summed.
+    Output keeps same spatial resolution as input.
+    """
+    def __init__(self, in_channels=3, embed_dims=256):
+        super().__init__()
+        self.embed1 = Embed(in_channels=in_channels, out_channels=embed_dims // 2,
+                            kernel_size=3, stride=1, padding=1, shortcut=True)
+        self.embed2 = Embed(in_channels=embed_dims // 2, out_channels=embed_dims,
+                            kernel_size=3, stride=1, padding=1)
+        self.embed3 = Embed(in_channels=embed_dims // 2, out_channels=embed_dims,
+                            kernel_size=1, stride=1, padding=0, shortcut=True)
+
+    def forward(self, x):
+        T, B, C, H, W = x.shape
+        x = self.embed1(x)
+        x = x.reshape(T, B, -1, H, W).contiguous()
+        x, x_feat = self.embed2(x, dual=True)
+        x_feat = self.embed3(x_feat)
+        x = (x + x_feat).reshape(T, B, -1, H, W).contiguous()
+        return x
+
+
 class EmbedMax(nn.Module):
     """MaxPool-based 2x downsampling embedding with residual."""
     def __init__(self, in_channels=2, embed_dims=256):
@@ -380,6 +416,34 @@ class Embed1Max(nn.Module):
         x = self.embed1(x)
 
         x_feat = self.max_embed2(x_feat)
+        x = (x + x_feat).reshape(T, B, -1, H // 2, W // 2).contiguous()
+        return x
+
+
+class Embed1MaxCifar(nn.Module):
+    """CIFAR Embed_1Max (original order from embedding_hub.py).
+
+    Main: Embed(LIF→Conv3x3→BN) → Max_Embed(LIF→Conv3x3→BN→MaxPool)
+    Residual: Embed(Conv1x1 stride=2, shortcut=True, no LIF)
+
+    Note: differs from Embed1Max (ImageNet) which swaps the main path order.
+    """
+
+    def __init__(self, in_channels=2, embed_dims=256):
+        super().__init__()
+        self.embed1 = Embed(in_channels=in_channels, out_channels=embed_dims,
+                            kernel_size=3, stride=1, padding=1)
+        self.max_embed1 = MaxEmbed(in_channels=embed_dims, out_channels=embed_dims,
+                                   kernel_size=3, stride=1, padding=1)
+        self.embed2 = Embed(in_channels=in_channels, out_channels=embed_dims,
+                            kernel_size=1, stride=2, padding=0, shortcut=True)
+
+    def forward(self, x):
+        T, B, C, H, W = x.shape
+        x, x_feat = self.embed1(x, dual=True)
+        x = x.reshape(T, B, -1, H, W).contiguous()
+        x = self.max_embed1(x)
+        x_feat = self.embed2(x_feat)
         x = (x + x_feat).reshape(T, B, -1, H // 2, W // 2).contiguous()
         return x
 
@@ -622,8 +686,271 @@ class MS_QKFormer(nn.Module):
         return x
 
 
+class MaxFormerCifar(nn.Module):
+    """MaxFormer for CIFAR (32x32).
+
+    Differences from ImageNet MaxFormer:
+    - EmbedOrig stem (3x3 stride=1, no downsampling)
+    - Stage 1: Block_identity (MLP only)
+    - Stage 2: Block_DWC(k=3)
+    - Stage 3: Block_SSA with num_heads=8 (fixed)
+    - depths=4 → 1+1+2 blocks
+    """
+
+    def __init__(self, in_channels=3, num_classes=100, embed_dims=384,
+                 mlp_ratios=4, depths=4, T=4):
+        super().__init__()
+        self.T = T
+
+        self.patch_embed1 = EmbedOrig(in_channels=in_channels,
+                                      embed_dims=embed_dims // 4)
+        self.stage1 = nn.ModuleList([
+            Block_identity(dim=embed_dims // 4, mlp_ratio=mlp_ratios)
+            for _ in range(1)
+        ])
+        self.patch_embed2 = EmbedMax(in_channels=embed_dims // 4,
+                                     embed_dims=embed_dims // 2)
+        self.stage2 = nn.ModuleList([
+            Block_DWC(dim=embed_dims // 2, kernel_size=3, mlp_ratio=mlp_ratios)
+            for _ in range(1)
+        ])
+        self.patch_embed3 = EmbedMax(in_channels=embed_dims // 2,
+                                     embed_dims=embed_dims)
+        self.stage3 = nn.ModuleList([
+            Block_SSA(dim=embed_dims, mlp_ratio=mlp_ratios, num_heads=8)
+            for _ in range(depths - 2)
+        ])
+        self.head_lif = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
+        self.head = nn.Linear(embed_dims, num_classes) if num_classes > 0 else nn.Identity()
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d):
+            _trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward_features(self, x):
+        x = self.patch_embed1(x)
+        for blk in self.stage1:
+            x = blk(x)
+        x = self.patch_embed2(x)
+        for blk in self.stage2:
+            x = blk(x)
+        x = self.patch_embed3(x)
+        for blk in self.stage3:
+            x = blk(x)
+        return x.flatten(3).mean(3)
+
+    def forward(self, x):
+        if len(x.shape) < 5:
+            x = (x.unsqueeze(0)).repeat(self.T, 1, 1, 1, 1)
+        else:
+            x = x.transpose(0, 1).contiguous()
+        x = self.forward_features(x)
+        x = self.head_lif(x)
+        x = self.head(x)
+        x = x.mean(0)
+        return x
+
+
+class MS_QKFormerCifar(nn.Module):
+    """MS_QKFormer for CIFAR (32x32).
+
+    Differences from ImageNet MS_QKFormer:
+    - EmbedOrig stem (3x3 stride=1, no downsampling)
+    - depths=4 → 1+1+2 blocks
+    - num_heads=8 (fixed)
+    """
+
+    def __init__(self, in_channels=3, num_classes=100, embed_dims=384,
+                 mlp_ratios=4, depths=4, T=4):
+        super().__init__()
+        self.T = T
+
+        self.patch_embed1 = EmbedOrig(in_channels=in_channels,
+                                      embed_dims=embed_dims // 4)
+        self.stage1 = nn.ModuleList([
+            Block_QKA(dim=embed_dims // 4, num_heads=8, mlp_ratio=mlp_ratios)
+            for _ in range(1)
+        ])
+        self.patch_embed2 = Embed1MaxCifar(in_channels=embed_dims // 4,
+                                           embed_dims=embed_dims // 2)
+        self.stage2 = nn.ModuleList([
+            Block_QKA(dim=embed_dims // 2, num_heads=8, mlp_ratio=mlp_ratios)
+            for _ in range(1)
+        ])
+        self.patch_embed3 = Embed1MaxCifar(in_channels=embed_dims // 2,
+                                           embed_dims=embed_dims)
+        self.stage3 = nn.ModuleList([
+            Block_SSA(dim=embed_dims, mlp_ratio=mlp_ratios, num_heads=8)
+            for _ in range(depths - 2)
+        ])
+        self.head_lif = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
+        self.head = nn.Linear(embed_dims, num_classes) if num_classes > 0 else nn.Identity()
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d):
+            _trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward_features(self, x):
+        x = self.patch_embed1(x)
+        for blk in self.stage1:
+            x = blk(x)
+        x = self.patch_embed2(x)
+        for blk in self.stage2:
+            x = blk(x)
+        x = self.patch_embed3(x)
+        for blk in self.stage3:
+            x = blk(x)
+        return x.flatten(3).mean(3)
+
+    def forward(self, x):
+        if len(x.shape) < 5:
+            x = (x.unsqueeze(0)).repeat(self.T, 1, 1, 1, 1)
+        else:
+            x = x.transpose(0, 1).contiguous()
+        x = self.forward_features(x)
+        x = self.head_lif(x)
+        x = self.head(x)
+        x = x.mean(0)
+        return x
+
+
+class EmbedMaxPlus(nn.Module):
+    """DVS initial patch embedding — 3 cascaded MaxPool stages for 128x128 input.
+
+    128→64→32→16 spatial downsampling (8x total).
+    Shortcut from after 2nd MaxPool via stride-4 Conv1x1.
+    """
+
+    def __init__(self, in_channels=2, embed_dims=256):
+        super().__init__()
+        self.proj_conv = nn.Conv2d(in_channels, embed_dims // 8, kernel_size=3,
+                                   stride=1, padding=1, bias=False)
+        self.proj_bn = nn.BatchNorm2d(embed_dims // 8)
+
+        self.max_embed1 = MaxEmbed(in_channels=embed_dims // 8, out_channels=embed_dims // 4,
+                                   kernel_size=3, stride=1, padding=1)
+        self.max_embed2 = MaxEmbed(in_channels=embed_dims // 4, out_channels=embed_dims // 2,
+                                   kernel_size=3, stride=1, padding=1)
+        self.max_embed3 = MaxEmbed(in_channels=embed_dims // 2, out_channels=embed_dims,
+                                   kernel_size=3, stride=1, padding=1)
+
+        self.embed1 = Embed(in_channels=embed_dims // 4, out_channels=embed_dims,
+                            kernel_size=1, stride=4, padding=0, shortcut=True)
+
+    def forward(self, x):
+        T, B, C, H, W = x.shape
+        x = self.proj_conv(x.flatten(0, 1).contiguous())
+        x = self.proj_bn(x).reshape(T, B, -1, H, W)
+
+        x = self.max_embed1(x)
+        x = x.reshape(T, B, -1, H // 2, W // 2).contiguous()
+
+        x, x_feat = self.max_embed2(x, dual=True)
+        x = x.reshape(T, B, -1, H // 4, W // 4).contiguous()
+
+        x = self.max_embed3(x)
+
+        x_feat = self.embed1(x_feat)  # shortcut: stride=4 from H//2 to H//8
+        x = (x + x_feat).reshape(T, B, -1, H // 8, W // 8).contiguous()
+        return x
+
+
+class MaxFormerDVS(nn.Module):
+    """MaxFormer for DVS datasets (128x128, 2 channels).
+
+    2-stage architecture: EmbedMaxPlus(8x downsample) + DWC3 → EmbedMax(2x) + SSA.
+    Trained from scratch (no transfer learning).
+
+    Original config: embed_dims=256, mlp_ratios=1.0, T=16, num_heads=16.
+    Reported: CIFAR10-DVS 84.2%, DVS128 Gesture 98.6%.
+    """
+
+    def __init__(self, in_channels=2, num_classes=10, embed_dims=256,
+                 mlp_ratios=1.0, T=16):
+        super().__init__()
+        self.T = T
+
+        self.patch_embed1 = EmbedMaxPlus(in_channels=in_channels,
+                                         embed_dims=embed_dims // 2)
+        self.stage1 = nn.ModuleList([
+            Block_DWC(dim=embed_dims // 2, kernel_size=3, mlp_ratio=mlp_ratios)
+            for _ in range(1)
+        ])
+
+        self.patch_embed2 = EmbedMax(in_channels=embed_dims // 2,
+                                     embed_dims=embed_dims)
+        self.stage2 = nn.ModuleList([
+            Block_SSA(dim=embed_dims, mlp_ratio=mlp_ratios, num_heads=16)
+            for _ in range(1)
+        ])
+
+        self.head_lif = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
+        self.head = nn.Linear(embed_dims, num_classes) if num_classes > 0 else nn.Identity()
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d):
+            _trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward_features(self, x):
+        x = self.patch_embed1(x)
+        for blk in self.stage1:
+            x = blk(x)
+        x = self.patch_embed2(x)
+        for blk in self.stage2:
+            x = blk(x)
+        return x.flatten(3).mean(3)
+
+    def forward(self, x):
+        if len(x.shape) < 5:
+            x = (x.unsqueeze(0)).repeat(self.T, 1, 1, 1, 1)
+        else:
+            x = x.transpose(0, 1).contiguous()
+        x = self.forward_features(x)
+        x = self.head_lif(x)
+        x = self.head(x)
+        x = x.mean(0)
+        return x
+
+
 def build_maxformer(config):
     """Build a MaxFormer model from a config dict."""
+    variant = config.get('variant', 'imagenet')
+    if variant == 'cifar':
+        return MaxFormerCifar(
+            T=config['T'],
+            embed_dims=config['embed_dims'],
+            mlp_ratios=config.get('mlp_ratios', 4),
+            in_channels=config.get('in_channels', 3),
+            num_classes=config['num_classes'],
+            depths=config.get('depths', 4),
+        )
+    if variant == 'dvs':
+        return MaxFormerDVS(
+            T=config['T'],
+            embed_dims=config['embed_dims'],
+            mlp_ratios=config.get('mlp_ratios', 1.0),
+            in_channels=config.get('in_channels', 2),
+            num_classes=config['num_classes'],
+        )
+    # Default: ImageNet
     return MaxFormer(
         T=config['T'],
         embed_dims=config['embed_dims'],
@@ -636,6 +963,25 @@ def build_maxformer(config):
 
 def build_ms_qkformer(config):
     """Build a MS_QKFormer model from a config dict."""
+    variant = config.get('variant', 'imagenet')
+    if variant == 'cifar':
+        return MS_QKFormerCifar(
+            T=config['T'],
+            embed_dims=config['embed_dims'],
+            mlp_ratios=config.get('mlp_ratios', 4),
+            in_channels=config.get('in_channels', 3),
+            num_classes=config['num_classes'],
+            depths=config.get('depths', 4),
+        )
+    if variant == 'dvs':
+        # DVS uses same MaxFormerDVS architecture (only MaxFormer DVS exists in repo)
+        return MaxFormerDVS(
+            T=config['T'],
+            embed_dims=config['embed_dims'],
+            mlp_ratios=config.get('mlp_ratios', 1.0),
+            in_channels=config.get('in_channels', 2),
+            num_classes=config['num_classes'],
+        )
     return MS_QKFormer(
         T=config['T'],
         embed_dims=config['embed_dims'],

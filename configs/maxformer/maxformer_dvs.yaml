@@ -1,0 +1,5 @@
+arch: maxformer
+variant: dvs
+
+embed_dims: 256
+mlp_ratios: 1.0

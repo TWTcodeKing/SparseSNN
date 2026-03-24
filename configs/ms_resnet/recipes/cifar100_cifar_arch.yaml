@@ -1,0 +1,35 @@
+# MS-ResNet CIFAR-specific architecture recipe for CIFAR-100
+# Paper: "Advancing Spiking Neural Networks towards Deep Residual Learning"
+# Table VIII (alternative structures) settings
+#
+# Models: ms_resnet_cifar{20,32,44,56,110}
+# Expected accuracy (paper Table VI):
+#   depth 32: 61.35%, depth 44: 63.84%
+#   depth 56: 65.24%, depth 110: 66.83%
+
+optimizer:
+  type: sgd
+  lr: 0.1
+  weight_decay: 1e-4
+  momentum: 0.9
+
+scheduler:
+  type: cosine
+  warmup_epochs: 0
+  min_lr: 0.0
+
+epochs: 100
+batch_size: 100
+
+augmentation:
+  auto_aug: false
+  cutout: false
+  mixup_alpha: 0.0
+  cutmix_alpha: 0.0
+
+regularization:
+  label_smoothing: 0.0
+  drop_path_rate: 0.0
+
+snn:
+  T: 6

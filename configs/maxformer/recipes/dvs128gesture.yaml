@@ -1,0 +1,27 @@
+# MaxFormer DVS recipe for DVS128 Gesture
+# Source: https://github.com/bic-L/MaxFormer event/dvsgesture.yaml
+# Trained from scratch. Reported: 98.6%
+optimizer:
+  type: adamw
+  lr: 5e-3
+  weight_decay: 0.06
+
+scheduler:
+  type: cosine
+  warmup_epochs: 10
+  warmup_lr: 1e-5
+  min_lr: 1e-5
+
+epochs: 150
+batch_size: 16
+
+augmentation:
+  auto_aug: false
+  mixup_alpha: 0.5
+  cutmix_alpha: 0.1
+
+regularization:
+  label_smoothing: 0.1
+
+snn:
+  T: 16

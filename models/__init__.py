@@ -25,9 +25,14 @@ from .layers import SeqToANNContainer, SeqToANNContainerT
 from .sewresnet import (
     SEWResNet,
     sew_resnet18, sew_resnet34, sew_resnet50, sew_resnet101, sew_resnet152,
+    sew_resnet_cifar20, sew_resnet_cifar32, sew_resnet_cifar44,
+    sew_resnet_cifar56, sew_resnet_cifar110,
 )
 from .msresnet import (
     ms_resnet18, ms_resnet34, ms_resnet50, ms_resnet104,
+    ms_resnet_cifar20, ms_resnet_cifar32, ms_resnet_cifar44,
+    ms_resnet_cifar56, ms_resnet_cifar110,
+    ms_resnet_dvs20,
 )
 from .dvs_sewresnet import DVSSEWResNet, dvs_sew_resnet
 from .spikingresformer import SpikingResformer, spikingresformer, build_spikingresformer

@@ -20,7 +20,7 @@ CIFAR100_STD = (0.2470, 0.2435, 0.2616)
 
 def _build_cifar_transforms(img_size, mean, std, auto_aug=False):
     train_t = [
-        transforms.RandomCrop(img_size),
+        transforms.RandomCrop(img_size, padding=4),
         transforms.RandomRotation(15),
         transforms.RandomHorizontalFlip(),
     ]

@@ -340,3 +340,140 @@ def ms_resnet50(num_classes=1000, **kwargs):
 
 def ms_resnet104(num_classes=1000, **kwargs):
     return MSResNet104(BasicBlock104, [3, 8, 32, 8], num_classes=num_classes, **kwargs)
+
+
+# ============================================================================
+# CIFAR-specific MS-ResNet (depths 20/32/44/56/110)
+# ============================================================================
+
+class BasicBlockCifar(nn.Module):
+    """Basic block for CIFAR MS-ResNet.
+
+    Same pre-activation pattern as BasicBlock18 (sn → conv_bn),
+    but shortcut uses AvgPool + Conv1x1 for spatial downsampling
+    (following the paper's CIFAR variant, same as BasicBlock104).
+    """
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1, **kwargs):
+        super().__init__()
+        self.sn1 = MSNeuron()
+        self.conv_bn1 = TDBNContainer(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3,
+                      stride=stride, padding=1, bias=False),
+            out_channels, bn_init_thresh=True,
+        )
+        self.sn2 = MSNeuron()
+        self.conv_bn2 = TDBNContainer(
+            nn.Conv2d(out_channels, out_channels, kernel_size=3,
+                      padding=1, bias=False),
+            out_channels, bn_init_thresh=False,  # zero-init
+        )
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.AvgPool3d((1, stride, stride), stride=(1, stride, stride)),
+                TDBNContainer(
+                    nn.Conv2d(in_channels, out_channels, kernel_size=1,
+                              stride=1, bias=False),
+                    out_channels, bn_init_thresh=True,
+                ),
+            )
+
+    def forward(self, x):
+        out = self.conv_bn1(self.sn1(x))
+        out = self.conv_bn2(self.sn2(out))
+        if len(self.shortcut) > 0:
+            # AvgPool3d expects (B,C,T,H,W)
+            sc = x.permute(1, 2, 0, 3, 4)
+            sc = self.shortcut[0](sc)
+            sc = sc.permute(2, 0, 1, 3, 4)
+            sc = self.shortcut[1](sc)
+        else:
+            sc = x
+        return out + sc
+
+
+class MSResNetCifar(nn.Module):
+    """CIFAR-specific MS-ResNet (paper Table VI).
+
+    Architecture: 3x3 stem (stride=1, no downsampling) → 3 stages [16, 32, 64]
+    with strides [1, 2, 2]. Total depth = 6*n + 2 where n = blocks per stage.
+
+    Paper reported accuracy on CIFAR-100:
+        depth 32  (n=5):  61.35%
+        depth 44  (n=7):  63.84%
+        depth 56  (n=9):  65.24%
+        depth 110 (n=18): 66.83%
+    """
+
+    def __init__(self, n, in_channels=3, num_classes=100, T=None,
+                 stem_stride=1, first_stage_stride=1, **kwargs):
+        super().__init__()
+        self.time_window = T or _TIME_WINDOW
+
+        # Stem: 3x3 conv (stride=1 for CIFAR 32x32, stride=2 for DVS 128x128)
+        self.conv1 = TDBNContainer(
+            nn.Conv2d(in_channels, 16, kernel_size=3, stride=stem_stride,
+                      padding=1, bias=False),
+            16, bn_init_thresh=True,
+        )
+
+        self.in_channels = 16
+        self.layer1 = self._make_layer(16, n, stride=first_stage_stride)
+        self.layer2 = self._make_layer(32, n, stride=2)
+        self.layer3 = self._make_layer(64, n, stride=2)
+
+        self.sn_out = MSNeuron()
+        self.fc = nn.Linear(64, num_classes)
+
+    def _make_layer(self, out_channels, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(BasicBlockCifar(self.in_channels, out_channels, s))
+            self.in_channels = out_channels
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        if x.dim() == 4:
+            T = self.time_window
+            x = x.unsqueeze(0).repeat(T, 1, 1, 1, 1)
+        output = self.conv1(x)
+        output = self.layer1(output)
+        output = self.layer2(output)
+        output = self.layer3(output)
+        output = self.sn_out(output)
+        output = output.mean(dim=0)
+        output = F.adaptive_avg_pool2d(output, 1).flatten(1)
+        output = self.fc(output)
+        return output
+
+
+def ms_resnet_cifar20(num_classes=100, **kwargs):
+    """CIFAR MS-ResNet-20 (depth=20, n=3)."""
+    return MSResNetCifar(n=3, num_classes=num_classes, **kwargs)
+
+def ms_resnet_cifar32(num_classes=100, **kwargs):
+    """CIFAR MS-ResNet-32 (depth=32, n=5)."""
+    return MSResNetCifar(n=5, num_classes=num_classes, **kwargs)
+
+def ms_resnet_cifar44(num_classes=100, **kwargs):
+    """CIFAR MS-ResNet-44 (depth=44, n=7)."""
+    return MSResNetCifar(n=7, num_classes=num_classes, **kwargs)
+
+def ms_resnet_cifar56(num_classes=100, **kwargs):
+    """CIFAR MS-ResNet-56 (depth=56, n=9)."""
+    return MSResNetCifar(n=9, num_classes=num_classes, **kwargs)
+
+def ms_resnet_cifar110(num_classes=100, **kwargs):
+    """CIFAR MS-ResNet-110 (depth=110, n=18)."""
+    return MSResNetCifar(n=18, num_classes=num_classes, **kwargs)
+
+
+def ms_resnet_dvs20(num_classes=10, **kwargs):
+    """DVS MS-ResNet-20 (128x128 input, stem_stride=2, first_stage_stride=2).
+    Paper: 75.56% on CIFAR10-DVS with 0.27M params.
+    Spatial: 128→64(stem)→32(layer1)→16(layer2)→8(layer3)."""
+    return MSResNetCifar(n=3, num_classes=num_classes,
+                         stem_stride=2, first_stage_stride=2, **kwargs)

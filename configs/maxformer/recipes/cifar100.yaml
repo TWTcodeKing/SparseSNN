@@ -1,22 +1,30 @@
-# MaxFormer recipe for CIFAR-100
+# MaxFormer / MS_QKFormer CIFAR-100 recipe
+# Source: https://github.com/bic-L/MaxFormer cifar10-100/cifar100.yaml
+# Reported: MaxFormer ~82.65% on CIFAR-100
 optimizer:
   type: adamw
-  lr: 1e-4
+  lr: 1.5e-3
   weight_decay: 0.06
-  betas: [0.9, 0.999]
+
 scheduler:
   type: cosine
   warmup_epochs: 20
-  min_lr: 1e-6
-epochs: 300
-batch_size: 128
+  warmup_lr: 1e-5
+  min_lr: 1e-5
+  cooldown_epochs: 10
+
+epochs: 400
+batch_size: 64
+
 augmentation:
-  auto_aug: true
-  cutout: true
-  mixup_alpha: 0.0
-  cutmix_alpha: 0.0
+  auto_aug: true    # rand-m9-n1-mstd0.4-inc1
+  mixup_alpha: 0.75
+  cutmix_alpha: 0.5
+  reprob: 0.25
+
 regularization:
   label_smoothing: 0.1
   drop_path_rate: 0.0
+
 snn:
   T: 4

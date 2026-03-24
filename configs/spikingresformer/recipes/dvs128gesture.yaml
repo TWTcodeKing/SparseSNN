@@ -1,0 +1,29 @@
+# SpikingResformer transfer learning recipe for DVS128 Gesture
+# Paper: same settings as CIFAR10-DVS transfer
+# T=10 (10 event slices), in_channels=2, img_size=128
+
+optimizer:
+  type: adamw
+  lr: 1e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_epochs: 3
+  min_lr: 1e-5
+
+epochs: 150
+batch_size: 128
+
+augmentation:
+  auto_aug: false
+  mixup_alpha: 0.5
+  cutmix_alpha: 0.0
+
+regularization:
+  label_smoothing: 0.1
+
+snn:
+  T: 10
+
+img_size: 128

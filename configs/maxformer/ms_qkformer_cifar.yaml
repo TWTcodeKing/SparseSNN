@@ -1,0 +1,6 @@
+arch: ms_qkformer
+variant: cifar
+
+embed_dims: 384
+mlp_ratios: 4
+depths: 4

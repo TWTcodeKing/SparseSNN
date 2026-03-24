@@ -1,0 +1,27 @@
+# MaxFormer DVS recipe for CIFAR10-DVS
+# Source: https://github.com/bic-L/MaxFormer event/cifar10dvs.yaml
+# Trained from scratch. Reported: 84.2%
+optimizer:
+  type: adamw
+  lr: 5e-3
+  weight_decay: 0.06
+
+scheduler:
+  type: cosine
+  warmup_epochs: 10
+  warmup_lr: 1e-5
+  min_lr: 1e-5
+
+epochs: 96
+batch_size: 16
+
+augmentation:
+  auto_aug: false
+  mixup_alpha: 0.5
+  cutmix_alpha: 0.1
+
+regularization:
+  label_smoothing: 0.1
+
+snn:
+  T: 16

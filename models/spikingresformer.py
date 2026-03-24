@@ -222,7 +222,7 @@ class SpikingResformer(nn.Module):
         super().__init__()
         self.T = T
 
-        # Prologue: Conv7x7(stride=2) → BN → MaxPool(3, stride=2)
+        # Prologue: Conv7x7(stride=2) → BN → MaxPool(3, stride=2) → 4x downsample
         self.prologue = nn.Sequential(
             _MultiStepConv2d(in_channels, planes[0], 7, stride=2, padding=3, bias=False),
             BN(planes[0]),
@@ -280,11 +280,12 @@ _CONFIGS = {
 }
 
 
-def spikingresformer(variant='s', num_classes=1000, in_channels=3, T=4, **kwargs):
+def spikingresformer(variant='s', num_classes=1000, in_channels=3, T=4,
+                     img_size=224, **kwargs):
     cfg = _CONFIGS[variant]
     return SpikingResformer(
         _LAYER_PATTERN, num_classes=num_classes, in_channels=in_channels, T=T,
-        **cfg, **kwargs,
+        img_size=img_size, **cfg, **kwargs,
     )
 
 
@@ -296,4 +297,5 @@ def build_spikingresformer(config):
         num_classes=config.get('num_classes', 1000),
         in_channels=config.get('in_channels', 3),
         T=config.get('T', 4),
+        img_size=config.get('img_size', 224),
     )

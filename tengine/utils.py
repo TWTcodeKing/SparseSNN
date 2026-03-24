@@ -123,7 +123,7 @@ def load_training_recipe(recipe_path):
             flat['decay_epochs'] = str(de)
 
     # Top-level
-    for key in ('epochs', 'batch_size'):
+    for key in ('epochs', 'batch_size', 'img_size'):
         if key in recipe:
             flat[key.replace('-', '_')] = recipe[key]
 
@@ -199,7 +199,12 @@ def _populate_resnet_registry():
     import models as M
     for name in ['sew_resnet18', 'sew_resnet34', 'sew_resnet50',
                  'sew_resnet101', 'sew_resnet152',
+                 'sew_resnet_cifar20', 'sew_resnet_cifar32', 'sew_resnet_cifar44',
+                 'sew_resnet_cifar56', 'sew_resnet_cifar110',
                  'ms_resnet18', 'ms_resnet34', 'ms_resnet50', 'ms_resnet104',
+                 'ms_resnet_cifar20', 'ms_resnet_cifar32', 'ms_resnet_cifar44',
+                 'ms_resnet_cifar56', 'ms_resnet_cifar110',
+                 'ms_resnet_dvs20',
                  'dvs_sew_resnet']:
         fn = getattr(M, name, None)
         if fn:

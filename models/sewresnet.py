@@ -123,7 +123,7 @@ def zero_init_blocks(net, connect_f):
 class SEWResNet(nn.Module):
     def __init__(self, block, layers, in_channels,neuron_type="lif",num_classes=1000, zero_init_residual=False,
                  groups=1, width_per_group=64, replace_stride_with_dilation=None,
-                 norm_layer=None, T=4, connect_f=None):
+                 norm_layer=None, T=4, connect_f="ADD"):
         super().__init__()
         self.T = T
         self.connect_f = connect_f
@@ -224,3 +224,115 @@ def sew_resnet101(**kwargs):
 
 def sew_resnet152(**kwargs):
     return SEWResNet(Bottleneck, [3, 8, 36, 3], **kwargs)
+
+
+# ============================================================================
+# CIFAR-specific SEW-ResNet (depths 20/32/44/56/110)
+# ============================================================================
+
+class SEWResNetCifar(nn.Module):
+    """CIFAR-specific SEW-ResNet.
+
+    Architecture: 3x3 stem (stride=1) → 3 stages [16, 32, 64]
+    with strides [1, 2, 2]. Total depth = 6*n + 2.
+
+    Uses the same BasicBlock + element-wise residual as ImageNet SEW-ResNet,
+    but adapted for 32x32 inputs (no 7x7 stem, no MaxPool).
+    """
+
+    def __init__(self, n, in_channels=3, num_classes=100, neuron_type="if",
+                 T=4, connect_f="ADD", zero_init_residual=False, **kwargs):
+        super().__init__()
+        self.T = T
+        self.connect_f = connect_f
+        self.neuron_type = neuron_type
+        self.inplanes = 16
+
+        # Stem: single 3x3 conv, stride=1
+        self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.sn1 = MultiStepIFNeuron(detach_reset=True) if neuron_type == "if" \
+            else MultiStepLIFNeuron(detach_reset=True)
+
+        self.layer1 = self._make_layer(16, n, stride=1)   # 32x32
+        self.layer2 = self._make_layer(32, n, stride=2)   # 16x16
+        self.layer3 = self._make_layer(64, n, stride=2)   # 8x8
+
+        self.avgpool = SeqToANNContainer(nn.AdaptiveAvgPool2d((1, 1)))
+        self.fc = nn.Linear(64, num_classes)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+        if zero_init_residual:
+            zero_init_blocks(self, connect_f)
+
+    def _make_layer(self, planes, num_blocks, stride):
+        norm_layer = nn.BatchNorm2d
+        downsample = None
+        if stride != 1 or self.inplanes != planes:
+            downsample = nn.Sequential(
+                SeqToANNContainer(
+                    conv1x1(self.inplanes, planes, stride),
+                    norm_layer(planes),
+                ),
+                MultiStepIFNeuron(detach_reset=True) if self.neuron_type == "if"
+                else MultiStepLIFNeuron(detach_reset=True)
+            )
+        layers = []
+        layers.append(BasicBlock(self.inplanes, planes, self.neuron_type,
+                                 stride=stride, downsample=downsample,
+                                 norm_layer=norm_layer, connect_f=self.connect_f))
+        self.inplanes = planes
+        for _ in range(1, num_blocks):
+            layers.append(BasicBlock(self.inplanes, planes, self.neuron_type,
+                                     norm_layer=norm_layer, connect_f=self.connect_f))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        # Static image: (B, C, H, W) → repeat T times
+        if x.dim() == 4:
+            x = self.conv1(x)
+            x = self.bn1(x)
+            x = x.unsqueeze(0).repeat(self.T, 1, 1, 1, 1)
+        elif x.dim() == 5:
+            # DVS: (T, B, C, H, W) or (B, T, C, H, W)
+            if x.shape[0] != self.T and x.shape[1] == self.T:
+                x = x.transpose(0, 1).contiguous()
+            T, B = x.shape[:2]
+            x = self.conv1(x.flatten(0, 1))
+            x = self.bn1(x)
+            x = x.view(T, B, *x.shape[1:])
+
+        x = self.sn1(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 2)
+        return self.fc(x.mean(dim=0))
+
+
+def sew_resnet_cifar20(**kwargs):
+    """CIFAR SEW-ResNet-20 (depth=20, n=3)."""
+    return SEWResNetCifar(n=3, **kwargs)
+
+def sew_resnet_cifar32(**kwargs):
+    """CIFAR SEW-ResNet-32 (depth=32, n=5)."""
+    return SEWResNetCifar(n=5, **kwargs)
+
+def sew_resnet_cifar44(**kwargs):
+    """CIFAR SEW-ResNet-44 (depth=44, n=7)."""
+    return SEWResNetCifar(n=7, **kwargs)
+
+def sew_resnet_cifar56(**kwargs):
+    """CIFAR SEW-ResNet-56 (depth=56, n=9)."""
+    return SEWResNetCifar(n=9, **kwargs)
+
+def sew_resnet_cifar110(**kwargs):
+    """CIFAR SEW-ResNet-110 (depth=110, n=18)."""
+    return SEWResNetCifar(n=18, **kwargs)

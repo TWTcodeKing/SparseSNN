@@ -50,7 +50,7 @@ def cutmix_data(x, y, alpha=1.0):
     batch_size = x.size(0)
     index = torch.randperm(batch_size, device=x.device)
 
-    _, _, H, W = x.shape
+    H, W = x.shape[-2], x.shape[-1]
     cut_ratio = np.sqrt(1.0 - lam)
     cut_h = int(H * cut_ratio)
     cut_w = int(W * cut_ratio)
@@ -65,7 +65,7 @@ def cutmix_data(x, y, alpha=1.0):
     x2 = np.clip(cx + cut_w // 2, 0, W)
 
     mixed_x = x.clone()
-    mixed_x[:, :, y1:y2, x1:x2] = x[index, :, y1:y2, x1:x2]
+    mixed_x[..., y1:y2, x1:x2] = x[index][..., y1:y2, x1:x2]
 
     # Adjust lambda to the actual area ratio
     lam = 1 - ((y2 - y1) * (x2 - x1)) / (H * W)

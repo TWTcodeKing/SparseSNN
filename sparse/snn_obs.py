@@ -411,7 +411,7 @@ if __name__ == '__main__':
     ckpt = torch.load(args.dense_checkpoint, map_location='cpu', weights_only=False)
     model.load_state_dict(ckpt.get('model', ckpt))
 
-    train_loader, val_loader = build_dataloaders(
+    train_loader, train_loader = build_dataloaders(
         args.dataset, args.data_root, args.batch_size,
         img_size=ds_cfg['img_size'], num_workers=4)
 

@@ -60,7 +60,7 @@ def parse_args():
                         help='Add extra connection from block input to block output (ResNets only)')
     # ---- Dataset ----
     parser.add_argument('--dataset', type=str, default='cifar10',
-                        choices=['cifar10', 'cifar100', 'imagenet', 'cifar10dvs'],
+                        choices=['cifar10', 'cifar100', 'imagenet', 'cifar10dvs','dvs128gesture'],
                         help='Dataset name')
     parser.add_argument('--data-root', type=str, required=True,
                         help='Path to dataset root directory')
@@ -308,6 +308,7 @@ def evaluate(model, loader, criterion, device, world_size):
         targets = targets.to(device, non_blocking=True)
 
         output = model(images)
+        
         loss = criterion(output, targets)
         reset_net(model)
 

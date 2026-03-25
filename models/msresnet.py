@@ -439,6 +439,9 @@ class MSResNetCifar(nn.Module):
         if x.dim() == 4:
             T = self.time_window
             x = x.unsqueeze(0).repeat(T, 1, 1, 1, 1)
+        else:
+            x = x.permute(1, 0, 2, 3, 4)  # (B,C,H,W) → (T,B,C,H,W) with T=1
+        # only 4 dim static images or 5 dim dvs images
         output = self.conv1(x)
         output = self.layer1(output)
         output = self.layer2(output)

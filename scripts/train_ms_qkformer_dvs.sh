@@ -1,47 +1,47 @@
 #!/bin/bash
-# Train MS-ResNet on DVS datasets (multi-GPU supported)
+# Train MaxFormer on DVS datasets (from scratch, multi-GPU)
 #
 # Usage:
-#   bash scripts/train_msresnet_dvs.sh [dataset] [gpus]
+#   bash scripts/train_maxformer_dvs.sh [dataset] [gpus]
 #
 # Examples:
-#   bash scripts/train_msresnet_dvs.sh cifar10dvs 0,1        # 2 GPUs
-#   bash scripts/train_msresnet_dvs.sh cifar10dvs 0           # single GPU
+#   bash scripts/train_maxformer_dvs.sh cifar10dvs 0,1         # 2 GPUs
+#   bash scripts/train_maxformer_dvs.sh dvs128gesture 0,1,2,3  # 4 GPUs
+#   bash scripts/train_maxformer_dvs.sh cifar10dvs 0            # single GPU
 #
-# Model: ms_resnet_dvs20 (ResNet-20, stem_stride=2, 0.27M params)
-# Paper: 75.56% on CIFAR10-DVS, T=20, 1024 epochs
+# Trained from scratch. Reported: CIFAR10-DVS 84.2%, DVS Gesture 98.6%
 
 DATASET=${1:-cifar10dvs}
 GPUS=${2:-0,1}
 
 if [ "$DATASET" = "cifar10dvs" ]; then
     DATA_ROOT="/home/twt/datasets/cifar10-dvs"
-    RECIPE="configs/ms_resnet/recipes/cifar10dvs.yaml"
+    RECIPE="configs/maxformer/recipes/cifar10dvs.yaml"
 elif [ "$DATASET" = "dvs128gesture" ]; then
     DATA_ROOT="/home/twt/datasets/dvs128gesture"
-    RECIPE="configs/ms_resnet/recipes/dvs128gesture.yaml"
+    RECIPE="configs/maxformer/recipes/dvs128gesture.yaml"
 else
-    echo "Unknown dataset: $DATASET (paper only evaluates on cifar10dvs)"
+    echo "Unknown dataset: $DATASET (use cifar10dvs or dvs128gesture)"
     exit 1
 fi
 
 NPROC=$(echo $GPUS | tr ',' '\n' | wc -l)
 
 echo "=========================================="
-echo "Training ms_resnet_dvs20 on ${DATASET} (GPUs: ${GPUS}, nproc=${NPROC})"
+echo "Training MaxFormer-DVS on ${DATASET} (GPUs: ${GPUS}, nproc=${NPROC})"
 echo "=========================================="
 
 if [ "$NPROC" -gt 1 ]; then
     CUDA_VISIBLE_DEVICES=${GPUS} torchrun --nproc_per_node=${NPROC} \
         tengine/train.py \
-        --model ms_resnet_dvs20 \
+        --config configs/maxformer/ms_qkformer_dvs.yaml \
         --recipe ${RECIPE} \
         --dataset ${DATASET} \
         --data-root ${DATA_ROOT} \
         --gpu-ids ${GPUS}
 else
     uv run tengine/train.py \
-        --model ms_resnet_dvs20 \
+        --config configs/maxformer/ms_qkformer_dvs.yaml \
         --recipe ${RECIPE} \
         --dataset ${DATASET} \
         --data-root ${DATA_ROOT} \

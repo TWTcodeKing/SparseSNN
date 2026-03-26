@@ -343,6 +343,120 @@ class SpikeDrivenTransformerV2(nn.Module):
         return x
 
 
+class SpikeDrivenTransformerV2Cifar(nn.Module):
+    """Meta Spiking Architecture adapted for CIFAR (32x32).
+
+    Reduces downsampling to preserve spatial resolution for attention:
+    32→32(stage1.1)→16(stage1.2)→8(stage2)→8(stage3)→8(stage4)
+    = 64 tokens at transformer stages (vs 4 tokens in ImageNet variant).
+    """
+
+    def __init__(self, in_channels=3, num_classes=100,
+                 embed_dim=[64, 128, 256, 512], num_heads=8, mlp_ratios=4,
+                 qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
+                 drop_path_rate=0., norm_layer=nn.LayerNorm,
+                 depths=8, sr_ratios=1, T=4):
+        super().__init__()
+        self.num_classes = num_classes
+        self.depths = depths
+        self.T = T
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depths)]
+
+        # Stage 1: ConvBlocks — stride=1 then stride=2 (32→32→16)
+        self.downsample1_1 = MS_DownSampling(
+            in_channels=in_channels, embed_dims=embed_dim[0] // 2,
+            kernel_size=3, stride=1, padding=1, first_layer=True
+        )
+        self.ConvBlock1_1 = nn.ModuleList([MS_ConvBlock(dim=embed_dim[0] // 2, mlp_ratio=mlp_ratios)])
+
+        self.downsample1_2 = MS_DownSampling(
+            in_channels=embed_dim[0] // 2, embed_dims=embed_dim[0],
+            kernel_size=3, stride=2, padding=1, first_layer=False
+        )
+        self.ConvBlock1_2 = nn.ModuleList([MS_ConvBlock(dim=embed_dim[0], mlp_ratio=mlp_ratios)])
+
+        # Stage 2: ConvBlocks — stride=2 (16→8)
+        self.downsample2 = MS_DownSampling(
+            in_channels=embed_dim[0], embed_dims=embed_dim[1],
+            kernel_size=3, stride=2, padding=1, first_layer=False
+        )
+        self.ConvBlock2_1 = nn.ModuleList([MS_ConvBlock(dim=embed_dim[1], mlp_ratio=mlp_ratios)])
+        self.ConvBlock2_2 = nn.ModuleList([MS_ConvBlock(dim=embed_dim[1], mlp_ratio=mlp_ratios)])
+
+        # Stage 3: Transformer blocks — stride=1 (keep 8x8 = 64 tokens)
+        self.downsample3 = MS_DownSampling(
+            in_channels=embed_dim[1], embed_dims=embed_dim[2],
+            kernel_size=3, stride=1, padding=1, first_layer=False
+        )
+        self.block3 = nn.ModuleList([
+            MS_Block(
+                dim=embed_dim[2], num_heads=num_heads, mlp_ratio=mlp_ratios,
+                qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[j],
+                norm_layer=norm_layer, sr_ratio=sr_ratios
+            ) for j in range(6)
+        ])
+
+        # Stage 4: Transformer blocks — stride=1 (keep 8x8)
+        self.downsample4 = MS_DownSampling(
+            in_channels=embed_dim[2], embed_dims=embed_dim[3],
+            kernel_size=3, stride=1, padding=1, first_layer=False
+        )
+        self.block4 = nn.ModuleList([
+            MS_Block(
+                dim=embed_dim[3], num_heads=num_heads, mlp_ratio=mlp_ratios,
+                qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[j],
+                norm_layer=norm_layer, sr_ratio=sr_ratios
+            ) for j in range(2)
+        ])
+
+        self.lif = MultiStepLIFNeuron(tau=2.0, detach_reset=True)
+        self.head = nn.Linear(embed_dim[3], num_classes) if num_classes > 0 else nn.Identity()
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            _trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward_features(self, x):
+        x = self.downsample1_1(x)
+        for blk in self.ConvBlock1_1:
+            x = blk(x)
+        x = self.downsample1_2(x)
+        for blk in self.ConvBlock1_2:
+            x = blk(x)
+
+        x = self.downsample2(x)
+        for blk in self.ConvBlock2_1:
+            x = blk(x)
+        for blk in self.ConvBlock2_2:
+            x = blk(x)
+
+        x = self.downsample3(x)
+        for blk in self.block3:
+            x = blk(x)
+
+        x = self.downsample4(x)
+        for blk in self.block4:
+            x = blk(x)
+        return x
+
+    def forward(self, x):
+        x = (x.unsqueeze(0)).repeat(self.T, 1, 1, 1, 1)
+        x = self.forward_features(x)
+        x = x.flatten(3).mean(3)
+        x_lif = self.lif(x)
+        x = self.head(x_lif).mean(0)
+        return x
+
+
 def build_metaformer(config):
     """Build a Spike-Driven Transformer V2 (Meta Spikformer) from a config dict.
 
@@ -353,8 +467,8 @@ def build_metaformer(config):
         num_classes, T, img_size, in_channels
     """
     img_size = config.get('img_size', 224)
-    return SpikeDrivenTransformerV2(
-        img_size_h=img_size, img_size_w=img_size,
+    variant = config.get('variant', 'imagenet')
+    common = dict(
         embed_dim=config['embed_dim'],
         num_heads=config['num_heads'],
         mlp_ratios=config.get('mlp_ratios', 4),
@@ -369,4 +483,9 @@ def build_metaformer(config):
         drop_rate=config.get('drop_rate', 0.0),
         attn_drop_rate=config.get('attn_drop_rate', 0.0),
         drop_path_rate=config.get('drop_path_rate', 0.0),
+    )
+    if variant == 'cifar':
+        return SpikeDrivenTransformerV2Cifar(**common)
+    return SpikeDrivenTransformerV2(
+        img_size_h=img_size, img_size_w=img_size, **common
     )

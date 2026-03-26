@@ -19,9 +19,12 @@ augmentation:
   auto_aug: false
   mixup_alpha: 0.5
   cutmix_alpha: 0.1
+  snn_aug: true
+  mixup_off_epoch: 75
 
 regularization:
   label_smoothing: 0.1
 
 snn:
   T: 16
+  amp: true

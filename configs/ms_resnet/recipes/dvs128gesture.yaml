@@ -1,0 +1,28 @@
+# MS-ResNet recipe for CIFAR10-DVS
+# Paper follows PLIF preprocessing (ref [45]):
+#   T=20, frames split by number, lr=1e-3, cosine T_max=64, 1024 epochs, bs=16
+# Neuron params: decay=0.25, thresh=0.5 (hardcoded in MSNeuron)
+optimizer:
+  type: sgd
+  lr: 1e-3
+  weight_decay: 0.0
+  momentum: 0.9
+
+scheduler:
+  type: cosine
+  warmup_epochs: 0
+  min_lr: 0.0
+
+epochs: 150
+batch_size: 16
+
+augmentation:
+  auto_aug: false
+  mixup_alpha: 0.0
+  cutmix_alpha: 0.0
+
+regularization:
+  label_smoothing: 0.0
+
+snn:
+  T: 16

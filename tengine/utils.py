@@ -129,7 +129,8 @@ def load_training_recipe(recipe_path):
 
     # Augmentation
     aug = recipe.get('augmentation', {})
-    for key in ('auto_aug', 'cutout', 'mixup_alpha', 'cutmix_alpha', 'random_erasing'):
+    for key in ('auto_aug', 'cutout', 'mixup_alpha', 'cutmix_alpha', 'random_erasing',
+                'snn_aug', 'mixup_off_epoch'):
         if key in aug:
             flat[key] = aug[key]
 
@@ -146,6 +147,8 @@ def load_training_recipe(recipe_path):
         flat['T'] = snn['T']
     if 'learnable_params' in snn:
         flat['learnable_params'] = bool(snn['learnable_params'])
+    if 'amp' in snn:
+        flat['amp'] = bool(snn['amp'])
 
     # Structured sparse (SR-STE 2:4)
     ss = recipe.get('structured_sparsity', recipe.get('structured_sparse', {}))

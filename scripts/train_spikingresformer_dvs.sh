@@ -1,20 +1,18 @@
 #!/bin/bash
-# Transfer-learn SpikingResformer on DVS datasets
+# Transfer-learn SpikingResformer on DVS datasets (multi-GPU supported)
 #
 # Usage:
-#   bash scripts/train_spikingresformer_dvs.sh [dataset] [variant] [gpu]
+#   bash scripts/train_spikingresformer_dvs.sh [dataset] [variant] [gpus]
 #
 # Examples:
-#   bash scripts/train_spikingresformer_dvs.sh cifar10dvs ti 0
-#   bash scripts/train_spikingresformer_dvs.sh dvs128gesture s 1
+#   bash scripts/train_spikingresformer_dvs.sh cifar10dvs ti 0,1     # 2 GPUs
+#   bash scripts/train_spikingresformer_dvs.sh dvs128gesture s 0     # single GPU
 #
-# Paper: finetune ImageNet pretrained model, T=10, img_size=128,
-#        same settings as CIFAR-100 transfer + neuromorphic data augmentation
-# Note: transfer.py is single-GPU. For multi-GPU, adapt to train.py with DDP.
+# Paper: finetune ImageNet pretrained model, T=10, img_size=128
 
 DATASET=${1:-cifar10dvs}
 VARIANT=${2:-ti}
-GPU=${3:-0}
+GPUS=${3:-0,1}
 
 if [ "$DATASET" = "cifar10dvs" ]; then
     DATA_ROOT="/home/twt/datasets/cifar10-dvs"
@@ -28,14 +26,27 @@ else
 fi
 
 CKPT="checkpoints/spikingresformer/ImageNet_spikingresformer_${VARIANT}.pth"
+NPROC=$(echo $GPUS | tr ',' '\n' | wc -l)
 
 echo "=========================================="
-echo "Transfer SpikingResformer-${VARIANT} → ${DATASET} (GPU ${GPU})"
+echo "Transfer SpikingResformer-${VARIANT} → ${DATASET} (GPUs: ${GPUS}, nproc=${NPROC})"
 echo "=========================================="
-uv run tengine/transfer.py \
-    --config configs/spikingresformer/spikingresformer_${VARIANT}.yaml \
-    --pretrained ${CKPT} \
-    --recipe ${RECIPE} \
-    --dataset ${DATASET} \
-    --data-root ${DATA_ROOT} \
-    --gpu-ids ${GPU}
+
+if [ "$NPROC" -gt 1 ]; then
+    CUDA_VISIBLE_DEVICES=${GPUS} torchrun --nproc_per_node=${NPROC} \
+        tengine/transfer.py \
+        --config configs/spikingresformer/spikingresformer_${VARIANT}.yaml \
+        --pretrained ${CKPT} \
+        --recipe ${RECIPE} \
+        --dataset ${DATASET} \
+        --data-root ${DATA_ROOT} \
+        --gpu-ids ${GPUS}
+else
+    uv run tengine/transfer.py \
+        --config configs/spikingresformer/spikingresformer_${VARIANT}.yaml \
+        --pretrained ${CKPT} \
+        --recipe ${RECIPE} \
+        --dataset ${DATASET} \
+        --data-root ${DATA_ROOT} \
+        --gpu-ids ${GPUS}
+fi

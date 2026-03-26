@@ -40,7 +40,10 @@ from tengine.utils import (
     load_training_recipe,
     build_dataloaders, get_dataset_config, list_models,
 )
-from datasets.augmentation import mixup_data, cutmix_data, mixup_criterion
+from datasets.augmentation import (
+    mixup_data, cutmix_data, mixup_criterion,
+    SNNAugmentWide, snn_aug_batch,
+)
 
 
 def parse_args():
@@ -104,6 +107,10 @@ def parse_args():
                         help='Use Cutout (RandomErasing)')
     parser.add_argument('--random-erasing', type=float, default=0.0,
                         help='Random erasing probability')
+    parser.add_argument('--snn-aug', action='store_true', default=False,
+                        help='Use SNNAugmentWide for DVS data (geometric + cutout)')
+    parser.add_argument('--mixup-off-epoch', type=int, default=0,
+                        help='Disable mixup/cutmix after this epoch (0 = never disable)')
 
     # ---- AMP ----
     parser.add_argument('--amp', action='store_true', default=False,
@@ -203,13 +210,14 @@ def build_scheduler(optimizer, args):
 
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
                     epoch, tlog, world_size, mixup_alpha=0.0, cutmix_alpha=0.0,
-                    structured_sparse=False, sr_lambda=0.0):
+                    structured_sparse=False, sr_lambda=0.0, snn_aug_fn=None):
     """Train one epoch.
 
     Args:
         structured_sparse: If True, adds SR-STE 2:4 regularization to task loss.
         sr_lambda: Current regularization coefficient (computed by caller from
             ProgressiveSparsityScheduler). Only used when structured_sparse=True.
+        snn_aug_fn: SNNAugmentWide instance for DVS data augmentation (or None).
     """
     model.train()
     losses = AverageMeter('Loss')
@@ -227,6 +235,10 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
     for step, (images, targets) in enumerate(loader):
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
+
+        # DVS augmentation: per-sample HFlip + SNNAugmentWide on (B, T, C, H, W)
+        if snn_aug_fn is not None and images.dim() == 5:
+            images = snn_aug_batch(images, hflip=True, snn_aug=snn_aug_fn)
 
         # MixUp / CutMix
         mix_active = False
@@ -471,6 +483,9 @@ def main():
         if is_main_process():
             logger.info(f"SR-STE enabled: {sr_scheduler}")
 
+    # ---- DVS augmentation ----
+    snn_aug_fn = SNNAugmentWide() if args.snn_aug else None
+
     # ---- Training loop ----
     t0 = time.time()
 
@@ -486,12 +501,20 @@ def main():
         if sr_scheduler is not None:
             current_sr_lambda = sr_scheduler.get_lambda(epoch)
 
+        # Disable mixup/cutmix after specified epoch
+        epoch_mixup = args.mixup_alpha
+        epoch_cutmix = args.cutmix_alpha
+        if args.mixup_off_epoch > 0 and epoch >= args.mixup_off_epoch:
+            epoch_mixup = 0.0
+            epoch_cutmix = 0.0
+
         train_m = train_one_epoch(model, train_loader, criterion, optimizer,
                                   scaler, device, epoch, tlog, world_size,
-                                  mixup_alpha=args.mixup_alpha,
-                                  cutmix_alpha=args.cutmix_alpha,
+                                  mixup_alpha=epoch_mixup,
+                                  cutmix_alpha=epoch_cutmix,
                                   structured_sparse=structured_sparse,
-                                  sr_lambda=current_sr_lambda)
+                                  sr_lambda=current_sr_lambda,
+                                  snn_aug_fn=snn_aug_fn)
         val_m = evaluate(model, val_loader, criterion, device, world_size)
 
         scheduler.step()

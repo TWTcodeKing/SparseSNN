@@ -212,8 +212,8 @@ def _benchmark_latency(model, loader, device, n_warmup=10, n_measure=50,
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
 
-    per_sample_ms = (elapsed / n_measure / images.size(0)) * 1000
-    return per_sample_ms
+    per_batch_ms = (elapsed / n_measure) * 1000
+    return per_batch_ms
 
 
 def benchmark_structured_sparse(
@@ -262,8 +262,8 @@ def benchmark_structured_sparse(
                           max_samples, input_dtype=torch.float16)
     dense_latency = _benchmark_latency(model_dense_fp16, test_loader, device,
                                        input_dtype=torch.float16)
-    results['dense'] = {**dense_acc, 'latency_ms': dense_latency}
-    print(f"  Acc@1: {dense_acc['acc1']:.2f}%  |  Latency: {dense_latency:.3f} ms/sample")
+    results['dense'] = {**dense_acc, 'latency_ms_per_batch': dense_latency}
+    print(f"  Acc@1: {dense_acc['acc1']:.2f}%  |  Latency: {dense_latency:.3f} ms/batch")
     del model_dense_fp16
 
     # ---- Build sparse fp16 model ----
@@ -296,8 +296,8 @@ def benchmark_structured_sparse(
                            max_samples, input_dtype=torch.float16)
     sparse_latency = _benchmark_latency(model_sparse, test_loader, device,
                                         input_dtype=torch.float16)
-    results['sparse'] = {**sparse_acc, 'latency_ms': sparse_latency}
-    print(f"  Acc@1: {sparse_acc['acc1']:.2f}%  |  Latency: {sparse_latency:.3f} ms/sample")
+    results['sparse'] = {**sparse_acc, 'latency_ms_per_batch': sparse_latency}
+    print(f"  Acc@1: {sparse_acc['acc1']:.2f}%  |  Latency: {sparse_latency:.3f} ms/batch")
 
     del model_sparse
 
@@ -314,8 +314,8 @@ def benchmark_structured_sparse(
     print(f"\n{'='*60}")
     print(f"  Summary (fp16{compile_tag}{neuron_tag})")
     print(f"{'='*60}")
-    print(f"  Dense fp16:      {dense_latency:.3f} ms/sample  Acc: {dense_acc['acc1']:.2f}%")
-    print(f"  Sparse fp16:     {sparse_latency:.3f} ms/sample  Acc: {sparse_acc['acc1']:.2f}%")
+    print(f"  Dense fp16:      {dense_latency:.3f} ms/batch  Acc: {dense_acc['acc1']:.2f}%")
+    print(f"  Sparse fp16:     {sparse_latency:.3f} ms/batch  Acc: {sparse_acc['acc1']:.2f}%")
     print(f"  Speedup:       {speedup:.2f}x")
     print(f"  Accuracy drop: {acc_drop:+.2f}%")
     print(f"{'='*60}")
@@ -353,6 +353,10 @@ def parse_args():
                         help='Disable torch.compile (eager mode)')
     parser.add_argument('--fuse-neurons', action='store_true', default=False,
                         help='Replace LIF/IF neurons with fused Triton kernels')
+    parser.add_argument('--img-size', type=int, default=None,
+                        help='Override image size (e.g. 128 for transfer models)')
+    parser.add_argument('--exclude-names', type=str, nargs='*', default=None,
+                        help='Additional module name prefixes to exclude from conversion')
     return parser.parse_args()
 
 
@@ -370,15 +374,17 @@ def main():
 
     # Build dataloader
     ds_config = get_dataset_config(args.dataset)
+    img_size = args.img_size or ds_config['img_size']
     _, test_loader = build_dataloaders(
         args.dataset, args.data_root, args.batch_size,
-        num_workers=4, distributed=False,
+        img_size=img_size, num_workers=4, distributed=False,
     )
 
     # Load model
     if args.config:
         config = load_model_config(args.config)
         config.update(ds_config)
+        config['img_size'] = img_size
         if args.T is not None:
             config['T'] = args.T
         elif 'T' not in config:

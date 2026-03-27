@@ -119,8 +119,12 @@ class SparseConv2d(nn.Module):
             self.bias = None
 
     def forward(self, x):
-        # x: (B, C_in, H, W)
+        # x: (B, C_in, H, W) or (T, B, C_in, H, W) for MultiStep wrappers
         orig_dtype = x.dtype
+        extra_dims = ()
+        if x.ndim == 5:
+            extra_dims = x.shape[:1]  # (T,)
+            x = x.flatten(0, 1)  # (T*B, C, H, W)
         B = x.shape[0]
         # im2col: (B, C_in*Kh*Kw, L) where L = H_out * W_out
         x_unf = F.unfold(

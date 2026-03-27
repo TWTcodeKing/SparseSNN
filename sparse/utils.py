@@ -186,15 +186,29 @@ def _get_upstream_entry(
 # ---------------------------------------------------------------------------
 
 def _get_neuron_types():
-    """Lazy import to avoid circular dependencies."""
+    """Lazy import to avoid circular dependencies.
+
+    Returns tuple of all spiking neuron types across architectures:
+      - models.neurons: MultiStepLIFNeuron, MultiStepIFNeuron, LIFNeuron, IFNeuron
+      - models.msresnet: MSNeuron (MS-ResNet CIFAR arch)
+    """
     from models.neurons import (
         MultiStepLIFNeuron, MultiStepIFNeuron, LIFNeuron, IFNeuron,
     )
-    return (MultiStepLIFNeuron, MultiStepIFNeuron, LIFNeuron, IFNeuron)
+    types = [MultiStepLIFNeuron, MultiStepIFNeuron, LIFNeuron, IFNeuron]
+    try:
+        from models.msresnet import MSNeuron
+        types.append(MSNeuron)
+    except ImportError:
+        pass
+    return tuple(types)
 
 
 def _get_inner_neuron(module):
-    """Get the inner LIFNeuron/IFNeuron from a MultiStep wrapper."""
+    """Get the inner LIFNeuron/IFNeuron from a MultiStep wrapper.
+
+    For MSNeuron, returns the module itself (no inner wrapper).
+    """
     from models.neurons import MultiStepLIFNeuron, MultiStepIFNeuron
     if isinstance(module, (MultiStepLIFNeuron, MultiStepIFNeuron)):
         return module.neuron
@@ -202,19 +216,31 @@ def _get_inner_neuron(module):
 
 
 def _get_vth(neuron) -> float:
-    """Get v_threshold as float."""
-    vth = neuron.v_threshold
+    """Get v_threshold/thresh as float (handles both LIF and MSNeuron)."""
+    if hasattr(neuron, 'v_threshold'):
+        vth = neuron.v_threshold
+    elif hasattr(neuron, 'thresh'):
+        vth = neuron.thresh
+    else:
+        raise AttributeError(f"No threshold attr on {type(neuron).__name__}")
     return vth.item() if isinstance(vth, torch.Tensor) else float(vth)
 
 
 def _set_vth(neuron, value: float):
-    """Set v_threshold."""
-    if isinstance(neuron.v_threshold, nn.Parameter):
-        neuron.v_threshold.data.fill_(value)
-    elif isinstance(neuron.v_threshold, torch.Tensor):
-        neuron.v_threshold.fill_(value)
+    """Set v_threshold/thresh (handles both LIF and MSNeuron)."""
+    if hasattr(neuron, 'v_threshold'):
+        attr = 'v_threshold'
+    elif hasattr(neuron, 'thresh'):
+        attr = 'thresh'
     else:
-        neuron.v_threshold = value
+        raise AttributeError(f"No threshold attr on {type(neuron).__name__}")
+    current = getattr(neuron, attr)
+    if isinstance(current, nn.Parameter):
+        current.data.fill_(value)
+    elif isinstance(current, torch.Tensor):
+        current.fill_(value)
+    else:
+        setattr(neuron, attr, value)
 
 
 def _get_tau(neuron) -> Optional[float]:
@@ -314,9 +340,19 @@ def collect_membrane_potentials(
 
         inner = _get_inner_neuron(module)
 
-        def make_hook(n, inner_neuron):
+        def make_hook(n, inner_neuron, mod_ref):
             def hook(mod, inp, out):
-                v = inner_neuron.v
+                # For standard LIF/IF: membrane potential stored in inner.v
+                # For MSNeuron: stateless, reconstruct from input (pre-threshold)
+                v = getattr(inner_neuron, 'v', None)
+                if v is None:
+                    # MSNeuron: input tensor IS the pre-threshold accumulation
+                    # Use last timestep's input as proxy for membrane potential
+                    x = inp[0]
+                    if x.ndim >= 3 and x.shape[0] <= 16:  # (T, B, ...) format
+                        v = x[-1]  # last timestep
+                    else:
+                        v = x
                 if isinstance(v, torch.Tensor):
                     if n not in potentials:
                         potentials[n] = []
@@ -328,7 +364,7 @@ def collect_membrane_potentials(
                     potentials[n].append(v_flat.cpu())
             return hook
 
-        hooks.append(module.register_forward_hook(make_hook(name, inner)))
+        hooks.append(module.register_forward_hook(make_hook(name, inner, module)))
 
     model.eval()
     with torch.no_grad():

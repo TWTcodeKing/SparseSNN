@@ -225,6 +225,9 @@ def collect_hessians(
             x = inp[0].detach().float()
 
             if isinstance(mod, nn.Conv2d):
+                # Handle 5D (T,B,C,H,W) from MultiStep wrappers
+                if x.ndim == 5:
+                    x = x.flatten(0, 1)  # (T*B, C, H, W)
                 x_unf = F.unfold(
                     x, mod.kernel_size,
                     dilation=mod.dilation, padding=mod.padding,

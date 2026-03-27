@@ -127,6 +127,9 @@ def collect_spike_aware_hessians(
             def hook(module, inp, out):
                 x = inp[0].detach().float()
                 if isinstance(m, nn.Conv2d):
+                    # Handle 5D (T,B,C,H,W) from MultiStep wrappers
+                    if x.ndim == 5:
+                        x = x.flatten(0, 1)  # (T*B, C, H, W)
                     x_unf = F.unfold(x, m.kernel_size, dilation=m.dilation,
                                      padding=m.padding, stride=m.stride)
                     x = x_unf.permute(1, 0, 2).reshape(x_unf.shape[1], -1)
@@ -151,7 +154,11 @@ def collect_spike_aware_hessians(
 
         def make_neuron_hook(l_names, inner_n, sig):
             def hook(module, inp, out):
-                v = inner_n.v
+                v = getattr(inner_n, 'v', None)
+                if v is None:
+                    # MSNeuron: stateless, use input as proxy
+                    x = inp[0]
+                    v = x[-1] if (x.ndim >= 3 and x.shape[0] <= 16) else x
                 vth = _get_vth(inner_n)
 
                 # Compute mean boundary weight for this batch
@@ -380,6 +387,10 @@ if __name__ == '__main__':
                         help='Gaussian width for boundary weighting')
     parser.add_argument('--alpha', type=float, default=0.15,
                         help='Threshold calibration strength')
+    parser.add_argument('--bn-batches', type=int, default=64,
+                        help='BN recalibration batches (0 to disable)')
+    parser.add_argument('--img-size', type=int, default=None,
+                        help='Override image size (e.g. 128 for transfer models)')
     parser.add_argument('--exclude', type=str, nargs='*', default=['head'])
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--evaluate', action='store_true')
@@ -395,11 +406,13 @@ if __name__ == '__main__':
     device = torch.device(f'cuda:{gpu_id}')
     torch.cuda.set_device(device)
     ds_cfg = get_dataset_config(args.dataset)
+    img_size = args.img_size or ds_cfg['img_size']
 
     if args.config:
         config = load_model_config(args.config)
         config.update(ds_cfg)
         config['T'] = args.T
+        config['img_size'] = img_size
         build_fn = lambda: build_model_from_config(config)
     elif args.model:
         build_fn = lambda: build_model(args.model, num_classes=ds_cfg['num_classes'],
@@ -411,9 +424,9 @@ if __name__ == '__main__':
     ckpt = torch.load(args.dense_checkpoint, map_location='cpu', weights_only=False)
     model.load_state_dict(ckpt.get('model', ckpt))
 
-    train_loader, train_loader = build_dataloaders(
+    train_loader, val_loader = build_dataloaders(
         args.dataset, args.data_root, args.batch_size,
-        img_size=ds_cfg['img_size'], num_workers=4)
+        img_size=img_size, num_workers=4)
 
     print(f"Dense checkpoint: {args.dense_checkpoint}")
     print(f"Scorer: {args.scorer}, σ={args.sigma}, α={args.alpha}")
@@ -439,7 +452,16 @@ if __name__ == '__main__':
         input_from_neuron=input_from_neuron,
     )
 
-    # Step 3: Threshold calibration
+    # Step 3: Co-calibration (BN → Threshold → BN)
+    from utils.fuse import recalibrate_bn
+
+    # Phase 1: BN recalibration (correct distribution shift from pruning)
+    if args.bn_batches > 0:
+        print(f"\n--- BN recalibration pass 1 ({args.bn_batches} batches) ---")
+        recalibrate_bn(model, train_loader, device, max_batches=args.bn_batches)
+        print("  Done")
+
+    # Phase 2: Threshold calibration (restore dense firing rates)
     if args.alpha > 0:
         print(f"\n--- Threshold calibration (α={args.alpha}) ---")
         dense_model = build_fn().to(device).eval()
@@ -466,6 +488,12 @@ if __name__ == '__main__':
             _set_vth(inner, old_vth + args.alpha * (target_vth - old_vth))
             n_calibrated += 1
         print(f"  Calibrated {n_calibrated} neurons")
+
+    # Phase 3: BN recalibration again (correct for threshold changes)
+    if args.bn_batches > 0 and args.alpha > 0:
+        print(f"\n--- BN recalibration pass 2 ({args.bn_batches} batches) ---")
+        recalibrate_bn(model, train_loader, device, max_batches=args.bn_batches)
+        print("  Done")
 
     # Save
     threshold_map = {}

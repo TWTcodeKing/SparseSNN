@@ -137,7 +137,7 @@ def recalibrate_bn(
 
     # Reset and enable stats update
     for mod in model.modules():
-        if isinstance(mod, (nn.BatchNorm2d, nn.BatchNorm1d)):
+        if isinstance(mod, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
             mod.reset_running_stats()
             mod.train()
             mod.momentum = momentum

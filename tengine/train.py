@@ -226,11 +226,12 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
     total_steps = len(loader)
     use_mix = mixup_alpha > 0 or cutmix_alpha > 0
 
-    # Import SR-STE helper only when needed (avoids import cost for normal runs)
+    # SR-STE training removed — use sparse.OBC / sparse.snn_obc for post-training sparsification
     if structured_sparse and sr_lambda > 0:
-        from sparse.st_train import sr_ste_regularizer
-    else:
-        sr_ste_regularizer = None
+        raise RuntimeError(
+            "SR-STE training (sparse.st_train) has been removed. "
+            "Use post-training sparsification via sparse.snn_obc instead.")
+    sr_ste_regularizer = None
 
     for step, (images, targets) in enumerate(loader):
         images = images.to(device, non_blocking=True)
@@ -470,18 +471,13 @@ def main():
         if is_main_process():
             logger.info(f"Resumed from epoch {start_epoch}, best_acc={best_acc:.2f}")
 
-    # ---- Structured sparse scheduler (SR-STE) ----
+    # ---- Structured sparse scheduler (SR-STE) — removed ----
     structured_sparse = getattr(args, 'structured_sparse', False)
     sr_scheduler = None
     if structured_sparse:
-        from sparse.st_train import ProgressiveSparsityScheduler
-        sr_scheduler = ProgressiveSparsityScheduler(
-            start_epoch=getattr(args, 'sr_start_epoch', 50),
-            end_epoch=getattr(args, 'sr_end_epoch', 150),
-            target_lambda=getattr(args, 'sr_lambda', 0.01),
-        )
-        if is_main_process():
-            logger.info(f"SR-STE enabled: {sr_scheduler}")
+        raise RuntimeError(
+            "SR-STE training (sparse.st_train) has been removed. "
+            "Use post-training sparsification via sparse.snn_obc instead.")
 
     # ---- DVS augmentation ----
     snn_aug_fn = SNNAugmentWide() if args.snn_aug else None
@@ -537,13 +533,11 @@ def main():
                 'args': vars(args),
             }, is_best, output_dir)
 
-    # ---- Apply hard 2:4 projection after training ----
+    # ---- Hard 2:4 projection (SR-STE) — removed ----
     if structured_sparse and is_main_process():
-        from sparse.st_train import apply_hard_n_m_projection
-        raw_model = model.module if distributed else model
-        proj_stats = apply_hard_n_m_projection(raw_model)
-        n_projected = sum(1 for v in proj_stats.values())
-        logger.info(f"Hard N:M projection applied to {n_projected} Linear layers")
+        raise RuntimeError(
+            "SR-STE hard projection (sparse.st_train) has been removed. "
+            "Use post-training sparsification via sparse.snn_obc instead.")
         # Save the sparse model
         sparse_path = os.path.join(output_dir, 'best_sparse.pth')
         torch.save({

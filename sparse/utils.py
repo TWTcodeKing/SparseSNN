@@ -1,19 +1,142 @@
 """Shared utilities for sparse/ submodules.
 
 Provides:
-  - Upstream-neuron lookup helpers (used by permutation.py, fr_prune.py, OBS)
+  - Module eligibility and weight reshaping helpers (moved from OBC/OBS)
+  - Upstream-neuron lookup helpers
   - Spiking neuron parameter accessors (_get_inner_neuron, _get_vth, _set_vth, etc.)
   - Calibration data collectors (collect_firing_rates, collect_membrane_potentials)
 
-This module must not import from permutation.py or fr_prune.py
+This module must not import from sbc.py or snn_sbc.py
 at module level to avoid circular imports.
 """
 
 import re
+from collections import OrderedDict
 from typing import Optional
 
 import torch
 import torch.nn as nn
+
+
+# ---------------------------------------------------------------------------
+# Module eligibility and weight reshaping (moved from OBC.py / OBS.py)
+# ---------------------------------------------------------------------------
+
+def _is_eligible(module: nn.Module) -> bool:
+    """Check if a module is eligible for pruning."""
+    if isinstance(module, nn.Linear):
+        return module.in_features >= 4
+    if isinstance(module, nn.Conv2d):
+        return module.groups == 1 and module.in_channels >= 1
+    return False
+
+
+def _get_weight_2d(module: nn.Module) -> tuple[torch.Tensor, Optional[tuple]]:
+    """Get 2D weight view for TensorRT-compatible 2:4 pruning.
+
+    TensorRT requires 2:4 sparsity along the C (input channel) dimension,
+    independently for each output channel K and spatial position (R, S):
+        for each (k, r, s): weights[k, c*4:(c+1)*4, r, s] has ≤ 2 non-zeros
+
+    So we reshape Conv2d [K, C, R, S] → (K*R*S, C) where each row is one
+    (k, r, s) combination, and the 2:4 pattern is along the C columns.
+
+    Linear [K, C] is already correct — pruning is along C.
+
+    Returns:
+        (W_2d, orig_shape) where orig_shape is Conv2d weight shape (None for Linear).
+    """
+    W = module.weight.data
+    if isinstance(module, nn.Conv2d):
+        orig_shape = W.shape  # (K, C, R, S)
+        K, C, R, S = orig_shape
+        # Reshape to (K*R*S, C): each row = one (k,r,s), columns = input channels
+        W_2d = W.permute(0, 2, 3, 1).reshape(K * R * S, C).contiguous()
+        return W_2d, orig_shape
+    return W, None
+
+
+def _write_weight_back(module: nn.Module, W_2d: torch.Tensor, orig_shape: Optional[tuple]):
+    """Write pruned 2D weight back to the module, reversing _get_weight_2d."""
+    if orig_shape is not None:
+        K, C, R, S = orig_shape
+        # (K*R*S, C) → (K, R, S, C) → (K, C, R, S)
+        W_back = W_2d.reshape(K, R, S, C).permute(0, 3, 1, 2).contiguous()
+    else:
+        W_back = W_2d
+    module.weight.data.copy_(W_back.to(module.weight.device))
+
+
+def _detect_neuron_fed_layers(
+    model: nn.Module,
+    eligible: OrderedDict,
+    neuron_types: tuple,
+) -> dict[str, bool]:
+    """Detect which eligible layers receive input from a spiking neuron.
+
+    Uses forward hooks to trace actual execution order. A Linear/Conv2d is
+    "neuron-fed" if ANY spiking neuron has fired before it in the forward
+    pass. Only the very first Linear/Conv2d layers (before any neuron has
+    executed) are considered "dense-input" — these receive raw images.
+
+    This correctly handles cross-container boundaries (e.g., LIF in
+    patch_embed feeds q_linear in block.0.attn).
+    """
+    # Track execution order via hooks
+    exec_order = []  # list of (name, is_neuron, is_eligible)
+    hooks = []
+    modules_dict = dict(model.named_modules())
+
+    for name, mod in model.named_modules():
+        is_neuron = isinstance(mod, neuron_types)
+        is_elig = name in eligible
+
+        if is_neuron or is_elig:
+            def make_hook(n, is_n, is_e):
+                def hook(module, inp, out):
+                    exec_order.append((n, is_n, is_e))
+                return hook
+            hooks.append(mod.register_forward_hook(make_hook(name, is_neuron, is_elig)))
+
+    # Single dummy forward pass to trace execution order
+    device = next(model.parameters()).device
+    # Infer input shape from first Conv2d or model config
+    first_conv = None
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            first_conv = m
+            break
+    in_ch = first_conv.in_channels if first_conv else 3
+    # Try common image sizes
+    from models.neurons import reset_net
+    with torch.no_grad():
+        try:
+            model(torch.randn(1, in_ch, 32, 32, device=device))
+        except Exception:
+            try:
+                model(torch.randn(1, in_ch, 224, 224, device=device))
+            except Exception:
+                pass
+        reset_net(model)
+
+    for h in hooks:
+        h.remove()
+
+    # Walk execution order: layers before any neuron fires are "dense-input"
+    result = {}
+    neuron_has_fired = False
+    for name, is_neuron, is_elig in exec_order:
+        if is_neuron:
+            neuron_has_fired = True
+        if is_elig:
+            result[name] = neuron_has_fired
+
+    # Any eligible layers not seen in exec_order → assume dense
+    for name in eligible:
+        if name not in result:
+            result[name] = False
+
+    return result
 
 
 def _find_neuron_for_layer(model: nn.Module, layer_name: str) -> Optional[str]:
@@ -244,12 +367,22 @@ def _set_vth(neuron, value: float):
 
 
 def _get_tau(neuron) -> Optional[float]:
-    """Get tau as float (None if IFNeuron)."""
+    """Get tau as float (None if IFNeuron).
+
+    Handles both standard LIF (has .tau) and MSNeuron (has .decay).
+    For MSNeuron, converts decay to equivalent tau: tau = 1/(1-decay).
+    """
     from models.neurons import IFNeuron
     if isinstance(neuron, IFNeuron):
         return None
-    tau = neuron.tau
-    return tau.item() if isinstance(tau, torch.Tensor) else float(tau)
+    if hasattr(neuron, 'tau'):
+        tau = neuron.tau
+        return tau.item() if isinstance(tau, torch.Tensor) else float(tau)
+    if hasattr(neuron, 'decay'):
+        decay = neuron.decay
+        d = decay.item() if isinstance(decay, torch.Tensor) else float(decay)
+        return 1.0 / max(1.0 - d, 1e-6)
+    return None
 
 
 def _set_tau(neuron, value: float):

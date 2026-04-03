@@ -40,7 +40,8 @@ if [ "$NPROC" -gt 1 ]; then
         --recipe ${RECIPE} \
         --dataset ${DATASET} \
         --data-root ${DATA_ROOT} \
-        --gpu-ids ${GPUS}
+        --gpu-ids ${GPUS} \
+        --batch-size 64
 else
     uv run tengine/transfer.py \
         --config configs/spikingresformer/spikingresformer_${VARIANT}.yaml \

@@ -23,4 +23,5 @@ uv run tengine/train.py \
     --recipe configs/metaformer/recipes/cifar100.yaml \
     --dataset cifar100 \
     --data-root ${DATA_ROOT} \
-    --gpu-ids ${GPU}
+    --gpu-ids ${GPU} \
+    --batch-size 32

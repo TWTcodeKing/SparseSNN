@@ -82,15 +82,12 @@ def evaluate(model, loader, criterion, device, logger, dvs=False):
         targets = targets.to(device, non_blocking=True)
 
         # DVS data: (B, T, C, H, W) → (T, B, C, H, W)
-        if dvs and images.dim() == 5:
-            images = images.permute(1, 0, 2, 3, 4)
-
         output = model(images)
         loss = criterion(output, targets)
         reset_net(model)
 
         acc1, acc5 = accuracy(output, targets, topk=(1, 5))
-        bs = images.size(0)
+        bs = targets.size(0)
 
         losses.update(loss.item(), bs)
         top1.update(acc1.item(), bs)

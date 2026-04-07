@@ -121,7 +121,7 @@ def zero_init_blocks(net, connect_f):
 
 
 class SEWResNet(nn.Module):
-    def __init__(self, block, layers, in_channels,neuron_type="lif",num_classes=1000, zero_init_residual=False,
+    def __init__(self, block, layers, in_channels,neuron_type="if",num_classes=1000, zero_init_residual=False,
                  groups=1, width_per_group=64, replace_stride_with_dilation=None,
                  norm_layer=None, T=4, connect_f="ADD"):
         super().__init__()

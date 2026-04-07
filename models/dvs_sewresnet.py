@@ -214,6 +214,7 @@ class DVSSEWResNet(nn.Module):
         Returns:
             logits: (B, num_classes) — mean over timesteps.
         """
+        x = x.transpose(0, 1).contiguous()  # (B, T, C, H, W) for nn.Sequential
         x = self.conv(x)  # (T, B, out_features)
         return self.out(x.mean(0))  # mean over T → (B, num_classes)
 

@@ -311,7 +311,7 @@ class MSResNet104(nn.Module):
             T = self.time_window
             input_seq = x.unsqueeze(0).repeat(T, 1, 1, 1, 1)
         else:
-            input_seq = x
+            input_seq = x.transpose(0, 1).contiguous()  # (B, T, C, H, W) for nn.Sequential
         output = self._stem_forward(input_seq)
         output = self.conv2_x(output)
         output = self.conv3_x(output)

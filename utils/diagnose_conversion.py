@@ -43,7 +43,10 @@ from sparse.utils import (
     _get_in_channels,
     _is_eligible_for_permutation,
 )
-from sparse.permutation import measure_permutation_quality
+try:
+    from sparse.permutation import measure_permutation_quality
+except ImportError:
+    measure_permutation_quality = None
 
 
 # ---------------------------------------------------------------------------

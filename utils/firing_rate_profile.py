@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 
 from utils.profiling import profile_model_firing_rates
-from sparse.permutation import compute_permutation_for_2_4
 
 
 def _find_upstream_linear(model: nn.Module, neuron_name: str) -> tuple:
@@ -109,11 +108,8 @@ if __name__ == '__main__':
     else:
         rates = profile_model_firing_rates(model, val_loader, device, args.max_batches)
 
-    permutations = {name: compute_permutation_for_2_4(rate) for name, rate in rates.items()}
-
     torch.save({
         'firing_rates': dict(rates),
-        'permutations': permutations,
         'config': {
             'dataset': args.dataset,
             'checkpoint': args.checkpoint,
@@ -121,4 +117,4 @@ if __name__ == '__main__':
             'T': args.T,
         },
     }, args.output)
-    print(f"\nSaved firing rates and permutations to {args.output}")
+    print(f"\nSaved firing rates to {args.output}")

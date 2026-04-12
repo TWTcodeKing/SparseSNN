@@ -21,7 +21,17 @@ import torch.nn as nn
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from models import reset_net
-from iengine.common.neuron_utils import maybe_fuse_neurons
+def maybe_fuse_neurons(model, fuse=True, verbose=True):
+    """Optionally replace neuron forwards with fused Triton kernels."""
+    if not fuse:
+        return 0
+    try:
+        from iengine.triton_sparse.neuron_kernel import replace_neuron_forward
+    except ImportError as e:
+        if verbose:
+            print(f"  [Triton neurons] Not available: {e}")
+        return 0
+    return replace_neuron_forward(model, verbose=verbose)
 from tengine.utils import (
     set_seed,
     build_model_from_config,

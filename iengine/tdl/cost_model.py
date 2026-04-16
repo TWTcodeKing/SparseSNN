@@ -100,6 +100,13 @@ class CostModel:
     - memory_us  = bytes  / (bandwidth_per_us)
 
     Accounts for L2 cache hit rates and calibration corrections.
+
+    Measured overrides
+    ------------------
+    After TileLang autotuning, call ``update_from_tilelang()`` to replace
+    analytical estimates with measured profiling latencies for fused
+    Conv+BN+Neuron groups.  The fused cost replaces the sum of the
+    individual Conv, BN, and Neuron costs.
     """
 
     def __init__(self, hw: HardwareSpec, dtype_bytes: int = 2,
@@ -113,8 +120,74 @@ class CostModel:
         self._mem_bw_per_us = hw.mem_bw_gb_s * 1e3        # bytes/us
         self._l2_bytes = hw.l2_cache_mb * 1024 * 1024
 
+        # Measured overrides: node_id -> latency_us
+        # When a node_id is in this dict, estimate_us returns the measured
+        # value instead of the analytical estimate.
+        self._measured: dict[int, float] = {}
+        # Nodes whose cost is absorbed into a fused group (BN, Neuron
+        # that are fused with Conv) — return 0.0 for these.
+        self._absorbed: set[int] = set()
+
+    def update_from_tilelang(
+        self,
+        fusion_groups: list[dict],
+        tuner_results: dict[str, "TuneResult"],
+    ) -> None:
+        """Replace analytical costs with measured TileLang profiling data.
+
+        For each ``conv_bn_neuron`` or ``linear_bn_neuron`` group that has
+        a tuning result, the conv/linear node gets the measured latency and
+        the BN + neuron nodes are marked as absorbed (cost = 0).
+
+        Parameters
+        ----------
+        fusion_groups : list[dict]
+            Fusion group descriptors from ``_build_fusion_groups()``.
+        tuner_results : dict[str, TuneResult]
+            Keyed by ``"fused_block_N"`` — the results from
+            ``TileLangKernelTuner``.
+        """
+        for gi, group in enumerate(fusion_groups):
+            key = f"fused_block_{gi}"
+            if key not in tuner_results:
+                continue
+
+            latency_ms = tuner_results[key].latency_ms
+            latency_us = latency_ms * 1000.0  # ms → us
+
+            gtype = group['type']
+
+            if gtype == 'conv_bn_neuron':
+                self._measured[group['conv']] = latency_us
+                self._absorbed.add(group['bn'])
+                self._absorbed.add(group['neuron'])
+
+            elif gtype == 'linear_bn_neuron':
+                self._measured[group['linear']] = latency_us
+                self._absorbed.add(group['bn'])
+                self._absorbed.add(group['neuron'])
+
+            elif gtype in ('conv_bn', 'linear_bn'):
+                node_key = 'conv' if 'conv' in group else 'linear'
+                self._measured[group[node_key]] = latency_us
+                self._absorbed.add(group['bn'])
+
     def estimate_us(self, node: OpNode) -> float:
-        """Estimate operator latency in microseconds."""
+        """Estimate operator latency in microseconds.
+
+        Returns measured latency if available (from ``update_from_tilelang``),
+        0.0 if absorbed into a fused group, or the analytical estimate.
+        """
+        nid = node.id if hasattr(node, 'id') else id(node)
+
+        # Check for measured override
+        if nid in self._measured:
+            return self._measured[nid]
+
+        # Check if absorbed into a fused group
+        if nid in self._absorbed:
+            return 0.0
+
         op = node.op_type
         if op == 'conv2d':
             return self._conv2d_us(node)

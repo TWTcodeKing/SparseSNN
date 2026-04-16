@@ -17,3 +17,5 @@ from iengine.tdl.transforms import TDLTransform, export_with_fused_neurons
 from iengine.tdl.analysis import collect_neuron_params, classify_modules
 from iengine.tdl.graph_ir import OpNode, Edge, OperatorDAG, extract_dag
 from iengine.tdl.cost_model import HardwareSpec, CostModel
+from iengine.tdl.temporal_unroll import TemporalNode, TemporalDAG, build_temporal_dag
+from iengine.tdl.slicegraph import SliceGraphDP, Partition

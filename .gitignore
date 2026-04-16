@@ -8,3 +8,6 @@ checkpoints/
 obs_pt/
 .venv/
 third_party/
+*.onnx
+*.engine
+*.pdf

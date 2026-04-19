@@ -13,11 +13,11 @@ Shared utilities in sparse.utils:
 Profiling utilities are in utils.profiling and re-exported here for convenience.
 """
 
-from utils.profiling import (
-    NeuronFiringRateProfiler,
-    ChannelFiringRateProfiler,
-    compute_effective_rates_conv,
-    compute_enhanced_rates_linear,
-    profile_neuron_firing_rates,
-    profile_model_firing_rates,
-)
+# from utils.profiling import (
+#     NeuronFiringRateProfiler,
+#     ChannelFiringRateProfiler,
+#     compute_effective_rates_conv,
+#     compute_enhanced_rates_linear,
+#     profile_neuron_firing_rates,
+#     profile_model_firing_rates,
+# )

@@ -490,6 +490,7 @@ if __name__ == '__main__':
     parser.add_argument('--bn-batches', type=int, default=64)
     parser.add_argument('--exclude', type=str, nargs='*',
                         default=['head', 'fc', 'classifier'])
+    parser.add_argument('--frames-number',type=int,default=16)
     parser.add_argument('--img-size', type=int, default=None)
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--evaluate', action='store_true')
@@ -521,11 +522,11 @@ if __name__ == '__main__':
 
     model = model.to(device).eval()
     ckpt = torch.load(args.dense_checkpoint, map_location='cpu', weights_only=False)
-    model.load_state_dict(ckpt.get('model', ckpt))
+    model.load_state_dict(ckpt.get('model', ckpt) if 'model' in ckpt else ckpt.get('state_dict',ckpt))
 
     train_loader, val_loader = build_dataloaders(
         args.dataset, args.data_root, args.batch_size,
-        img_size=img_size, num_workers=4)
+        img_size=img_size, num_workers=4, frames_number=args.frames_number)
 
     n_keep, m_group = args.nm
     pw_tag = " + pattern-weighted" if args.pattern_weight else ""

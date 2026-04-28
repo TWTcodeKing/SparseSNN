@@ -298,6 +298,79 @@ def _build_columnslast_perm(C: int, R: int, S: int, device) -> torch.Tensor:
     return torch.arange(C * R * S, device=device).reshape(C, R, S).permute(1, 2, 0).flatten()
 
 
+def _compute_channel_permutation(
+    W: torch.Tensor,
+    n: int = 2,
+    m: int = 4,
+) -> torch.Tensor:
+    """Compute channel permutation that balances importance across M-groups.
+
+    Sorts input channels by aggregate importance, then distributes them
+    so each M-group gets n "likely-keep" (high importance) and (m-n)
+    "likely-prune" (low importance) channels.
+
+    When H (im2col Hessian in columnslast layout) is provided, importance
+    is Hessian-weighted:
+        importance_c = ||W[:, c]||₂² × Σ_{r,s} H_{(r,s,c),(r,s,c)}
+    This accounts for both weight magnitude AND input activity/curvature.
+    Channels with high weight energy AND high Hessian diagonal (active,
+    hard-to-compensate) are most important to separate.
+
+    Args:
+        W: (K, C, R, S) Conv2d or (K, C) Linear weight tensor.
+        n: Non-zeros to keep per group.
+        m: Group size.
+        H: (D, D) Hessian in im2col columnslast layout (optional).
+
+    Returns:
+        (C,) permutation mapping new channel index → old channel index.
+    """
+    if W.ndim == 4:
+        importance = W.float().flatten(2).pow(2).sum(dim=(0, 2))  # (C,)
+    else:
+        importance = W.float().pow(2).sum(0)  # (C,)
+
+    C = importance.shape[0]
+    n_groups = C // m
+    n_prune = m - n
+
+    # Sort channels by importance (descending)
+    _, ranked = importance.sort(descending=True)
+    top_half = ranked[:n_groups * n]      # n*G channels: "keep candidates"
+    bot_half = ranked[n_groups * n:]      # (m-n)*G channels: "prune candidates"
+    bot_half = bot_half.flip(0)           # reverse so least important pairs with most important group
+
+    # Build balanced groups: group g gets top[g*n:(g+1)*n] + bot[g*n_prune:(g+1)*n_prune]
+    perm = torch.empty(n_groups * m, dtype=torch.long, device=W.device)
+    for g in range(n_groups):
+        perm[g * m : g * m + n] = top_half[g * n : (g + 1) * n]
+        perm[g * m + n : (g + 1) * m] = bot_half[g * n_prune : (g + 1) * n_prune]
+
+    # Handle remainder channels
+    if C > n_groups * m:
+        remainder = ranked[n_groups * m:]
+        perm = torch.cat([perm, remainder])
+
+    return perm
+
+
+def _build_columnslast_perm_with_channel_perm(
+    C: int, R: int, S: int,
+    chan_perm: torch.Tensor,
+    device,
+) -> torch.Tensor:
+    """Compose channel permutation with columnslast.
+
+    Standard columnslast maps (C, R, S) → (R, S, C) with C innermost.
+    The channel permutation π reorders the C dimension first, then
+    columnslast is applied. The result: M-groups of 4 consecutive
+    columns contain the channels selected by π, not the natural order.
+    """
+    idx = torch.arange(C * R * S, device=device).reshape(C, R, S)
+    idx_permuted = idx[chan_perm]               # permute C dimension
+    return idx_permuted.permute(1, 2, 0).flatten()  # then columnslast
+
+
 def sbc_nm_global_pipeline(
     model: nn.Module,
     dataloader,
@@ -312,6 +385,7 @@ def sbc_nm_global_pipeline(
     exclude_names: Optional[list] = None,
     skip_dense_input: bool = True,
     pattern_weight: bool = False,
+    permute_channels: bool = False,
 ) -> tuple[nn.Module, dict]:
     """ExactOBS-style SBC N:M pruning with im2col Hessian.
 
@@ -392,13 +466,24 @@ def sbc_nm_global_pipeline(
             K, C_in, kR, kS = W_raw.shape
             W_2d = W_raw.flatten(1)  # (K, C*R*S)
 
-            perm = _build_columnslast_perm(C_in, kR, kS, device=W_2d.device)
-            W_2d = W_2d[:, perm]  # (K, R*S*C) — C is innermost
+            if permute_channels and C_in >= m:
+                chan_perm = _compute_channel_permutation(W_raw, n, m)
+                perm = _build_columnslast_perm_with_channel_perm(
+                    C_in, kR, kS, chan_perm, device=W_2d.device)
+            else:
+                perm = _build_columnslast_perm(C_in, kR, kS, device=W_2d.device)
+            W_2d = W_2d[:, perm]  # (K, R*S*C) — C is innermost (permuted)
             H = H[perm][:, perm]   # permute Hessian accordingly
         else:
             # Linear: (out_features, in_features)
             W_2d = module.weight.data.clone().float()
-            perm = None
+            if permute_channels and W_2d.shape[1] >= m:
+                chan_perm = _compute_channel_permutation(module.weight.data, n, m)
+                W_2d = W_2d[:, chan_perm]
+                H = H[chan_perm][:, chan_perm]
+                perm = chan_perm  # for inverse permute at write-back
+            else:
+                perm = None
 
         W_2d = W_2d.to(H.device)
         W_orig = W_2d.clone()
@@ -432,6 +517,9 @@ def sbc_nm_global_pipeline(
             inv_perm = torch.argsort(perm)
             W_back = W_pruned[:, inv_perm]  # (K, C*R*S) original col order
             module.weight.data.copy_(W_back.reshape(K, C_in, kR, kS))
+        elif perm is not None:
+            inv_perm = torch.argsort(perm)
+            module.weight.data.copy_(W_pruned[:, inv_perm])
         else:
             module.weight.data.copy_(W_pruned)
 
@@ -467,6 +555,100 @@ def sbc_nm_global_pipeline(
 
 
 # ---------------------------------------------------------------------------
+# Sparse fine-tuning (mask-frozen, all weights trainable)
+# ---------------------------------------------------------------------------
+
+def finetune_sparse(
+    model_sparse: nn.Module,
+    model_dense: nn.Module,
+    dataloader,
+    device: torch.device,
+    T: int = 4,
+    epochs: int = 1,
+    lr: float = 1e-4,
+    temperature: float = 4.0,
+    alpha_kd: float = 0.9,
+) -> None:
+    """Fine-tune all weights with fixed sparse mask + KD from dense teacher.
+
+    After each optimizer step, re-applies the original zero mask so the
+    sparse pattern is preserved. BN running stats are updated normally.
+
+    Args:
+        model_sparse: Pruned model (modified in-place).
+        model_dense:  Dense teacher (frozen).
+        dataloader:   Training data.
+        device:       Compute device.
+        T:            SNN timesteps.
+        epochs:       Fine-tuning epochs.
+        lr:           Learning rate.
+        temperature:  KD temperature.
+        alpha_kd:     KD vs CE weight.
+    """
+    model_dense.eval()
+
+    # Capture sparse masks (True = zero/pruned, False = kept)
+    masks = {}
+    for name, mod in model_sparse.named_modules():
+        if isinstance(mod, (nn.Conv2d, nn.Linear)) and hasattr(mod, 'weight'):
+            masks[name] = (mod.weight.data == 0)
+
+    n_total = sum(p.numel() for p in model_sparse.parameters())
+    n_masked = sum(m.sum().item() for m in masks.values())
+    print(f"  Total params: {n_total}  |  Masked zeros: {int(n_masked)}  |  "
+          f"Trainable (non-zero): {n_total - int(n_masked)}")
+
+    model_sparse.train()
+    optimizer = torch.optim.SGD(model_sparse.parameters(), lr=lr, momentum=0.9)
+    ce_fn = nn.CrossEntropyLoss()
+    kl_fn = nn.KLDivLoss(reduction='batchmean')
+
+    for epoch in range(epochs):
+        total_loss = 0.0
+        correct = total = 0
+
+        for batch_idx, (images, targets) in enumerate(dataloader):
+            images, targets = images.to(device), targets.to(device)
+
+            with torch.no_grad():
+                logits_d = model_dense(images)
+                reset_net(model_dense)
+
+            logits_s = model_sparse(images)
+            reset_net(model_sparse)
+
+            soft_d = F.softmax(logits_d / temperature, dim=1)
+            log_soft_s = F.log_softmax(logits_s / temperature, dim=1)
+            loss = (alpha_kd * kl_fn(log_soft_s, soft_d) * temperature ** 2
+                    + (1 - alpha_kd) * ce_fn(logits_s, targets))
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # Re-apply sparse mask: zero out pruned positions
+            with torch.no_grad():
+                for name, mod in model_sparse.named_modules():
+                    if name in masks:
+                        mod.weight.data[masks[name]] = 0.0
+
+            total_loss += loss.item()
+            correct += logits_s.argmax(1).eq(targets).sum().item()
+            total += targets.size(0)
+
+            if (batch_idx + 1) % 100 == 0:
+                print(f"    [{epoch+1}/{epochs}] batch {batch_idx+1}  "
+                      f"loss={total_loss/(batch_idx+1):.4f}  "
+                      f"acc={100.*correct/total:.2f}%")
+
+        print(f"  Epoch {epoch+1}/{epochs}: "
+              f"loss={total_loss/(batch_idx+1):.4f}  "
+              f"train_acc={100.*correct/total:.2f}%")
+
+    model_sparse.eval()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -486,11 +668,16 @@ if __name__ == '__main__':
     parser.add_argument('--rel-damp', type=float, default=0.01)
     parser.add_argument('--pattern-weight', action='store_true',
                         help='Weight Hessian by spike pattern alignment with N:M')
+    parser.add_argument('--permute-channels', action='store_true',
+                        help='Reorder input channels to balance importance across '
+                             'M-groups before 2:4 pruning')
+    parser.add_argument('--finetune', type=int, default=0, metavar='EPOCHS',
+                        help='Sparse fine-tune all weights (mask frozen) with KD for N epochs')
     parser.add_argument('--calib-batches', type=int, default=128)
     parser.add_argument('--bn-batches', type=int, default=64)
     parser.add_argument('--exclude', type=str, nargs='*',
                         default=['head', 'fc', 'classifier'])
-    parser.add_argument('--frames-number',type=int,default=16)
+    parser.add_argument('--frames-number',type=int,default=None)
     parser.add_argument('--img-size', type=int, default=None)
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--evaluate', action='store_true')
@@ -522,11 +709,17 @@ if __name__ == '__main__':
 
     model = model.to(device).eval()
     ckpt = torch.load(args.dense_checkpoint, map_location='cpu', weights_only=False)
-    model.load_state_dict(ckpt.get('model', ckpt) if 'model' in ckpt else ckpt.get('state_dict',ckpt))
-
+    # model.load_state_dict(ckpt.get('model', ckpt) if 'model' in ckpt else ckpt.get('state_dict',ckpt))
+    for key in ('model', 'state_dict', 'net', 'model_state_dict'):
+        if isinstance(ckpt, dict) and key in ckpt and isinstance(ckpt[key], dict):
+            state_dict = ckpt[key]
+            break
+    model.load_state_dict(state_dict, strict=False)
+    dl_kwargs = dict(img_size=img_size, num_workers=4)
+    if args.frames_number is not None:
+        dl_kwargs['frames_number'] = args.frames_number
     train_loader, val_loader = build_dataloaders(
-        args.dataset, args.data_root, args.batch_size,
-        img_size=img_size, num_workers=4, frames_number=args.frames_number)
+        args.dataset, args.data_root, args.batch_size, **dl_kwargs)
 
     n_keep, m_group = args.nm
     pw_tag = " + pattern-weighted" if args.pattern_weight else ""
@@ -542,10 +735,27 @@ if __name__ == '__main__':
         bn_batches=args.bn_batches,
         exclude_names=args.exclude,
         pattern_weight=args.pattern_weight,
+        permute_channels=args.permute_channels,
     )
     method_tag = f'sbc_{n_keep}_{m_group}_global'
     if args.pattern_weight:
         method_tag += '_pw'
+    if args.permute_channels:
+        method_tag += '_perm'
+
+    # Sparse fine-tuning (if requested)
+    if args.finetune > 0:
+        import copy
+        print(f"\n--- Sparse fine-tuning ({args.finetune} epoch(s), KD, mask frozen) ---")
+        dense_teacher = copy.deepcopy(model)
+        dense_teacher.load_state_dict(state_dict, strict=False)
+        dense_teacher.to(device).eval()
+        finetune_sparse(
+            model, dense_teacher, train_loader, device,
+            T=args.T, epochs=args.finetune,
+        )
+        del dense_teacher
+        method_tag += f'_ft{args.finetune}'
 
     # Save
     import os

@@ -100,12 +100,12 @@ def build_engine(
     network = builder.create_network(network_flags)
     parser = trt.OnnxParser(network, logger)
 
-    # Parse ONNX
-    with open(onnx_path, 'rb') as f:
-        if not parser.parse(f.read()):
-            for i in range(parser.num_errors):
-                print(f"  ONNX parse error: {parser.get_error(i)}")
-            raise RuntimeError(f"Failed to parse ONNX: {onnx_path}")
+    # Parse ONNX (use absolute path so TRT finds external data files)
+    abs_onnx = os.path.abspath(onnx_path)
+    if not parser.parse_from_file(abs_onnx):
+        for i in range(parser.num_errors):
+            print(f"  ONNX parse error: {parser.get_error(i)}")
+        raise RuntimeError(f"Failed to parse ONNX: {onnx_path}")
 
     if verbose:
         print(f"  Parsed ONNX: {network.num_inputs} inputs, "

@@ -11,6 +11,8 @@ Usage:
     export_onnx(model, onnx_path, input_shape=(1, 3, 32, 32), opset=17)
 """
 
+import os
+
 import torch
 import torch.nn as nn
 from pathlib import Path
@@ -51,14 +53,15 @@ def export_onnx(
     onnx_path = str(Path(onnx_path).resolve())
     Path(onnx_path).parent.mkdir(parents=True, exist_ok=True)
 
-    device = next(model.parameters()).device
     dtype = torch.float16 if fp16_inputs else torch.float32
 
     # Reset neuron states for a clean trace
     model.eval()
     reset_net(model)
 
-    dummy = torch.randn(*input_shape, device=device, dtype=dtype)
+    # Trace on CPU to avoid GPU OOM (ONNX export doesn't need GPU)
+    model_cpu = model.cpu()
+    dummy = torch.randn(*input_shape, dtype=dtype)
 
     dynamic_axes = None
     if dynamic_batch:
@@ -81,29 +84,50 @@ def export_onnx(
             do_constant_folding=True,
         )
         try:
-            # PyTorch 2.9+: force legacy dynamo_export=False
-            torch.onnx.export(model, dummy, onnx_path, dynamo=False, **export_kwargs)
+            torch.onnx.export(model_cpu, dummy, onnx_path, dynamo=False, **export_kwargs)
         except TypeError:
-            # Older PyTorch: no dynamo kwarg
-            torch.onnx.export(model, dummy, onnx_path, **export_kwargs)
-    reset_net(model)
+            torch.onnx.export(model_cpu, dummy, onnx_path, **export_kwargs)
+    reset_net(model_cpu)
+    model.cuda()  # move back to GPU
+
+    # Large models export weights as scattered external data files.
+    # Consolidate into a single .data file for TRT compatibility.
+    import onnx
+    from onnx.external_data_helper import convert_model_to_external_data
+    onnx_model_peek = onnx.load(onnx_path, load_external_data=False)
+    has_external = any(t.data_location == 1 for t in onnx_model_peek.graph.initializer)
+    del onnx_model_peek
+    if has_external:
+        onnx_model = onnx.load(onnx_path, load_external_data=True)
+        data_file = os.path.basename(onnx_path) + '.data'
+        # Strip inline data, point everything to one external file
+        convert_model_to_external_data(
+            onnx_model, all_tensors_to_one_file=True,
+            location=data_file, size_threshold=0)
+        onnx.save_model(onnx_model, onnx_path)
+        # Clean up stale per-tensor external files
+        onnx_dir = os.path.dirname(onnx_path) or '.'
+        for f in os.listdir(onnx_dir):
+            fp = os.path.join(onnx_dir, f)
+            if f.startswith('onnx__') or f in ('fc.weight', 'fc.bias'):
+                os.remove(fp)
+        del onnx_model
+        if verbose:
+            data_path = os.path.join(onnx_dir, data_file)
+            print(f"  Weights: {data_file} ({os.path.getsize(data_path)/1e6:.1f} MB)")
 
     if verbose:
         print(f"  Saved raw ONNX to {onnx_path}")
 
-    # Simplify
-    if simplify:
+    # Simplify (skip for models with external data — onnxsim can't serialize them)
+    if simplify and not has_external:
         try:
-            import onnx
             from onnxsim import simplify as onnxsim_simplify
 
             onnx_model = onnx.load(onnx_path)
-            # Avoid onnxscript version converter crash (PyTorch 2.9+ exports
-            # opset 21 but onnxsim tries to down-convert, which breaks).
-            # Fix: set overwrite_input_shapes to skip version conversion.
             simplified, ok = onnxsim_simplify(
                 onnx_model,
-                skipped_optimizers=['fuse_bn_into_conv'],  # BN already folded
+                skipped_optimizers=['fuse_bn_into_conv'],
             )
             if ok:
                 onnx.save(simplified, onnx_path)
@@ -120,7 +144,6 @@ def export_onnx(
                 print(f"  onnxsim failed ({e}), keeping original (non-fatal)")
 
     if verbose:
-        import os
         size_mb = os.path.getsize(onnx_path) / (1024 * 1024)
         print(f"  Final ONNX: {size_mb:.1f} MB")
 

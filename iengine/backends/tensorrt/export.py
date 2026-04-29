@@ -99,30 +99,56 @@ def export_onnx(
         _do_export(model_cpu, 'cpu')
         model.cuda()
 
-    # Large models export weights as external data files in the ONNX directory.
-    # TRT finds them via parse_from_file(abs_path). No consolidation needed.
+    # PyTorch 2.9+ externalizes large Constant tensors (e.g. neuron membrane
+    # init zeros) but may write 0-byte files. Fix: inline these tensors back.
+    # Initializer weights stay external (TRT reads them via parse_from_file).
     import onnx
+    import numpy as np
+    onnx_model = onnx.load(onnx_path, load_external_data=False)
+    onnx_dir = os.path.dirname(onnx_path) or '.'
+    modified = False
+    for node in onnx_model.graph.node:
+        if node.op_type != 'Constant':
+            continue
+        for attr in node.attribute:
+            if attr.type != 4 or attr.t.data_location != 1:
+                continue
+            # This Constant has broken external data — inline it
+            ext_file = None
+            for ed in attr.t.external_data:
+                if ed.key == 'location':
+                    ext_file = os.path.join(onnx_dir, ed.value)
+            # Generate the tensor (usually zeros for membrane init)
+            shape = list(attr.t.dims)
+            nbytes = int(np.prod(shape)) * 4  # float32
+            if ext_file and os.path.exists(ext_file) and os.path.getsize(ext_file) == nbytes:
+                data = np.fromfile(ext_file, dtype=np.float32)
+            else:
+                data = np.zeros(shape, dtype=np.float32)
+            attr.t.raw_data = data.tobytes()
+            attr.t.data_location = 0  # EMBEDDED
+            del attr.t.external_data[:]
+            # Clean up the stale file
+            if ext_file and os.path.exists(ext_file):
+                os.remove(ext_file)
+            modified = True
+    if modified:
+        onnx.save(onnx_model, onnx_path)
+        if verbose:
+            print(f"  Fixed broken external Constant nodes (inlined)")
+    del onnx_model
+
     has_external = False
-    onnx_model_peek = onnx.load(onnx_path, load_external_data=False)
-    for t in onnx_model_peek.graph.initializer:
+    onnx_peek = onnx.load(onnx_path, load_external_data=False)
+    for t in onnx_peek.graph.initializer:
         if t.data_location == 1:
             has_external = True
             break
-    if not has_external:
-        # Also check Constant node attributes
-        for node in onnx_model_peek.graph.node:
-            for attr in node.attribute:
-                if attr.type == 4 and attr.t.data_location == 1:  # TENSOR type
-                    has_external = True
-                    break
-            if has_external:
-                break
-    del onnx_model_peek
+    del onnx_peek
     if has_external and verbose:
-        onnx_dir = os.path.dirname(onnx_path) or '.'
         ext_files = [f for f in os.listdir(onnx_dir)
-                     if not f.endswith('.onnx') and not f.endswith('.engine')]
-        print(f"  External data: {len(ext_files)} files in {onnx_dir}")
+                     if not f.endswith(('.onnx', '.engine', '.py', '.sh', '.md'))]
+        print(f"  External data: {len(ext_files)} weight files")
 
     if verbose:
         print(f"  Saved raw ONNX to {onnx_path}")

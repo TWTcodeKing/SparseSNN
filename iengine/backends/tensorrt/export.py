@@ -100,70 +100,45 @@ def export_onnx(
         model.cuda()
 
     # PyTorch 2.9+ externalizes large Constant tensors (e.g. neuron membrane
-    # init zeros) but may write 0-byte files. Fix: load all external data,
-    # regenerate broken ones, then save everything to a single .data file.
+    # init zeros) but may write 0-byte files. Fix: write correct data to the
+    # external files directly on disk (no proto serialization needed).
     import onnx
     import numpy as np
     onnx_dir = os.path.dirname(onnx_path) or '.'
 
     onnx_model = onnx.load(onnx_path, load_external_data=False)
-    has_external = any(t.data_location == 1 for t in onnx_model.graph.initializer)
-    has_broken_const = False
+    fixed = 0
     for node in onnx_model.graph.node:
-        if node.op_type == 'Constant':
-            for attr in node.attribute:
-                if attr.type == 4 and attr.t.data_location == 1:
-                    has_broken_const = True
-                    break
+        if node.op_type != 'Constant':
+            continue
+        for attr in node.attribute:
+            if attr.type != 4 or attr.t.data_location != 1:
+                continue
+            # Find the external file path
+            ext_file = None
+            for ed in attr.t.external_data:
+                if ed.key == 'location':
+                    ext_file = os.path.join(onnx_dir, ed.value)
+            if ext_file is None:
+                continue
+            # Check if file is missing or 0-byte
+            shape = list(attr.t.dims)
+            dtype_map = {1: np.float32, 10: np.float16, 7: np.int64, 6: np.int32}
+            dt = dtype_map.get(attr.t.data_type, np.float32)
+            expected = int(np.prod(shape)) * np.dtype(dt).itemsize
+            if not os.path.exists(ext_file) or os.path.getsize(ext_file) != expected:
+                # Write correct data (zeros for membrane init)
+                np.zeros(shape, dtype=dt).tofile(ext_file)
+                fixed += 1
     del onnx_model
-
-    if has_external or has_broken_const:
-        # Reload with all valid external data
-        onnx_model = onnx.load(onnx_path, load_external_data=True)
-
-        # Fix broken Constant nodes: replace 0-byte external with inline zeros
-        for node in onnx_model.graph.node:
-            if node.op_type != 'Constant':
-                continue
-            for attr in node.attribute:
-                if attr.type != 4 or attr.t.data_location != 1:
-                    continue
-                shape = list(attr.t.dims)
-                # External data was broken (0 bytes) — fill with zeros
-                if len(attr.t.raw_data) == 0:
-                    dtype_map = {1: np.float32, 10: np.float16, 7: np.int64, 6: np.int32}
-                    dt = dtype_map.get(attr.t.data_type, np.float32)
-                    attr.t.raw_data = np.zeros(shape, dtype=dt).tobytes()
-                attr.t.data_location = 0
-                del attr.t.external_data[:]
-
-        # Save with single external data file for all large tensors
-        data_file = os.path.basename(onnx_path) + '.data'
-        onnx.save_model(onnx_model, onnx_path,
-                        save_as_external_data=True,
-                        all_tensors_to_one_file=True,
-                        location=data_file,
-                        size_threshold=1024)
-
-        # Clean up stale per-tensor external files
-        data_path = os.path.join(onnx_dir, data_file)
-        keep = {os.path.abspath(data_path), os.path.abspath(onnx_path)}
-        for f in os.listdir(onnx_dir):
-            fp = os.path.join(onnx_dir, f)
-            if os.path.abspath(fp) in keep:
-                continue
-            if f.startswith(('_', 'onnx__')) or f in ('fc.weight', 'fc.bias'):
-                os.remove(fp)
-
-        del onnx_model
-        if verbose:
-            print(f"  Weights: {data_file} ({os.path.getsize(data_path)/1e6:.1f} MB)")
+    if fixed and verbose:
+        print(f"  Fixed {fixed} broken external Constant files")
 
     if verbose:
         print(f"  Saved raw ONNX to {onnx_path}")
 
     # Simplify (skip for models with external data — onnxsim can't serialize them)
-    if simplify and not has_external:
+    if simplify and fixed == 0:
         try:
             from onnxsim import simplify as onnxsim_simplify
 

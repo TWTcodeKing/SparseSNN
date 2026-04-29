@@ -53,15 +53,12 @@ def export_onnx(
     onnx_path = str(Path(onnx_path).resolve())
     Path(onnx_path).parent.mkdir(parents=True, exist_ok=True)
 
+    device = next(model.parameters()).device
     dtype = torch.float16 if fp16_inputs else torch.float32
 
     # Reset neuron states for a clean trace
     model.eval()
     reset_net(model)
-
-    # Trace on CPU to avoid GPU OOM (ONNX export doesn't need GPU)
-    model_cpu = model.cpu()
-    dummy = torch.randn(*input_shape, dtype=dtype)
 
     dynamic_axes = None
     if dynamic_batch:
@@ -74,21 +71,33 @@ def export_onnx(
         print(f"Exporting ONNX: input={list(input_shape)}, opset={opset}, "
               f"dynamic_batch={dynamic_batch}")
 
-    with torch.no_grad():
-        # Use legacy exporter to avoid onnxscript issues on PyTorch 2.9+
-        export_kwargs = dict(
-            input_names=['input'],
-            output_names=['output'],
-            dynamic_axes=dynamic_axes,
-            opset_version=opset,
-            do_constant_folding=True,
-        )
-        try:
-            torch.onnx.export(model_cpu, dummy, onnx_path, dynamo=False, **export_kwargs)
-        except TypeError:
-            torch.onnx.export(model_cpu, dummy, onnx_path, **export_kwargs)
-    reset_net(model_cpu)
-    model.cuda()  # move back to GPU
+    export_kwargs = dict(
+        input_names=['input'],
+        output_names=['output'],
+        dynamic_axes=dynamic_axes,
+        opset_version=opset,
+        do_constant_folding=True,
+    )
+
+    def _do_export(model, device):
+        dummy = torch.randn(*input_shape, dtype=dtype, device=device)
+        with torch.no_grad():
+            try:
+                torch.onnx.export(model, dummy, onnx_path, dynamo=False, **export_kwargs)
+            except TypeError:
+                torch.onnx.export(model, dummy, onnx_path, **export_kwargs)
+        reset_net(model)
+
+    # Try GPU first (produces correct external data); fall back to CPU on OOM
+    try:
+        _do_export(model, device)
+    except torch.OutOfMemoryError:
+        if verbose:
+            print(f"  GPU OOM, retrying on CPU...")
+        torch.cuda.empty_cache()
+        model_cpu = model.cpu()
+        _do_export(model_cpu, 'cpu')
+        model.cuda()
 
     # Large models export weights as external data files in the ONNX directory.
     # TRT finds them via parse_from_file(abs_path). No consolidation needed.

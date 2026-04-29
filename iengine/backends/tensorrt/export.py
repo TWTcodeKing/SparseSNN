@@ -100,55 +100,64 @@ def export_onnx(
         model.cuda()
 
     # PyTorch 2.9+ externalizes large Constant tensors (e.g. neuron membrane
-    # init zeros) but may write 0-byte files. Fix: inline these tensors back.
-    # Initializer weights stay external (TRT reads them via parse_from_file).
+    # init zeros) but may write 0-byte files. Fix: load all external data,
+    # regenerate broken ones, then save everything to a single .data file.
     import onnx
     import numpy as np
-    onnx_model = onnx.load(onnx_path, load_external_data=False)
     onnx_dir = os.path.dirname(onnx_path) or '.'
-    modified = False
+
+    onnx_model = onnx.load(onnx_path, load_external_data=False)
+    has_external = any(t.data_location == 1 for t in onnx_model.graph.initializer)
+    has_broken_const = False
     for node in onnx_model.graph.node:
-        if node.op_type != 'Constant':
-            continue
-        for attr in node.attribute:
-            if attr.type != 4 or attr.t.data_location != 1:
-                continue
-            # This Constant has broken external data — inline it
-            ext_file = None
-            for ed in attr.t.external_data:
-                if ed.key == 'location':
-                    ext_file = os.path.join(onnx_dir, ed.value)
-            # Generate the tensor (usually zeros for membrane init)
-            shape = list(attr.t.dims)
-            nbytes = int(np.prod(shape)) * 4  # float32
-            if ext_file and os.path.exists(ext_file) and os.path.getsize(ext_file) == nbytes:
-                data = np.fromfile(ext_file, dtype=np.float32)
-            else:
-                data = np.zeros(shape, dtype=np.float32)
-            attr.t.raw_data = data.tobytes()
-            attr.t.data_location = 0  # EMBEDDED
-            del attr.t.external_data[:]
-            # Clean up the stale file
-            if ext_file and os.path.exists(ext_file):
-                os.remove(ext_file)
-            modified = True
-    if modified:
-        onnx.save(onnx_model, onnx_path)
-        if verbose:
-            print(f"  Fixed broken external Constant nodes (inlined)")
+        if node.op_type == 'Constant':
+            for attr in node.attribute:
+                if attr.type == 4 and attr.t.data_location == 1:
+                    has_broken_const = True
+                    break
     del onnx_model
 
-    has_external = False
-    onnx_peek = onnx.load(onnx_path, load_external_data=False)
-    for t in onnx_peek.graph.initializer:
-        if t.data_location == 1:
-            has_external = True
-            break
-    del onnx_peek
-    if has_external and verbose:
-        ext_files = [f for f in os.listdir(onnx_dir)
-                     if not f.endswith(('.onnx', '.engine', '.py', '.sh', '.md'))]
-        print(f"  External data: {len(ext_files)} weight files")
+    if has_external or has_broken_const:
+        # Reload with all valid external data
+        onnx_model = onnx.load(onnx_path, load_external_data=True)
+
+        # Fix broken Constant nodes: replace 0-byte external with inline zeros
+        for node in onnx_model.graph.node:
+            if node.op_type != 'Constant':
+                continue
+            for attr in node.attribute:
+                if attr.type != 4 or attr.t.data_location != 1:
+                    continue
+                shape = list(attr.t.dims)
+                # External data was broken (0 bytes) — fill with zeros
+                if len(attr.t.raw_data) == 0:
+                    dtype_map = {1: np.float32, 10: np.float16, 7: np.int64, 6: np.int32}
+                    dt = dtype_map.get(attr.t.data_type, np.float32)
+                    attr.t.raw_data = np.zeros(shape, dtype=dt).tobytes()
+                attr.t.data_location = 0
+                del attr.t.external_data[:]
+
+        # Save with single external data file for all large tensors
+        data_file = os.path.basename(onnx_path) + '.data'
+        onnx.save_model(onnx_model, onnx_path,
+                        save_as_external_data=True,
+                        all_tensors_to_one_file=True,
+                        location=data_file,
+                        size_threshold=1024)
+
+        # Clean up stale per-tensor external files
+        data_path = os.path.join(onnx_dir, data_file)
+        keep = {os.path.abspath(data_path), os.path.abspath(onnx_path)}
+        for f in os.listdir(onnx_dir):
+            fp = os.path.join(onnx_dir, f)
+            if os.path.abspath(fp) in keep:
+                continue
+            if f.startswith(('_', 'onnx__')) or f in ('fc.weight', 'fc.bias'):
+                os.remove(fp)
+
+        del onnx_model
+        if verbose:
+            print(f"  Weights: {data_file} ({os.path.getsize(data_path)/1e6:.1f} MB)")
 
     if verbose:
         print(f"  Saved raw ONNX to {onnx_path}")

@@ -72,9 +72,9 @@ def get_pytorch_output(model_name: str, config: str, dataset: str,
 def export_and_build_sengine(model, T: int, img_size: int):
     """Export model to plugin ONNX, build sengine, return engine + builder."""
     from models.neurons import reset_net
-    import iengine.tdl.neuron_ops as nops
-    from iengine.tdl.transforms import export_with_fused_neurons
-    from sengine.python.sengine.build.engine_builder import EngineBuilder
+    import sengine.tdl.neuron_ops as nops
+    from sengine.tdl.transforms import export_with_fused_neurons
+    from sengine.build.engine_builder import EngineBuilder
 
     onnx_path = tempfile.mktemp(suffix='.onnx')
 

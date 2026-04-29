@@ -72,10 +72,10 @@ def export_model(model_name: str, output_dir: str, T: int = 4,
     plugin_path = os.path.join(output_dir, f"{tag}_plugin.onnx")
 
     # Export plugin-mode ONNX
-    import iengine.tdl.neuron_ops as nops
+    import sengine.tdl.neuron_ops as nops
     nops.use_native_onnx = False
     try:
-        from iengine.tdl.transforms import export_with_fused_neurons
+        from sengine.tdl.transforms import export_with_fused_neurons
         export_with_fused_neurons(
             model, plugin_path, input_shape=input_shape, opset=17,
             dynamic_batch=False, verbose=True)

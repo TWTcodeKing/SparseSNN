@@ -32,7 +32,7 @@ os.environ['PATH'] = '/usr/local/cuda-12.8/bin:' + os.environ.get('PATH', '')
 
 def bench_sengine(args) -> float:
     """Build or load sengine, benchmark, return latency in ms."""
-    from sengine.python.sengine.build.engine_builder import EngineBuilder
+    from sengine.build.engine_builder import EngineBuilder
 
     if args.sengine:
         print(f"\n{'='*60}")
@@ -189,8 +189,8 @@ def main():
 
     # If loading from .sengine and schedule export requested
     if args.sengine and args.export_schedule:
-        from sengine.python.sengine.build.sengine_io import load_sengine
-        from sengine.python.sengine.build.schedule_builder import export_schedule_md
+        from sengine.build.sengine_io import load_sengine
+        from sengine.build.schedule_builder import export_schedule_md
         ir, schedule, T, B = load_sengine(args.sengine)
         model_name = os.path.splitext(os.path.basename(args.sengine))[0]
         export_schedule_md(ir, schedule, args.export_schedule, model_name=model_name)

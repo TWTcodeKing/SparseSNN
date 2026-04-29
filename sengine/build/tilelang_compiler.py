@@ -67,12 +67,21 @@ def _load_cuda_if():
     global _ext_if
     if _ext_if is not None:
         return
-    os.environ.setdefault('CUDA_HOME', '/usr/local/cuda-12.8')
-    os.environ.setdefault('TORCH_CUDA_ARCH_LIST', '8.9')
+    # Auto-detect CUDA home and GPU arch
+    import torch
+    if 'CUDA_HOME' not in os.environ:
+        for p in ['/usr/local/cuda', '/usr/local/cuda-12.8', '/usr/local/cuda-12']:
+            if os.path.exists(os.path.join(p, 'bin', 'nvcc')):
+                os.environ['CUDA_HOME'] = p
+                break
+    if 'TORCH_CUDA_ARCH_LIST' not in os.environ:
+        props = torch.cuda.get_device_properties(0)
+        os.environ['TORCH_CUDA_ARCH_LIST'] = f'{props.major}.{props.minor}'
     from torch.utils.cpp_extension import load
+    src = os.path.join(os.path.dirname(__file__), '..', 'csrc', 'green_context', 'if_neuron.cu')
     _ext_if = load(
         name='if_neuron_ext',
-        sources=['sengine/csrc/green_context/if_neuron.cu'],
+        sources=[src],
         extra_cuda_cflags=['-O3', '--use_fast_math'],
         verbose=False,
     )

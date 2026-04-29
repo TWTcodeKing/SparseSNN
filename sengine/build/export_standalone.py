@@ -35,7 +35,7 @@ def _get_include_paths():
 
 
 def export_kernel_so(kern, output_path: str,
-                     nvcc: str = '/usr/local/cuda-12.8/bin/nvcc',
+                     nvcc: str | None = None,
                      arch: str = 'sm_89') -> str:
     """Export a TileLang JITKernel as a standalone .so.
 
@@ -72,6 +72,14 @@ def export_kernel_so(kern, output_path: str,
     # Write to temp .cu file and compile
     tl_inc, cutlass_inc = _get_include_paths()
 
+    if nvcc is None:
+        for p in ['/usr/local/cuda/bin/nvcc', '/usr/local/cuda-12.8/bin/nvcc']:
+            if os.path.exists(p):
+                nvcc = p
+                break
+        else:
+            nvcc = 'nvcc'
+
     cu_path = output_path.replace('.so', '.cu')
     with open(cu_path, 'w') as f:
         f.write(lib_code)
@@ -96,7 +104,7 @@ def export_kernel_so(kern, output_path: str,
 
 
 def export_all_kernels(kernels: dict, ir, build_dir: str,
-                       nvcc: str = '/usr/local/cuda-12.8/bin/nvcc',
+                       nvcc: str | None = None,
                        arch: str = 'sm_89') -> dict[int, str]:
     """Export all TileLang kernels in a schedule to standalone .so files.
 

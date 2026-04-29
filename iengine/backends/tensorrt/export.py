@@ -93,27 +93,34 @@ def export_onnx(
     # Large models export weights as scattered external data files.
     # Consolidate into a single .data file for TRT compatibility.
     import onnx
-    from onnx.external_data_helper import convert_model_to_external_data
     onnx_model_peek = onnx.load(onnx_path, load_external_data=False)
     has_external = any(t.data_location == 1 for t in onnx_model_peek.graph.initializer)
+    # Collect stale external file names before consolidation
+    stale_files = set()
+    if has_external:
+        onnx_dir = os.path.dirname(onnx_path) or '.'
+        for t in onnx_model_peek.graph.initializer:
+            if t.data_location == 1:
+                for ed in t.external_data:
+                    if ed.key == 'location':
+                        stale_files.add(os.path.join(onnx_dir, ed.value))
     del onnx_model_peek
     if has_external:
         onnx_model = onnx.load(onnx_path, load_external_data=True)
         data_file = os.path.basename(onnx_path) + '.data'
-        # Strip inline data, point everything to one external file
-        convert_model_to_external_data(
-            onnx_model, all_tensors_to_one_file=True,
-            location=data_file, size_threshold=0)
-        onnx.save_model(onnx_model, onnx_path)
-        # Clean up stale per-tensor external files
-        onnx_dir = os.path.dirname(onnx_path) or '.'
-        for f in os.listdir(onnx_dir):
-            fp = os.path.join(onnx_dir, f)
-            if f.startswith('onnx__') or f in ('fc.weight', 'fc.bias'):
+        data_path = os.path.join(onnx_dir, data_file)
+        # Write consolidated external data
+        onnx.save_model(onnx_model, onnx_path,
+                        save_as_external_data=True,
+                        all_tensors_to_one_file=True,
+                        location=data_file,
+                        size_threshold=0)
+        # Remove stale per-tensor files
+        for fp in stale_files:
+            if os.path.exists(fp) and os.path.abspath(fp) != os.path.abspath(data_path):
                 os.remove(fp)
         del onnx_model
         if verbose:
-            data_path = os.path.join(onnx_dir, data_file)
             print(f"  Weights: {data_file} ({os.path.getsize(data_path)/1e6:.1f} MB)")
 
     if verbose:

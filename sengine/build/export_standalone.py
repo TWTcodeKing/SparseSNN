@@ -151,6 +151,11 @@ def export_all_kernels(kernels: dict, ir, build_dir: str,
             continue
 
         so_path = os.path.join(build_dir, f'kern_{nid}.so')
+        if os.path.exists(so_path):
+            # Cached — skip nvcc compilation
+            kern_to_so[kid] = so_path
+            nid_to_so[nid] = so_path
+            continue
         try:
             export_kernel_so(kern, so_path, nvcc=nvcc, arch=arch)
             kern_to_so[kid] = so_path
@@ -159,7 +164,8 @@ def export_all_kernels(kernels: dict, ir, build_dir: str,
         except Exception as e:
             logger.error("Failed to export kernel for node %d: %s", nid, e)
 
-    logger.phase("EXPORT", "Exported %d standalone .so files to %s", count, build_dir)
+    cached = len(nid_to_so) - count
+    logger.phase("EXPORT", "Exported %d .so files (%d cached) to %s", count, cached, build_dir)
     return nid_to_so
 
 

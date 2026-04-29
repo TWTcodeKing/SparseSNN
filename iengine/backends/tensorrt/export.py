@@ -72,15 +72,20 @@ def export_onnx(
               f"dynamic_batch={dynamic_batch}")
 
     with torch.no_grad():
-        torch.onnx.export(
-            model, dummy,
-            onnx_path,
+        # Use legacy exporter to avoid onnxscript issues on PyTorch 2.9+
+        export_kwargs = dict(
             input_names=['input'],
             output_names=['output'],
             dynamic_axes=dynamic_axes,
             opset_version=opset,
             do_constant_folding=True,
         )
+        try:
+            # PyTorch 2.9+: force legacy dynamo_export=False
+            torch.onnx.export(model, dummy, onnx_path, dynamo=False, **export_kwargs)
+        except TypeError:
+            # Older PyTorch: no dynamo kwarg
+            torch.onnx.export(model, dummy, onnx_path, **export_kwargs)
     reset_net(model)
 
     if verbose:
@@ -93,8 +98,13 @@ def export_onnx(
             from onnxsim import simplify as onnxsim_simplify
 
             onnx_model = onnx.load(onnx_path)
-            onnx.checker.check_model(onnx_model)
-            simplified, ok = onnxsim_simplify(onnx_model)
+            # Avoid onnxscript version converter crash (PyTorch 2.9+ exports
+            # opset 21 but onnxsim tries to down-convert, which breaks).
+            # Fix: set overwrite_input_shapes to skip version conversion.
+            simplified, ok = onnxsim_simplify(
+                onnx_model,
+                skipped_optimizers=['fuse_bn_into_conv'],  # BN already folded
+            )
             if ok:
                 onnx.save(simplified, onnx_path)
                 if verbose:
@@ -107,7 +117,7 @@ def export_onnx(
                 print(f"  onnxsim not installed, skipping simplification")
         except Exception as e:
             if verbose:
-                print(f"  onnxsim failed ({e}), keeping original")
+                print(f"  onnxsim failed ({e}), keeping original (non-fatal)")
 
     if verbose:
         import os

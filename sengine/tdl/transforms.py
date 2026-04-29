@@ -433,14 +433,17 @@ def export_with_fused_neurons(
 
     try:
         with torch.no_grad():
-            torch.onnx.export(
-                model, dummy, onnx_path,
+            export_kwargs = dict(
                 input_names=['input'],
                 output_names=['output'],
                 dynamic_axes=dynamic_axes,
                 opset_version=opset,
                 do_constant_folding=False,
             )
+            try:
+                torch.onnx.export(model, dummy, onnx_path, dynamo=False, **export_kwargs)
+            except TypeError:
+                torch.onnx.export(model, dummy, onnx_path, **export_kwargs)
     finally:
         _C._jit_pass_peephole = orig_peephole
         _nops.trace_batch_size = None

@@ -90,38 +90,30 @@ def export_onnx(
     reset_net(model_cpu)
     model.cuda()  # move back to GPU
 
-    # Large models export weights as scattered external data files.
-    # Consolidate into a single .data file for TRT compatibility.
+    # Large models export weights as external data files in the ONNX directory.
+    # TRT finds them via parse_from_file(abs_path). No consolidation needed.
     import onnx
+    has_external = False
     onnx_model_peek = onnx.load(onnx_path, load_external_data=False)
-    has_external = any(t.data_location == 1 for t in onnx_model_peek.graph.initializer)
-    # Collect stale external file names before consolidation
-    stale_files = set()
-    if has_external:
-        onnx_dir = os.path.dirname(onnx_path) or '.'
-        for t in onnx_model_peek.graph.initializer:
-            if t.data_location == 1:
-                for ed in t.external_data:
-                    if ed.key == 'location':
-                        stale_files.add(os.path.join(onnx_dir, ed.value))
+    for t in onnx_model_peek.graph.initializer:
+        if t.data_location == 1:
+            has_external = True
+            break
+    if not has_external:
+        # Also check Constant node attributes
+        for node in onnx_model_peek.graph.node:
+            for attr in node.attribute:
+                if attr.type == 4 and attr.t.data_location == 1:  # TENSOR type
+                    has_external = True
+                    break
+            if has_external:
+                break
     del onnx_model_peek
-    if has_external:
-        onnx_model = onnx.load(onnx_path, load_external_data=True)
-        data_file = os.path.basename(onnx_path) + '.data'
-        data_path = os.path.join(onnx_dir, data_file)
-        # Write consolidated external data
-        onnx.save_model(onnx_model, onnx_path,
-                        save_as_external_data=True,
-                        all_tensors_to_one_file=True,
-                        location=data_file,
-                        size_threshold=0)
-        # Remove stale per-tensor files
-        for fp in stale_files:
-            if os.path.exists(fp) and os.path.abspath(fp) != os.path.abspath(data_path):
-                os.remove(fp)
-        del onnx_model
-        if verbose:
-            print(f"  Weights: {data_file} ({os.path.getsize(data_path)/1e6:.1f} MB)")
+    if has_external and verbose:
+        onnx_dir = os.path.dirname(onnx_path) or '.'
+        ext_files = [f for f in os.listdir(onnx_dir)
+                     if not f.endswith('.onnx') and not f.endswith('.engine')]
+        print(f"  External data: {len(ext_files)} files in {onnx_dir}")
 
     if verbose:
         print(f"  Saved raw ONNX to {onnx_path}")

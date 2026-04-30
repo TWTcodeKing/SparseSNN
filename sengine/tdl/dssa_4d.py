@@ -143,8 +143,12 @@ class DSSA4D(nn.Module):
         out = torch.matmul(y2, attn)
         out = out * self.scale2
 
-        # Reshape back: use x_feat.shape for exact match (avoids broadcast issues)
-        out = out.view(x_feat.shape[0], C, x_feat.shape[2], x_feat.shape[3])
+        # Reshape back to 4D (TB, C, H, W) for Conv projection.
+        # Use contiguous reshape so ONNX tracer sees a clean 4D tensor
+        # (not a view alias of the multi-head layout).
+        H_in = x_feat.shape[2]
+        W_in = x_feat.shape[3]
+        out = out.reshape(out.shape[0], C, H_in, W_in).contiguous()
 
         # LIF neuron + projection + residual
         out = self.activation_out(out)

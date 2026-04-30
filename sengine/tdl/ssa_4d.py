@@ -18,6 +18,37 @@ import torch
 import torch.nn as nn
 
 
+# ── Conv1d↔Conv2d / BN1d↔BN2d conversion helpers ───────────────────────
+
+def _conv1d_to_conv2d(conv1d):
+    """Convert nn.Conv1d(k=1) to nn.Conv2d(k=1×1), sharing weights."""
+    conv2d = nn.Conv2d(
+        conv1d.in_channels, conv1d.out_channels, kernel_size=1,
+        stride=1, padding=0, bias=conv1d.bias is not None,
+        groups=conv1d.groups,
+    )
+    conv2d.weight = nn.Parameter(conv1d.weight.unsqueeze(-1))
+    if conv1d.bias is not None:
+        conv2d.bias = conv1d.bias
+    return conv2d
+
+
+def _bn1d_to_bn2d(bn1d):
+    """Convert nn.BatchNorm1d to nn.BatchNorm2d, sharing parameters."""
+    bn2d = nn.BatchNorm2d(
+        bn1d.num_features, eps=bn1d.eps, momentum=bn1d.momentum,
+        affine=bn1d.affine, track_running_stats=bn1d.track_running_stats,
+    )
+    if bn1d.affine:
+        bn2d.weight = bn1d.weight
+        bn2d.bias = bn1d.bias
+    if bn1d.track_running_stats:
+        bn2d.running_mean = bn1d.running_mean
+        bn2d.running_var = bn1d.running_var
+        bn2d.num_batches_tracked = bn1d.num_batches_tracked
+    return bn2d
+
+
 # ── SpikFormer ──────────────────────────────────────────────────────────
 
 
@@ -207,15 +238,24 @@ class MaxFormerSSA4D(nn.Module):
 
     @classmethod
     def from_ssa(cls, ssa, T):
-        """Convert a 5D maxformer.SSA to 4D, sharing weights."""
+        """Convert a 5D maxformer.SSA to 4D, sharing weights.
+
+        Conv1d weights are reshaped to Conv2d 1×1, BN1d converted to BN2d,
+        so the entire module operates on 4D (TB, C, H, W) without any
+        3D reshaping that would confuse ONNX shape inference.
+        """
         return cls(
             dim=ssa.dim, num_heads=ssa.num_heads, scale=ssa.scale, T=T,
             x_lif=ssa.x_lif,
-            q_conv=ssa.q_conv, q_bn=ssa.q_bn, q_lif=ssa.q_lif,
-            k_conv=ssa.k_conv, k_bn=ssa.k_bn, k_lif=ssa.k_lif,
-            v_conv=ssa.v_conv, v_bn=ssa.v_bn, v_lif=ssa.v_lif,
+            q_conv=_conv1d_to_conv2d(ssa.q_conv),
+            q_bn=_bn1d_to_bn2d(ssa.q_bn), q_lif=ssa.q_lif,
+            k_conv=_conv1d_to_conv2d(ssa.k_conv),
+            k_bn=_bn1d_to_bn2d(ssa.k_bn), k_lif=ssa.k_lif,
+            v_conv=_conv1d_to_conv2d(ssa.v_conv),
+            v_bn=_bn1d_to_bn2d(ssa.v_bn), v_lif=ssa.v_lif,
             attn_lif=ssa.attn_lif,
-            proj_conv=ssa.proj_conv, proj_bn=ssa.proj_bn,
+            proj_conv=_conv1d_to_conv2d(ssa.proj_conv),
+            proj_bn=_bn1d_to_bn2d(ssa.proj_bn),
         )
 
     def forward(self, x):
@@ -226,34 +266,32 @@ class MaxFormerSSA4D(nn.Module):
             (T*B, C, H, W) with residual already added
         """
         TB, C, H, W = x.shape
+        N = H * W
         identity = x
 
-        x = self.x_lif(x)                              # (TB, C, H, W) — TDL-2 fused
-        N = H * W
-        x_flat = x.view(TB, C, N)                      # (TB, C, N) for Conv1d
+        x = self.x_lif(x)                                # (TB, C, H, W)
 
-        # Q/K/V projections: Conv1d → BN1d → LIF → head reshape
-        q = self.q_bn(self.q_conv(x_flat))              # (TB, C, N)
+        # Q/K/V projections: Conv2d(k=1×1) → BN2d → LIF — all 4D, no reshaping
+        q = self.q_bn(self.q_conv(x))
         q = self.q_lif(q)
-        q = q.view(TB, self.num_heads, self.head_dim, N).transpose(-2, -1)  # (TB, heads, N, head_dim)
+        q = q.view(TB, self.num_heads, self.head_dim, N).transpose(-2, -1)
 
-        k = self.k_bn(self.k_conv(x_flat))
+        k = self.k_bn(self.k_conv(x))
         k = self.k_lif(k)
-        k = k.view(TB, self.num_heads, self.head_dim, N).transpose(-2, -1)  # (TB, heads, N, head_dim)
+        k = k.view(TB, self.num_heads, self.head_dim, N).transpose(-2, -1)
 
-        v = self.v_bn(self.v_conv(x_flat))
+        v = self.v_bn(self.v_conv(x))
         v = self.v_lif(v)
-        v = v.view(TB, self.num_heads, self.head_dim, N).transpose(-2, -1)  # (TB, heads, N, head_dim)
+        v = v.view(TB, self.num_heads, self.head_dim, N).transpose(-2, -1)
 
         # Linear attention: K^T @ V → Q @ result * scale
-        kv = k.transpose(-2, -1) @ v                    # (TB, heads, head_dim, head_dim)
-        x = (q @ kv) * self.scale                       # (TB, heads, N, head_dim)
+        kv = k.transpose(-2, -1) @ v                     # (TB, heads, head_dim, head_dim)
+        x = (q @ kv) * self.scale                        # (TB, heads, N, head_dim)
 
-        # Merge heads → (TB, C, N) → attn_lif → proj
-        x = x.transpose(-2, -1).reshape(TB, C, N)       # (TB, C, N)  [heads*head_dim on dim 1]
+        # Merge heads → proj → residual
+        x = x.transpose(-2, -1).reshape(TB, C, H, W)
         x = self.attn_lif(x)
-        x = self.proj_bn(self.proj_conv(x))              # (TB, C, N)
-        x = x.view(TB, C, H, W)
+        x = self.proj_bn(self.proj_conv(x))               # (TB, C, H, W)
 
         return x + identity
 
@@ -296,10 +334,13 @@ class TokenQKA4D(nn.Module):
         return cls(
             dim=qka.dim, num_heads=qka.num_heads, T=T,
             proj_lif=qka.proj_lif,
-            q_conv=qka.q_conv, q_bn=qka.q_bn, q_lif=qka.q_lif,
-            k_conv=qka.k_conv, k_bn=qka.k_bn, k_lif=qka.k_lif,
+            q_conv=_conv1d_to_conv2d(qka.q_conv),
+            q_bn=_bn1d_to_bn2d(qka.q_bn), q_lif=qka.q_lif,
+            k_conv=_conv1d_to_conv2d(qka.k_conv),
+            k_bn=_bn1d_to_bn2d(qka.k_bn), k_lif=qka.k_lif,
             attn_lif=qka.attn_lif,
-            proj_conv=qka.proj_conv, proj_bn=qka.proj_bn,
+            proj_conv=_conv1d_to_conv2d(qka.proj_conv),
+            proj_bn=_bn1d_to_bn2d(qka.proj_bn),
         )
 
     def forward(self, x):
@@ -313,27 +354,24 @@ class TokenQKA4D(nn.Module):
         identity = x
         N = H * W
 
-        x = self.proj_lif(x)                            # (TB, C, H, W) — TDL-2 fused
-        x_flat = x.view(TB, C, N)                       # (TB, C, N) for Conv1d
+        x = self.proj_lif(x)                              # (TB, C, H, W)
 
-        # Q: Conv1d → BN → LIF → head reshape
-        q = self.q_bn(self.q_conv(x_flat))               # (TB, C, N)
+        # Q/K: Conv2d(k=1×1) → BN2d → LIF — all 4D
+        q = self.q_bn(self.q_conv(x))
         q = self.q_lif(q)
-        q = q.view(TB, self.num_heads, self.head_dim, N) # (TB, heads, head_dim, N)
+        q = q.view(TB, self.num_heads, self.head_dim, N)
 
-        # K: Conv1d → BN → LIF → head reshape
-        k = self.k_bn(self.k_conv(x_flat))
+        k = self.k_bn(self.k_conv(x))
         k = self.k_lif(k)
-        k = k.view(TB, self.num_heads, self.head_dim, N) # (TB, heads, head_dim, N)
+        k = k.view(TB, self.num_heads, self.head_dim, N)
 
         # Scalar attention: sum Q over head_dim → LIF → multiply with K
-        attn = q.sum(dim=2, keepdim=True)                # (TB, heads, 1, N)
+        attn = q.sum(dim=2, keepdim=True)                  # (TB, heads, 1, N)
         attn = self.attn_lif(attn)
-        x = torch.mul(attn, k)                           # (TB, heads, head_dim, N)
+        x = torch.mul(attn, k)                             # (TB, heads, head_dim, N)
 
-        # Merge heads → proj
-        x = x.reshape(TB, C, N)                          # (TB, C, N)
+        # Merge heads → proj → residual
+        x = x.reshape(TB, C, H, W)
         x = self.proj_bn(self.proj_conv(x))
-        x = x.view(TB, C, H, W)
 
         return x + identity

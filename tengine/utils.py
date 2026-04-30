@@ -208,7 +208,8 @@ def _populate_resnet_registry():
                  'ms_resnet_cifar20', 'ms_resnet_cifar32', 'ms_resnet_cifar44',
                  'ms_resnet_cifar56', 'ms_resnet_cifar110',
                  'ms_resnet_dvs20',
-                 'dvs_sew_resnet']:
+                 'dvs_sew_resnet',
+                 'snn_vgg9', 'snn_vgg11', 'snn_vgg16', 'snn_vgg19']:
         fn = getattr(M, name, None)
         if fn:
             _RESNET_REGISTRY[name] = fn

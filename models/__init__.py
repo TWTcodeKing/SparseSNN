@@ -35,6 +35,7 @@ from .msresnet import (
     ms_resnet_dvs20,
 )
 from .dvs_sewresnet import DVSSEWResNet, dvs_sew_resnet
+from .snn_vgg import SNNVGG, snn_vgg9, snn_vgg11, snn_vgg16, snn_vgg19
 from .spikingresformer import SpikingResformer, spikingresformer, build_spikingresformer
 
 # ---- SNN Transformer variants (config-based builders) ----

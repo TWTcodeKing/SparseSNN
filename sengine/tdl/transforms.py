@@ -5,7 +5,13 @@ model from 5D temporal IR (T, B, C, H, W) to 4D spatial IR (T*B, C, H, W):
 
   TDL-1: T-Axis Absorption     — patch stateless wrappers to skip 5D reshape
   TDL-2: Stateful Op Extraction — replace neurons with fused custom ops
-  TDL-3: Attention Decomposition — replace DSSA with native 4D DSSA4D
+  TDL-3: Attention Decomposition — replace attention blocks with 4D variants
+
+Supported attention types:
+  - DSSA (SpikingResformer) → DSSA4D
+  - SSA  (SpikFormer)       → SpikformerSSA4D + SpikformerMLP4D
+  - SSA  (MaxFormer)        → MaxFormerSSA4D
+  - Token_QK_Attention      → TokenQKA4D
 
 After transforms, the model operates entirely in 4D. The temporal dimension
 survives only inside fused neuron kernels (T as an attribute, not a tensor dim).
@@ -17,13 +23,17 @@ import torch
 import torch.nn as nn
 
 from sengine.tdl.analysis import (
-    collect_neuron_params, is_neuron, is_stateless_wrapper, is_spike_attention,
+    collect_neuron_params, is_neuron, is_stateless_wrapper,
+    is_spike_attention, is_spikformer_mlp, get_attention_type,
 )
 from sengine.tdl.neuron_ops import (
     FusedLIFOp, FusedIFOp, FusedMSOp,
     FusedLIFPluginOp, FusedIFPluginOp, FusedMSPluginOp,
 )
 from sengine.tdl.dssa_4d import DSSA4D
+from sengine.tdl.ssa_4d import (
+    SpikformerSSA4D, SpikformerMLP4D, MaxFormerSSA4D, TokenQKA4D,
+)
 
 
 class TDLTransform:
@@ -36,19 +46,21 @@ class TDLTransform:
         tdl.restore()         # model restored to original 5D
     """
 
-    def __init__(self, model: nn.Module, T: int = None):
+    def __init__(self, model: nn.Module, T: int = None,
+                 force_native_onnx: bool = False):
         self.model = model
         self.T = T or getattr(model, 'T', 4)
+        self.force_native_onnx = force_native_onnx
         self._originals = {}     # name → original forward or module
         self._original_fwd = None  # model.forward backup
         self._dssa_replacements = {}  # name → (parent, attr, original_module)
 
     def apply(self):
         """Apply TDL-1/2/3 transforms + model forward patch."""
-        # Classify attention neurons BEFORE TDL-3 replaces modules
+        # Classify attention + SpikFormer MLP neurons BEFORE TDL-3 replaces modules
         self._attention_neurons = set()
         for name, module in self.model.named_modules():
-            if is_spike_attention(module):
+            if is_spike_attention(module) or is_spikformer_mlp(module):
                 for child_name, _ in module.named_modules():
                     if child_name:
                         self._attention_neurons.add(f"{name}.{child_name}")
@@ -82,11 +94,11 @@ class TDLTransform:
 
     def _apply_tdl1(self):
         """Patch all stateless temporal wrappers to operate on 4D directly."""
-        # Collect attention module children (don't patch their internals —
-        # TDL-3 handles those via DSSA4D replacement)
+        # Collect attention + SpikFormer MLP children (don't patch their
+        # internals — TDL-3 handles those via 4D module replacement)
         attention_children = set()
         for name, module in self.model.named_modules():
-            if is_spike_attention(module):
+            if is_spike_attention(module) or is_spikformer_mlp(module):
                 for child_name, _ in module.named_modules():
                     if child_name:
                         attention_children.add(f"{name}.{child_name}")
@@ -167,12 +179,14 @@ class TDLTransform:
             p = neuron_params[name]
             self._originals[name] = module.forward
 
-            # Choose export mode: native ONNX for simple path, plugin for attention
+            # Choose export mode: native ONNX for simple path, plugin for attention.
+            # force_native_onnx=True overrides this for TRT export (no plugins).
             in_attention = (name in self._attention_neurons
                             or any(name.startswith(an + '.')
                                    for an in self._attention_neurons))
             from sengine.tdl import neuron_ops as _nops
-            use_native = _nops.use_native_onnx and not in_attention
+            use_native = _nops.use_native_onnx and (self.force_native_onnx
+                                                     or not in_attention)
 
             if p['type'] == 'LIF':
                 OpClass = FusedLIFOp if use_native else FusedLIFPluginOp
@@ -204,21 +218,44 @@ class TDLTransform:
                 module.forward = _make_ms(p, OpClass)
 
     # ------------------------------------------------------------------
-    # TDL-3: Temporal Attention Decomposition — replace DSSA with DSSA4D
+    # TDL-3: Temporal Attention Decomposition — replace with 4D variants
     # ------------------------------------------------------------------
 
     def _apply_tdl3(self):
-        """Replace DSSA attention modules with native 4D DSSA4D."""
-        replacements = []
+        """Replace attention (+ SpikFormer MLP) modules with 4D variants."""
+        # Collect attention modules
+        attn_replacements = []
         for name, module in self.model.named_modules():
-            if is_spike_attention(module):
-                replacements.append((name, module))
+            atype = get_attention_type(module)
+            if atype is not None:
+                attn_replacements.append((name, module, atype))
 
-        for name, module in replacements:
-            dssa4d = DSSA4D.from_dssa(module, self.T)
+        for name, module, atype in attn_replacements:
+            if atype == 'dssa':
+                replacement = DSSA4D.from_dssa(module, self.T)
+            elif atype == 'spikformer_ssa':
+                replacement = SpikformerSSA4D.from_ssa(module, self.T)
+            elif atype == 'maxformer_ssa':
+                replacement = MaxFormerSSA4D.from_ssa(module, self.T)
+            elif atype == 'token_qka':
+                replacement = TokenQKA4D.from_qka(module, self.T)
+            else:
+                continue
             parent, attr = _get_parent_and_attr(self.model, name)
             self._dssa_replacements[name] = (parent, attr, module)
-            setattr(parent, attr, dssa4d)
+            setattr(parent, attr, replacement)
+
+        # Also replace SpikFormer MLP modules (Linear + BN1d + LIF in 5D)
+        mlp_replacements = []
+        for name, module in self.model.named_modules():
+            if is_spikformer_mlp(module):
+                mlp_replacements.append((name, module))
+
+        for name, module in mlp_replacements:
+            replacement = SpikformerMLP4D.from_mlp(module, self.T)
+            parent, attr = _get_parent_and_attr(self.model, name)
+            self._dssa_replacements[name] = (parent, attr, module)
+            setattr(parent, attr, replacement)
 
     # ------------------------------------------------------------------
     # Model forward patch — 4D input/output
@@ -231,7 +268,13 @@ class TDLTransform:
         model = self.model
 
         # Detect model architecture by structure
-        if hasattr(model, 'prologue') and hasattr(model, 'layers'):
+        if hasattr(model, 'patch_embed') and hasattr(model, 'block'):
+            # SpikFormer pattern: SPS patch_embed + ModuleList block
+            self._patch_spikformer_forward()
+        elif hasattr(model, 'patch_embed1') and hasattr(model, 'stage3'):
+            # MaxFormer / MS_QKFormer pattern: hierarchical stages
+            self._patch_maxformer_forward()
+        elif hasattr(model, 'prologue') and hasattr(model, 'layers'):
             # SpikingResformer pattern
             self._patch_spikingresformer_forward()
         elif (hasattr(model, 'conv1') and hasattr(model, 'bn1')
@@ -249,6 +292,350 @@ class TDLTransform:
         else:
             # Generic fallback — try to detect the pattern
             self._patch_generic_forward()
+
+    def _patch_spikformer_forward(self):
+        """4D forward for SpikFormer.
+
+        Original flow: (B,C,H,W) → repeat → (T,B,C,H,W) → SPS → (T,B,N,C)
+                        → Blocks(SSA+MLP in 5D) → mean(N) → mean(T) → head
+
+        4D flow: (B,C,H,W) → repeat → (T*B,C,H,W) → SPS(4D) → (T*B,N,C)
+                  → Blocks(SSA4D+MLP4D in 3D) → mean(N) → reshape → mean(T) → head
+
+        SPS is already 4D after TDL-1 (all Conv2d+BN2d+MaxPool are stateless
+        wrappers), but we need to rewrite its forward to skip the 5D reshapes
+        and flatten(-2).transpose(-1,-2) at the end.
+        """
+        T = self.T
+        model = self.model
+        sps = model.patch_embed
+
+        # Patch SPS forward for 4D
+        def sps_4d(x):
+            # x: (T*B, C, H, W)
+            x = sps.proj_conv(x)
+            x = sps.proj_bn(x)
+            x = sps.proj_lif(x)
+
+            x = sps.proj_conv1(x)
+            x = sps.proj_bn1(x)
+            x = sps.proj_lif1(x)
+
+            x = sps.proj_conv2(x)
+            x = sps.proj_bn2(x)
+            x = sps.proj_lif2(x)
+            x = sps.maxpool2(x)
+
+            x = sps.proj_conv3(x)
+            x = sps.proj_bn3(x)
+            x = sps.proj_lif3(x)
+            x = sps.maxpool3(x)
+
+            x_feat = x
+            x = sps.rpe_conv(x)
+            x = sps.rpe_bn(x)
+            x = sps.rpe_lif(x)
+            x = x + x_feat
+
+            # (T*B, C, H', W') → (T*B, N, C) where N = H'*W'
+            x = x.flatten(2).transpose(1, 2)
+            return x
+
+        self._originals['patch_embed'] = sps.forward
+        sps.forward = sps_4d
+
+        # Patch Block forward for 4D (SSA4D and MLP4D already replaced by TDL-3)
+        for i, blk in enumerate(model.block):
+            blk_name = f'block.{i}'
+            self._originals[blk_name] = blk.forward
+            def _make_blk_fwd(b):
+                def _fwd(x):
+                    # x: (T*B, N, C) — SSA4D and MLP4D operate directly on this
+                    x = x + b.attn(x)
+                    x = x + b.mlp(x)
+                    return x
+                return _fwd
+            blk.forward = _make_blk_fwd(blk)
+
+        def forward_4d(x):
+            # x: (B, C, H, W)
+            x = x.repeat(T, 1, 1, 1)       # (T*B, C, H, W)
+            x = model.patch_embed(x)         # (T*B, N, C)
+            for blk in model.block:
+                x = blk(x)                   # (T*B, N, C)
+            x = x.mean(1)                    # (T*B, C) — mean over tokens
+            TB = x.shape[0]
+            B = TB // T
+            x = x.view(T, B, -1).mean(0)    # (B, C) — mean over T
+            x = model.head(x)                # (B, num_classes)
+            return x
+
+        model.forward = forward_4d
+
+    def _patch_maxformer_forward(self):
+        """4D forward for MaxFormer / MaxFormerCifar / MaxFormerDVS / MS_QKFormer.
+
+        These share the same hierarchical structure:
+          patch_embed1 → stage1 → patch_embed2 → stage2 → patch_embed3 → stage3
+          → head_lif → head → mean(T)
+
+        All stages operate on (T, B, C, H, W). In 4D mode, they operate on
+        (T*B, C, H, W). The S_MLP and embedding modules use Conv2d+BN2d which
+        are already patched by TDL-1. The SSA/QKA blocks are replaced by TDL-3.
+
+        S_MLP needs its own 4D patch since it has 5D neuron + residual patterns.
+        """
+        T = self.T
+        model = self.model
+
+        # Patch S_MLP modules for 4D
+        for name, module in model.named_modules():
+            if not (hasattr(module, 'fc1_conv') and hasattr(module, 'fc1_bn')
+                    and hasattr(module, 'fc1_lif') and hasattr(module, 'fc2_conv')):
+                continue
+            self._originals[name] = module.forward
+            def _make_smlp_fwd(m):
+                def _fwd(x):
+                    # x: (T*B, C, H, W)
+                    identity = x
+                    x = m.fc1_lif(x)
+                    x = m.fc1_conv(x)
+                    x = m.fc1_bn(x)
+                    if m.res:
+                        x = identity + x
+                        identity = x
+                    x = m.fc2_lif(x)
+                    x = m.fc2_conv(x)
+                    x = m.fc2_bn(x)
+                    x = x + identity
+                    return x
+                return _fwd
+            module.forward = _make_smlp_fwd(module)
+
+        # Patch Block_DWC for 4D
+        for name, module in model.named_modules():
+            if not (hasattr(module, 'conv') and hasattr(module, 'conv_bn')
+                    and hasattr(module, 'conv_neuron') and hasattr(module, 'mlp')):
+                continue
+            self._originals[name] = module.forward
+            def _make_dwc_fwd(m):
+                def _fwd(x):
+                    # x: (T*B, C, H, W)
+                    identity = x
+                    x = m.conv_neuron(x)
+                    x = m.conv(x)
+                    x = m.conv_bn(x)
+                    x = x + identity
+                    x = m.mlp(x)
+                    return x
+                return _fwd
+            module.forward = _make_dwc_fwd(module)
+
+        # Patch Block_SSA for 4D (SSA already replaced by MaxFormerSSA4D)
+        for name, module in model.named_modules():
+            if (hasattr(module, 'attn') and hasattr(module, 'mlp')
+                    and not hasattr(module, 'conv')
+                    and isinstance(module.attn, MaxFormerSSA4D)):
+                self._originals[name] = module.forward
+                def _make_bssa_fwd(m):
+                    def _fwd(x):
+                        x = m.attn(x)   # MaxFormerSSA4D includes residual
+                        x = m.mlp(x)    # S_MLP 4D includes residual
+                        return x
+                    return _fwd
+                module.forward = _make_bssa_fwd(module)
+
+        # Patch Block_QKA for 4D (QKA already replaced by TokenQKA4D)
+        for name, module in model.named_modules():
+            if (hasattr(module, 'attn') and hasattr(module, 'mlp')
+                    and isinstance(module.attn, TokenQKA4D)):
+                self._originals[name] = module.forward
+                def _make_bqka_fwd(m):
+                    def _fwd(x):
+                        x = m.attn(x)   # TokenQKA4D includes residual
+                        x = m.mlp(x)
+                        return x
+                    return _fwd
+                module.forward = _make_bqka_fwd(module)
+
+        # Patch Block_Max for 4D (MaxPool mixer)
+        for name, module in model.named_modules():
+            if hasattr(module, 'pool') and hasattr(module, 'mlp') and not hasattr(module, 'attn'):
+                self._originals[name] = module.forward
+                def _make_bmax_fwd(m):
+                    def _fwd(x):
+                        x = m.pool(x)
+                        x = m.mlp(x)
+                        return x
+                    return _fwd
+                module.forward = _make_bmax_fwd(module)
+
+        # Patch Block_identity for 4D (MLP only)
+        for name, module in model.named_modules():
+            if (hasattr(module, 'mlp') and not hasattr(module, 'attn')
+                    and not hasattr(module, 'pool') and not hasattr(module, 'conv')):
+                cls_name = type(module).__name__
+                if cls_name == 'Block_identity':
+                    self._originals[name] = module.forward
+                    def _make_bid_fwd(m):
+                        def _fwd(x):
+                            return m.mlp(x)
+                        return _fwd
+                    module.forward = _make_bid_fwd(module)
+
+        # Patch embedding modules for 4D
+        self._patch_maxformer_embeds()
+
+        def forward_4d(x):
+            # x: (B, C, H, W)
+            x = x.repeat(T, 1, 1, 1)             # (T*B, C, H, W)
+            x = model.patch_embed1(x)
+            for blk in model.stage1:
+                x = blk(x)
+            x = model.patch_embed2(x)
+            for blk in model.stage2:
+                x = blk(x)
+            x = model.patch_embed3(x)
+            for blk in model.stage3:
+                x = blk(x)
+            # Global average pool: (T*B, C, H, W) → (T*B, C)
+            x = x.flatten(2).mean(2)
+            x = model.head_lif(x)
+            x = model.head(x)
+            TB = x.shape[0]
+            B = TB // T
+            return x.view(T, B, -1).mean(0)
+
+        model.forward = forward_4d
+
+    def _patch_maxformer_embeds(self):
+        """Patch MaxFormer embedding modules for 4D operation."""
+        model = self.model
+
+        for name, module in model.named_modules():
+            cls_name = type(module).__name__
+
+            if cls_name == 'Embed':
+                self._originals[name] = module.forward
+                def _make_embed_fwd(m):
+                    def _fwd(x, dual=False):
+                        if not m.shortcut:
+                            x = m.embed_lif(x)
+                        x_feat = x
+                        x = m.embed_conv(x)
+                        x = m.embed_bn(x)
+                        if dual:
+                            return x, x_feat
+                        return x
+                    return _fwd
+                module.forward = _make_embed_fwd(module)
+
+            elif cls_name == 'MaxEmbed':
+                self._originals[name] = module.forward
+                def _make_maxembed_fwd(m):
+                    def _fwd(x, dual=False):
+                        if not m.shortcut:
+                            x = m.embed_lif(x)
+                        x_feat = x
+                        x = m.embed_conv(x)
+                        x = m.embed_bn(x)
+                        x = m.maxpool(x)
+                        if dual:
+                            return x, x_feat
+                        return x
+                    return _fwd
+                module.forward = _make_maxembed_fwd(module)
+
+            elif cls_name == 'EmbedOrigImageNet':
+                self._originals[name] = module.forward
+                def _make_eoi_fwd(m):
+                    def _fwd(x):
+                        x = m.embed1(x)
+                        x, x_feat = m.embed2(x, dual=True)
+                        x = m.embed3(x)
+                        x_feat = m.embed4(x_feat)
+                        return x + x_feat
+                    return _fwd
+                module.forward = _make_eoi_fwd(module)
+
+            elif cls_name == 'EmbedOrig':
+                self._originals[name] = module.forward
+                def _make_eo_fwd(m):
+                    def _fwd(x):
+                        x = m.embed1(x)
+                        x, x_feat = m.embed2(x, dual=True)
+                        x_feat = m.embed3(x_feat)
+                        return x + x_feat
+                    return _fwd
+                module.forward = _make_eo_fwd(module)
+
+            elif cls_name == 'EmbedMax':
+                self._originals[name] = module.forward
+                def _make_em_fwd(m):
+                    def _fwd(x):
+                        x, x_feat = m.max_embed1(x, dual=True)
+                        x = m.embed1(x)
+                        x_feat = m.max_embed2(x_feat)
+                        return x + x_feat
+                    return _fwd
+                module.forward = _make_em_fwd(module)
+
+            elif cls_name == 'EmbedMaxPlus':
+                self._originals[name] = module.forward
+                def _make_emp_fwd(m):
+                    def _fwd(x):
+                        x = m.proj_conv(x)
+                        x = m.proj_bn(x)
+                        x = m.max_embed1(x)
+                        x, x_feat = m.max_embed2(x, dual=True)
+                        x = m.max_embed3(x)
+                        x_feat = m.embed1(x_feat)
+                        return x + x_feat
+                    return _fwd
+                module.forward = _make_emp_fwd(module)
+
+            elif cls_name == 'PatchEmbedInitMaxPool':
+                self._originals[name] = module.forward
+                def _make_peimp_fwd(m):
+                    def _fwd(x):
+                        x = m.embed1.embed_conv(x)
+                        x = m.embed1.embed_bn(x)
+                        x = m.maxpool1(x)
+                        x = m.lif1(x)
+                        x_feat = x
+                        x = m.embed2.embed_conv(x)
+                        x = m.embed2.embed_bn(x)
+                        x = m.maxpool2(x)
+                        x = m.lif2(x)
+                        x = m.embed3.embed_conv(x)
+                        x = m.embed3.embed_bn(x)
+                        x_feat = m.embed4.embed_conv(x_feat)
+                        x_feat = m.embed4.embed_bn(x_feat)
+                        return x + x_feat
+                    return _fwd
+                module.forward = _make_peimp_fwd(module)
+
+            elif cls_name == 'Embed1Max':
+                self._originals[name] = module.forward
+                def _make_e1m_fwd(m):
+                    def _fwd(x):
+                        x, x_feat = m.max_embed1(x, dual=True)
+                        x = m.embed1(x)
+                        x_feat = m.max_embed2(x_feat)
+                        return x + x_feat
+                    return _fwd
+                module.forward = _make_e1m_fwd(module)
+
+            elif cls_name == 'Embed1MaxCifar':
+                self._originals[name] = module.forward
+                def _make_e1mc_fwd(m):
+                    def _fwd(x):
+                        x, x_feat = m.embed1(x, dual=True)
+                        x = m.max_embed1(x)
+                        x_feat = m.embed2(x_feat)
+                        return x + x_feat
+                    return _fwd
+                module.forward = _make_e1mc_fwd(module)
 
     def _patch_spikingresformer_forward(self):
         T = self.T
@@ -359,18 +746,22 @@ def export_with_fused_neurons(
     opset: int = 17,
     dynamic_batch: bool = True,
     flatten_temporal: bool = True,
+    force_native_onnx: bool = True,
     verbose: bool = True,
 ):
     """Export SNN model to ONNX with TDL transforms applied.
 
     Args:
-        model:            PyTorch SNN model.
-        onnx_path:        Output ONNX file path.
-        input_shape:      (B, C, H, W) for tracing.
-        opset:            ONNX opset version.
-        dynamic_batch:    Enable dynamic batch dim.
-        flatten_temporal: Apply TDL-1/2/3 transforms (4D batched mode).
-        verbose:          Print progress.
+        model:             PyTorch SNN model.
+        onnx_path:         Output ONNX file path.
+        input_shape:       (B, C, H, W) for tracing.
+        opset:             ONNX opset version.
+        dynamic_batch:     Enable dynamic batch dim.
+        flatten_temporal:  Apply TDL-1/2/3 transforms (4D batched mode).
+        force_native_onnx: Force all neurons (including attention) to use
+                           native ONNX ops instead of plugin ops. Required
+                           for TRT (no FusedLIFNeuron plugin registered).
+        verbose:           Print progress.
     """
     from pathlib import Path
     from models.neurons import reset_net
@@ -378,7 +769,7 @@ def export_with_fused_neurons(
     Path(onnx_path).parent.mkdir(parents=True, exist_ok=True)
     T = getattr(model, 'T', 4)
 
-    tdl = TDLTransform(model, T)
+    tdl = TDLTransform(model, T, force_native_onnx=force_native_onnx)
     neuron_params = collect_neuron_params(model)
 
     if verbose:

@@ -41,6 +41,7 @@ from tengine.utils import (
 from iengine.backends.tensorrt.export import export_onnx
 from iengine.backends.tensorrt.builder import build_engine
 from iengine.backends.tensorrt.runtime import TRTRunner
+from sengine.tdl.transforms import export_with_fused_neurons
 
 
 # ---------------------------------------------------------------------------
@@ -147,12 +148,25 @@ def run_pipeline(
     input_shape = (args.batch_size, ds_cfg['in_channels'], img_size, img_size)
 
     # Step 1: ONNX export
-    print(f"\n--- [{mode_str.upper()}] Step 1: ONNX export ---")
-    export_onnx(
-        model, onnx_path,
-        input_shape=input_shape,
-        opset=args.opset,
-    )
+    # Use TDL export for transformer models (config-based) — flattens the
+    # temporal dimension to 4D so TRT can handle attention/reshape ops.
+    # ResNet models use the simpler direct export.
+    is_transformer = args.config is not None
+    print(f"\n--- [{mode_str.upper()}] Step 1: ONNX export "
+          f"({'TDL 4D' if is_transformer else 'direct'}) ---")
+    if is_transformer:
+        export_with_fused_neurons(
+            model, onnx_path,
+            input_shape=input_shape,
+            opset=args.opset,
+            dynamic_batch=True,
+        )
+    else:
+        export_onnx(
+            model, onnx_path,
+            input_shape=input_shape,
+            opset=args.opset,
+        )
 
     # Step 2: Build TensorRT engine
     print(f"\n--- [{mode_str.upper()}] Step 2: Build TensorRT engine ---")

@@ -1,0 +1,339 @@
+"""TDL-3: Temporal Attention Decomposition — SSA / QKA 4D rewrites.
+
+Provides 4D-native replacements for SpikFormer and MaxFormer attention modules:
+
+  SpikformerSSA4D  — replaces spikformer.SSA  (Linear QKV, standard matmul order)
+  SpikformerMLP4D  — replaces spikformer.MLP  (Linear + BN1d + LIF)
+  MaxFormerSSA4D   — replaces maxformer.SSA   (Conv1d QKV, reversed matmul order)
+  TokenQKA4D       — replaces maxformer.Token_QK_Attention (scalar Q, no V)
+
+All modules accept (T*B, ...) input with T as a construction parameter.
+All 5D temporal reshapes are eliminated — the only temporal state lives
+inside fused neuron kernels (patched by TDL-2).
+
+Platform-agnostic — pure PyTorch, no inference engine dependencies.
+"""
+
+import torch
+import torch.nn as nn
+
+
+# ── SpikFormer ──────────────────────────────────────────────────────────
+
+
+class SpikformerSSA4D(nn.Module):
+    """4D-native Spiking Self-Attention for SpikFormer.
+
+    Original SSA operates on (T, B, N, C) with 5D reshapes for neurons.
+    This version operates on (T*B, N, C) — neurons are TDL-2 fused (4D).
+
+    Attention pattern: (Q @ K.T) * scale → @ V → attn_lif → proj
+    """
+
+    def __init__(self, dim, num_heads, scale, T,
+                 q_linear=None, q_bn=None, q_lif=None,
+                 k_linear=None, k_bn=None, k_lif=None,
+                 v_linear=None, v_bn=None, v_lif=None,
+                 attn_lif=None,
+                 proj_linear=None, proj_bn=None, proj_lif=None):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = scale
+        self.T = T
+
+        self.q_linear = q_linear
+        self.q_bn = q_bn
+        self.q_lif = q_lif
+        self.k_linear = k_linear
+        self.k_bn = k_bn
+        self.k_lif = k_lif
+        self.v_linear = v_linear
+        self.v_bn = v_bn
+        self.v_lif = v_lif
+        self.attn_lif = attn_lif
+        self.proj_linear = proj_linear
+        self.proj_bn = proj_bn
+        self.proj_lif = proj_lif
+
+    @classmethod
+    def from_ssa(cls, ssa, T):
+        """Convert a 5D spikformer.SSA to 4D, sharing weights."""
+        return cls(
+            dim=ssa.dim, num_heads=ssa.num_heads, scale=ssa.scale, T=T,
+            q_linear=ssa.q_linear, q_bn=ssa.q_bn, q_lif=ssa.q_lif,
+            k_linear=ssa.k_linear, k_bn=ssa.k_bn, k_lif=ssa.k_lif,
+            v_linear=ssa.v_linear, v_bn=ssa.v_bn, v_lif=ssa.v_lif,
+            attn_lif=ssa.attn_lif,
+            proj_linear=ssa.proj_linear, proj_bn=ssa.proj_bn,
+            proj_lif=ssa.proj_lif,
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: (T*B, N, C) token sequence
+
+        Returns:
+            (T*B, N, C) output
+        """
+        TB = x.shape[0]
+        N = x.shape[1]
+        C = self.dim
+        head_dim = self.head_dim
+
+        # Q projection: Linear → BN1d → LIF
+        # BN1d expects (TB, C, N), Linear outputs (TB, N, C)
+        q = self.q_linear(x)                           # (TB, N, C)
+        q = self.q_bn(q.transpose(-1, -2)).transpose(-1, -2)  # BN on channels
+        q = self.q_lif(q)                              # (TB, N, C) — TDL-2 fused
+        q = q.view(TB, N, self.num_heads, head_dim).permute(0, 2, 1, 3)  # (TB, heads, N, head_dim)
+
+        # K projection
+        k = self.k_linear(x)
+        k = self.k_bn(k.transpose(-1, -2)).transpose(-1, -2)
+        k = self.k_lif(k)
+        k = k.view(TB, N, self.num_heads, head_dim).permute(0, 2, 1, 3)
+
+        # V projection
+        v = self.v_linear(x)
+        v = self.v_bn(v.transpose(-1, -2)).transpose(-1, -2)
+        v = self.v_lif(v)
+        v = v.view(TB, N, self.num_heads, head_dim).permute(0, 2, 1, 3)
+
+        # Attention: (Q @ K^T) * scale → @ V
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (TB, heads, N, N)
+        x = attn @ v                                    # (TB, heads, N, head_dim)
+
+        # Merge heads → attn_lif → proj
+        x = x.transpose(1, 2).reshape(TB, N, C)        # (TB, N, C)
+        x = self.attn_lif(x)
+
+        # Output projection: Linear → BN1d → proj_lif
+        x = self.proj_linear(x)
+        x = self.proj_bn(x.transpose(-1, -2)).transpose(-1, -2)
+        x = self.proj_lif(x)
+        return x
+
+
+class SpikformerMLP4D(nn.Module):
+    """4D-native MLP for SpikFormer.
+
+    Original MLP operates on (T, B, N, C) with 5D reshapes for neurons.
+    This version operates on (T*B, N, C).
+    """
+
+    def __init__(self, c_hidden, c_output, T,
+                 fc1_linear=None, fc1_bn=None, fc1_lif=None,
+                 fc2_linear=None, fc2_bn=None, fc2_lif=None):
+        super().__init__()
+        self.c_hidden = c_hidden
+        self.c_output = c_output
+        self.T = T
+        self.fc1_linear = fc1_linear
+        self.fc1_bn = fc1_bn
+        self.fc1_lif = fc1_lif
+        self.fc2_linear = fc2_linear
+        self.fc2_bn = fc2_bn
+        self.fc2_lif = fc2_lif
+
+    @classmethod
+    def from_mlp(cls, mlp, T):
+        """Convert a 5D spikformer.MLP to 4D, sharing weights."""
+        return cls(
+            c_hidden=mlp.c_hidden, c_output=mlp.c_output, T=T,
+            fc1_linear=mlp.fc1_linear, fc1_bn=mlp.fc1_bn, fc1_lif=mlp.fc1_lif,
+            fc2_linear=mlp.fc2_linear, fc2_bn=mlp.fc2_bn, fc2_lif=mlp.fc2_lif,
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: (T*B, N, C)
+        Returns:
+            (T*B, N, C)
+        """
+        x = self.fc1_linear(x)
+        x = self.fc1_bn(x.transpose(-1, -2)).transpose(-1, -2)
+        x = self.fc1_lif(x)
+
+        x = self.fc2_linear(x)
+        x = self.fc2_bn(x.transpose(-1, -2)).transpose(-1, -2)
+        x = self.fc2_lif(x)
+        return x
+
+
+# ── MaxFormer ───────────────────────────────────────────────────────────
+
+
+class MaxFormerSSA4D(nn.Module):
+    """4D-native Spiking Self-Attention for MaxFormer.
+
+    Original SSA operates on (T, B, C, H, W) with 5D reshapes for neurons.
+    This version operates on (T*B, C, H, W).
+
+    Attention pattern (reversed / linear attention):
+        K.T @ V → Q @ result * scale → attn_lif → proj
+    """
+
+    def __init__(self, dim, num_heads, scale, T,
+                 x_lif=None,
+                 q_conv=None, q_bn=None, q_lif=None,
+                 k_conv=None, k_bn=None, k_lif=None,
+                 v_conv=None, v_bn=None, v_lif=None,
+                 attn_lif=None,
+                 proj_conv=None, proj_bn=None):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = scale
+        self.T = T
+
+        self.x_lif = x_lif
+        self.q_conv = q_conv
+        self.q_bn = q_bn
+        self.q_lif = q_lif
+        self.k_conv = k_conv
+        self.k_bn = k_bn
+        self.k_lif = k_lif
+        self.v_conv = v_conv
+        self.v_bn = v_bn
+        self.v_lif = v_lif
+        self.attn_lif = attn_lif
+        self.proj_conv = proj_conv
+        self.proj_bn = proj_bn
+
+    @classmethod
+    def from_ssa(cls, ssa, T):
+        """Convert a 5D maxformer.SSA to 4D, sharing weights."""
+        return cls(
+            dim=ssa.dim, num_heads=ssa.num_heads, scale=ssa.scale, T=T,
+            x_lif=ssa.x_lif,
+            q_conv=ssa.q_conv, q_bn=ssa.q_bn, q_lif=ssa.q_lif,
+            k_conv=ssa.k_conv, k_bn=ssa.k_bn, k_lif=ssa.k_lif,
+            v_conv=ssa.v_conv, v_bn=ssa.v_bn, v_lif=ssa.v_lif,
+            attn_lif=ssa.attn_lif,
+            proj_conv=ssa.proj_conv, proj_bn=ssa.proj_bn,
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: (T*B, C, H, W)
+        Returns:
+            (T*B, C, H, W) with residual already added
+        """
+        TB, C, H, W = x.shape
+        identity = x
+
+        x = self.x_lif(x)                              # (TB, C, H, W) — TDL-2 fused
+        N = H * W
+        x_flat = x.view(TB, C, N)                      # (TB, C, N) for Conv1d
+
+        # Q/K/V projections: Conv1d → BN1d → LIF → head reshape
+        q = self.q_bn(self.q_conv(x_flat))              # (TB, C, N)
+        q = self.q_lif(q)
+        q = q.view(TB, self.num_heads, self.head_dim, N).transpose(-2, -1)  # (TB, heads, N, head_dim)
+
+        k = self.k_bn(self.k_conv(x_flat))
+        k = self.k_lif(k)
+        k = k.view(TB, self.num_heads, self.head_dim, N).transpose(-2, -1)  # (TB, heads, N, head_dim)
+
+        v = self.v_bn(self.v_conv(x_flat))
+        v = self.v_lif(v)
+        v = v.view(TB, self.num_heads, self.head_dim, N).transpose(-2, -1)  # (TB, heads, N, head_dim)
+
+        # Linear attention: K^T @ V → Q @ result * scale
+        kv = k.transpose(-2, -1) @ v                    # (TB, heads, head_dim, head_dim)
+        x = (q @ kv) * self.scale                       # (TB, heads, N, head_dim)
+
+        # Merge heads → (TB, C, N) → attn_lif → proj
+        x = x.transpose(-2, -1).reshape(TB, C, N)       # (TB, C, N)  [heads*head_dim on dim 1]
+        x = self.attn_lif(x)
+        x = self.proj_bn(self.proj_conv(x))              # (TB, C, N)
+        x = x.view(TB, C, H, W)
+
+        return x + identity
+
+
+class TokenQKA4D(nn.Module):
+    """4D-native Token Q-K Attention for MS_QKFormer.
+
+    Original operates on (T, B, C, H, W) with 5D reshapes.
+    This version operates on (T*B, C, H, W).
+
+    Attention pattern: sum(Q, head_dim) → attn_lif → Q * K → proj
+    """
+
+    def __init__(self, dim, num_heads, T,
+                 proj_lif=None,
+                 q_conv=None, q_bn=None, q_lif=None,
+                 k_conv=None, k_bn=None, k_lif=None,
+                 attn_lif=None,
+                 proj_conv=None, proj_bn=None):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.T = T
+
+        self.proj_lif = proj_lif
+        self.q_conv = q_conv
+        self.q_bn = q_bn
+        self.q_lif = q_lif
+        self.k_conv = k_conv
+        self.k_bn = k_bn
+        self.k_lif = k_lif
+        self.attn_lif = attn_lif
+        self.proj_conv = proj_conv
+        self.proj_bn = proj_bn
+
+    @classmethod
+    def from_qka(cls, qka, T):
+        """Convert a 5D maxformer.Token_QK_Attention to 4D, sharing weights."""
+        return cls(
+            dim=qka.dim, num_heads=qka.num_heads, T=T,
+            proj_lif=qka.proj_lif,
+            q_conv=qka.q_conv, q_bn=qka.q_bn, q_lif=qka.q_lif,
+            k_conv=qka.k_conv, k_bn=qka.k_bn, k_lif=qka.k_lif,
+            attn_lif=qka.attn_lif,
+            proj_conv=qka.proj_conv, proj_bn=qka.proj_bn,
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: (T*B, C, H, W)
+        Returns:
+            (T*B, C, H, W) with residual already added
+        """
+        TB, C, H, W = x.shape
+        identity = x
+        N = H * W
+
+        x = self.proj_lif(x)                            # (TB, C, H, W) — TDL-2 fused
+        x_flat = x.view(TB, C, N)                       # (TB, C, N) for Conv1d
+
+        # Q: Conv1d → BN → LIF → head reshape
+        q = self.q_bn(self.q_conv(x_flat))               # (TB, C, N)
+        q = self.q_lif(q)
+        q = q.view(TB, self.num_heads, self.head_dim, N) # (TB, heads, head_dim, N)
+
+        # K: Conv1d → BN → LIF → head reshape
+        k = self.k_bn(self.k_conv(x_flat))
+        k = self.k_lif(k)
+        k = k.view(TB, self.num_heads, self.head_dim, N) # (TB, heads, head_dim, N)
+
+        # Scalar attention: sum Q over head_dim → LIF → multiply with K
+        attn = q.sum(dim=2, keepdim=True)                # (TB, heads, 1, N)
+        attn = self.attn_lif(attn)
+        x = torch.mul(attn, k)                           # (TB, heads, head_dim, N)
+
+        # Merge heads → proj
+        x = x.reshape(TB, C, N)                          # (TB, C, N)
+        x = self.proj_bn(self.proj_conv(x))
+        x = x.view(TB, C, H, W)
+
+        return x + identity

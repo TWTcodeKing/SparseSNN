@@ -127,13 +127,59 @@ def is_stateless_wrapper(module: nn.Module) -> bool:
 
 
 def is_spike_attention(module: nn.Module) -> bool:
-    """Check if a module is a spike-driven attention block (e.g., DSSA).
+    """Check if a module is a spike-driven attention block.
 
-    Detected by structure: has num_heads attr + firing_rate buffers.
+    Detects three families:
+      - DSSA (SpikingResformer): num_heads + firing_rate_x/attn buffers
+      - SSA  (SpikFormer/MaxFormer): num_heads + q_lif/k_lif/v_lif neurons
+      - Token_QK_Attention (MS_QKFormer): num_heads + q_lif/k_lif (no v_lif)
     """
-    return (hasattr(module, 'num_heads')
-            and hasattr(module, 'firing_rate_x')
-            and hasattr(module, 'firing_rate_attn'))
+    if not hasattr(module, 'num_heads'):
+        return False
+    # DSSA pattern
+    if hasattr(module, 'firing_rate_x') and hasattr(module, 'firing_rate_attn'):
+        return True
+    # SSA / Token_QK_Attention pattern: has q_lif and k_lif neuron children
+    if hasattr(module, 'q_lif') and hasattr(module, 'k_lif'):
+        if is_neuron(module.q_lif) and is_neuron(module.k_lif):
+            return True
+    return False
+
+
+def get_attention_type(module: nn.Module) -> str | None:
+    """Classify which attention variant a module is.
+
+    Returns:
+        'dssa'          — SpikingResformer DSSA
+        'spikformer_ssa' — SpikFormer SSA (Linear QKV, standard matmul)
+        'maxformer_ssa'  — MaxFormer SSA (Conv1d QKV, reversed matmul)
+        'token_qka'      — MS_QKFormer Token_QK_Attention (no V)
+        None             — not an attention module
+    """
+    if not is_spike_attention(module):
+        return None
+    # DSSA: has firing_rate buffers
+    if hasattr(module, 'firing_rate_x'):
+        return 'dssa'
+    # SpikFormer SSA: has q_linear (nn.Linear projections)
+    if hasattr(module, 'q_linear'):
+        return 'spikformer_ssa'
+    # Distinguish MaxFormer SSA vs Token_QK_Attention:
+    # SSA has v_conv/v_lif; Token_QK_Attention does not
+    if hasattr(module, 'v_conv') and hasattr(module, 'v_lif'):
+        return 'maxformer_ssa'
+    if hasattr(module, 'q_conv') and not hasattr(module, 'v_conv'):
+        return 'token_qka'
+    return None
+
+
+def is_spikformer_mlp(module: nn.Module) -> bool:
+    """Check if a module is a SpikFormer MLP (Linear + BN1d + LIF).
+
+    Detected by: fc1_linear + fc1_bn + fc1_lif + fc2_linear.
+    """
+    return (hasattr(module, 'fc1_linear') and hasattr(module, 'fc1_bn')
+            and hasattr(module, 'fc1_lif') and hasattr(module, 'fc2_linear'))
 
 
 def classify_modules(model: nn.Module) -> OrderedDict:

@@ -550,7 +550,8 @@ class SEngine:
                         KernelVariant.FusedTokenQKAttn):
                 ap = node.attention_params
                 so_paths = self._kernel_so_map.get(nid)
-                if ap is None or not isinstance(so_paths, tuple) or len(so_paths) != 2:
+                if (ap is None or so_paths is None
+                        or not isinstance(so_paths, tuple) or len(so_paths) < 2):
                     exe.set_skip_node(nid)
                     continue
 

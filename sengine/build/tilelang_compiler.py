@@ -641,8 +641,12 @@ class TileLangCompiler:
         heads = ap.num_heads
         hd = ap.head_dim
         C = heads * hd
-        shape0 = node.input_shapes[0] if node.input_shapes else ()
+        if not node.input_shapes or not node.input_shapes[0]:
+            return None
+        shape0 = node.input_shapes[0]
         TB = shape0[0] if shape0 else self.TB
+        if TB <= 0 or C <= 0:
+            return None
         batch = TB * heads
 
         if ap.variant == "spikformer":
@@ -650,7 +654,9 @@ class TileLangCompiler:
             total = 1
             for d in shape0:
                 total *= d
-            N = total // (TB * C) if (TB * C) > 0 else 1
+            N = total // (TB * C) if (TB * C) > 0 else 0
+            if N <= 0:
+                return None
             # GEMM1: attn_scores = Q @ K^T, per head: (N,hd)@(hd,N)=(N,N)
             g1_batch, g1_M, g1_K, g1_N = batch, N, hd, N
             g1_scale = ap.scale

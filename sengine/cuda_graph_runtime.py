@@ -716,7 +716,8 @@ class CUDAGraphEngine:
                             for in_name in pn.input_names:
                                 w = self.ir.weights.get(in_name)
                                 if w is not None:
-                                    wt = torch.from_numpy(w).half().cuda() if not isinstance(w, torch.Tensor) else w.half().cuda()
+                                    import numpy as np
+                                    wt = torch.from_numpy(w.copy()).half().cuda() if isinstance(w, np.ndarray) else w.half().cuda()
                                     if perm and len(perm) == wt.ndim:
                                         wt = wt.permute(*perm).contiguous()
                                     inputs.append(wt)
@@ -843,7 +844,14 @@ class CUDAGraphEngine:
                     for in_name in node.input_names:
                         w = self.ir.weights.get(in_name)
                         if w is not None:
-                            inputs = [w.half().to('cuda')]
+                            import numpy as np
+                            if isinstance(w, np.ndarray):
+                                wt = torch.from_numpy(w.copy()).half().cuda()
+                            elif isinstance(w, torch.Tensor):
+                                wt = w.half().cuda()
+                            else:
+                                continue
+                            inputs = [wt]
                             break
                 if perm and inputs:
                     t = inputs[0]

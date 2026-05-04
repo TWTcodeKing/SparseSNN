@@ -119,9 +119,18 @@ class SEngine:
         eng._kernel_so_map = export_all_kernels(
             eng._kernels, eng._ir, build_dir, nvcc=nvcc, arch=arch)
 
-        # 3. Wire up C++ executor
+        # 3. Wire up C++ executor (if all attention kernels are compiled)
+        has_uncompiled_attn = any(
+            isinstance(eng._kernel_so_map.get(nid), type(None))
+            for nid in eng._schedule
+            if eng._ir.nodes.get(nid) and eng._ir.nodes[nid].op_type == OpType.FusedAttention
+        )
         if eng._py_engine._lazy_mode:
             logger.phase("BUILD", "Lazy mode: using Python runtime (OOM during pre-allocation)")
+            eng._graph_captured = True
+            eng._use_python_runtime = True
+        elif has_uncompiled_attn:
+            logger.phase("BUILD", "Python runtime: uncompiled attention kernels (DSSA/TokenQK)")
             eng._graph_captured = True
             eng._use_python_runtime = True
         else:
@@ -592,6 +601,9 @@ class SEngine:
                     exe.set_skip_node(nid)
                     continue
 
+                if ws_total <= 0:
+                    exe.set_skip_node(nid)
+                    continue
                 workspace = torch.empty(ws_total, dtype=torch.float16, device='cuda')
                 self._attn_workspaces = getattr(self, '_attn_workspaces', [])
                 self._attn_workspaces.append(workspace)

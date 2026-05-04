@@ -36,6 +36,11 @@ TILELANG_VARIANTS = frozenset({
     KernelVariant.TileLangFusedConv1x1BNIF,
     KernelVariant.TileLangLinearBN,
     KernelVariant.TileLangLinearBNLIF,
+    KernelVariant.TileLangDWConvBN,
+    KernelVariant.TileLangFusedDWConvBNIF,
+    KernelVariant.TileLangGroupedConvBN,
+    KernelVariant.TileLangMatMulScale,
+    KernelVariant.TileLangFusedMatMulLIF,
 })
 
 
@@ -65,6 +70,7 @@ class SEngine:
     def __init__(self):
         self._py_engine = None      # CUDAGraphEngine (Python, for buffer management)
         self._cpp_exec: Optional[CppExecutor] = None
+        self._use_python_runtime: bool = False
         self._ir: Optional[EngineIR] = None
         self._schedule: list[int] = []
         self._kernels: dict = {}
@@ -108,22 +114,28 @@ class SEngine:
 
         # 2. Export TileLang kernels as standalone .so
         if build_dir is None:
-            build_dir = f'/tmp/sengine_B{batch_size}'
+            build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                     '.cache', f'sengine_B{batch_size}')
         eng._kernel_so_map = export_all_kernels(
             eng._kernels, eng._ir, build_dir, nvcc=nvcc, arch=arch)
 
         # 3. Wire up C++ executor
-        eng._setup_cpp_executor()
+        if eng._py_engine._lazy_mode:
+            logger.phase("BUILD", "Lazy mode: using Python runtime (OOM during pre-allocation)")
+            eng._graph_captured = True
+            eng._use_python_runtime = True
+        else:
+            eng._setup_cpp_executor()
+            eng._cpp_exec.capture_graph()
+            eng._cpp_exec.sync()
+            torch.cuda.synchronize()
+            eng._use_python_runtime = False
 
-        # 4. Capture CUDA Graph
-        eng._cpp_exec.capture_graph()
-        eng._cpp_exec.sync()
-        # Drain any deferred CUDA errors from graph capture
-        torch.cuda.synchronize()
         eng._graph_captured = True
 
         elapsed = time.time() - t0
-        logger.phase("BUILD", "Ready in %.1fs (%d ops, C++ CUDA Graph captured)", elapsed, len(eng._schedule))
+        mode = "Python lazy" if eng._use_python_runtime else "C++ CUDA Graph"
+        logger.phase("BUILD", "Ready in %.1fs (%d ops, %s)", elapsed, len(eng._schedule), mode)
         return eng
 
     # ─── Save / Load ───
@@ -179,7 +191,8 @@ class SEngine:
 
         # 4. Export standalone .so + C++ executor
         if build_dir is None:
-            build_dir = f'/tmp/sengine_B{batch_size}'
+            build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                     '.cache', f'sengine_B{batch_size}')
         eng._kernel_so_map = export_all_kernels(
             eng._kernels, ir, build_dir, nvcc=nvcc, arch=arch)
         eng._setup_cpp_executor()
@@ -201,6 +214,14 @@ class SEngine:
         Returns:
             Output numpy array (e.g., class logits).
         """
+        # Python runtime path (CuDNNConv or lazy mode)
+        if getattr(self, '_use_python_runtime', False):
+            x_torch = torch.from_numpy(x).cuda()
+            out = self._py_engine(x_torch)
+            if out is not None:
+                return out.float().cpu().numpy()
+            return np.zeros(1)
+
         import ctypes as ct
 
         graph_input = self._py_engine._graph_input
@@ -255,6 +276,8 @@ class SEngine:
         """Return mean inference latency in milliseconds."""
         if not self._graph_captured:
             raise RuntimeError("Engine not built — call build() or load() first")
+        if getattr(self, '_use_python_runtime', False):
+            return self._py_engine.benchmark(warmup=warmup, n_iters=iters)
         return self._cpp_exec.benchmark(warmup, iters)
 
     # ─── Cleanup ───
@@ -271,6 +294,23 @@ class SEngine:
 
     # ─── Internals ───
 
+    @staticmethod
+    def _resolve_buf(act, ir, nid, max_depth=10):
+        """Find the activation buffer for a node, tracing through ZeroCost predecessors."""
+        buf = act.get(nid)
+        if buf is not None:
+            return buf
+        cur = nid
+        for _ in range(max_depth):
+            pp = ir.predecessors(cur)
+            if not pp:
+                return None
+            buf = act.get(pp[0])
+            if buf is not None:
+                return buf
+            cur = pp[0]
+        return None
+
     def _setup_cpp_executor(self):
         """Wire the C++ executor to the Python engine's GPU buffers."""
         exe = CppExecutor()
@@ -283,9 +323,11 @@ class SEngine:
         exe.alloc_nodes(max_nid)
         exe.set_schedule(schedule)
 
-        # Load TileLang .so files
+        # Load TileLang .so files (skip tuples — fused attention loads separately)
         nid_tl_idx = {}
         for nid, so_path in self._kernel_so_map.items():
+            if isinstance(so_path, tuple):
+                continue  # fused attention: loaded in the handler below
             tl_idx = exe.load_tilelang(so_path)
             nid_tl_idx[nid] = tl_idx
 
@@ -303,37 +345,80 @@ class SEngine:
 
             kv = node.assigned_kernel
             preds = ir.predecessors(nid)
-            input_nid = preds[0] if preds else nid
-            input_buf = act.get(input_nid)
+            # Find the best input buffer from ALL predecessors.
+            # Prefer LayoutTranspose (reformat) over ZeroCost chains.
+            input_buf = None
+            for pid in preds:
+                buf = act.get(pid)
+                if buf is not None:
+                    input_buf = buf
+                    break
+            if input_buf is None:
+                for pid in preds:
+                    buf = self._resolve_buf(act, ir, pid)
+                    if buf is not None:
+                        input_buf = buf
+                        break
             output_buf = act.get(nid)
             p = lambda t: t.data_ptr()  # noqa: E731
 
             if kv in TILELANG_VARIANTS and nid in nid_tl_idx:
                 tl_idx = nid_tl_idx[nid]
+
+                # MatMul variants: 3-arg TileLang (A, B, output) or cuBLAS fallback
+                if kv in (KernelVariant.TileLangMatMul,
+                          KernelVariant.TileLangMatMulScale):
+                    if len(preds) >= 2 and output_buf is not None:
+                        a = self._resolve_buf(act, ir, preds[0])
+                        b = self._resolve_buf(act, ir, preds[1])
+                        if a is not None and b is not None:
+                            kern = engine.kernels.get(nid)
+                            if kern is not None and nid in nid_tl_idx:
+                                exe.set_tilelang_3(nid, nid_tl_idx[nid],
+                                                    p(a), p(b), p(output_buf))
+                            else:
+                                # No TileLang kernel (dim alignment issue) → cuBLAS
+                                M = a.shape[0]
+                                K = a.shape[-1] if a.ndim >= 2 else 1
+                                N = b.shape[-1] if b.ndim >= 2 else 1
+                                exe.set_gemm_node(nid, p(a), p(b), p(output_buf), M, K, N)
+                        else:
+                            exe.set_skip_node(nid)
+                    else:
+                        exe.set_skip_node(nid)
+                    continue
+
+                # Fused Conv/Linear+BN+IF: 6-arg (input, weight, membrane, scale, bias, output)
                 w = engine.weights.get(nid)
                 if w is None:
                     w = engine.weights_1x1.get(nid)
                 sc = engine.bn_scales.get(nid)
                 bi = engine.bn_biases.get(nid)
 
-                if input_buf is None or w is None or output_buf is None:
+                if input_buf is None or output_buf is None:
                     exe.set_skip_node(nid)
                     continue
 
                 if kv in (KernelVariant.TileLangFusedConvBNIF,
-                          KernelVariant.TileLangFusedConv1x1BNIF):
+                          KernelVariant.TileLangFusedConv1x1BNIF,
+                          KernelVariant.TileLangLinearBNLIF,
+                          KernelVariant.TileLangFusedMatMulLIF):
                     mem = None
                     for s in ir.successors(nid):
                         if s in engine.membranes:
                             mem = engine.membranes[s]
                             break
-                    if mem is not None and sc is not None and bi is not None:
+                    if w is not None and mem is not None and sc is not None and bi is not None:
                         exe.set_tilelang_6(nid, tl_idx,
                             p(input_buf), p(w), p(mem), p(sc), p(bi), p(output_buf))
+                    elif w is not None and mem is not None:
+                        # MatMul+LIF: 4-arg (A, B, membrane, spikes)
+                        exe.set_tilelang_3(nid, tl_idx, p(input_buf), p(w), p(output_buf))
                     else:
                         exe.set_skip_node(nid)
                 else:
-                    if sc is not None and bi is not None:
+                    # Conv+BN, Linear+BN: 5-arg (input, weight, scale, bias, output)
+                    if w is not None and sc is not None and bi is not None:
                         exe.set_tilelang_5(nid, tl_idx,
                             p(input_buf), p(w), p(sc), p(bi), p(output_buf))
                     else:
@@ -357,8 +442,8 @@ class SEngine:
 
             elif kv == KernelVariant.Elementwise:
                 if node.op_type == OpType.Add and len(preds) >= 2:
-                    a = act.get(preds[0])
-                    b = act.get(preds[1])
+                    a = self._resolve_buf(act, ir, preds[0])
+                    b = self._resolve_buf(act, ir, preds[1])
                     if a is not None and b is not None and output_buf is not None:
                         exe.set_add_node(nid, p(a), p(b), p(output_buf),
                                         min(a.numel(), b.numel()))
@@ -410,6 +495,122 @@ class SEngine:
                                       min(input_buf.numel(), output_buf.numel()))
                 else:
                     exe.set_skip_node(nid)
+
+            elif kv == KernelVariant.LayoutTranspose:
+                perm = node.extra_attrs.get("perm")
+                if input_buf is not None and output_buf is not None and perm and len(perm) == 4:
+                    s = input_buf.shape
+                    if len(s) == 4:
+                        # direction: 0=NHWC→NCHW (perm 0,3,1,2), 1=NCHW→NHWC (perm 0,2,3,1)
+                        direction = 1 if perm == [0, 2, 3, 1] else 0
+                        N, d1, d2, d3 = s
+                        if direction == 0:
+                            # Input is NHWC (N,H,W,C): H=d1, W=d2, C=d3
+                            exe.set_layout_transpose_node(nid, p(input_buf), p(output_buf),
+                                                           N, d1, d2, d3, direction)
+                        else:
+                            # Input is NCHW (N,C,H,W): C=d1, H=d2, W=d3
+                            exe.set_layout_transpose_node(nid, p(input_buf), p(output_buf),
+                                                           N, d2, d3, d1, direction)
+                    else:
+                        exe.set_skip_node(nid)
+                else:
+                    exe.set_skip_node(nid)
+
+            elif kv == KernelVariant.CuDNNConv:
+                # Stem Conv (C_in<4): use naive CUDA Conv kernel
+                w = engine.weights.get(nid)
+                sc = engine.bn_scales.get(nid)
+                bi = engine.bn_biases.get(nid)
+                cp = node.conv_params
+                if input_buf is not None and output_buf is not None and w is not None and cp and sc is not None and bi is not None:
+                    s = input_buf.shape  # NHWC: (TB, H, W, C_in)
+                    OH = (s[1] + 2*cp.pad_h - cp.kernel_h) // cp.stride_h + 1
+                    OW = (s[2] + 2*cp.pad_w - cp.kernel_w) // cp.stride_w + 1
+                    exe.set_naive_conv_node(nid,
+                        p(input_buf), p(w), p(sc), p(bi), p(output_buf),
+                        s[0], s[1], s[2], cp.in_channels, cp.out_channels,
+                        cp.kernel_h, cp.kernel_w, cp.stride_h, cp.pad_h, OH, OW,
+                        cp.groups)
+                else:
+                    exe.set_skip_node(nid)
+
+            elif kv in (KernelVariant.FusedSpikformerAttn,
+                        KernelVariant.FusedMaxformerAttn,
+                        KernelVariant.FusedDSSAAttn,
+                        KernelVariant.FusedTokenQKAttn):
+                ap = node.attention_params
+                so_paths = self._kernel_so_map.get(nid)
+                if ap is None or not isinstance(so_paths, tuple) or len(so_paths) != 2:
+                    exe.set_skip_node(nid)
+                    continue
+
+                # Load both TileLang .so kernels
+                gemm1_idx = exe.load_tilelang(so_paths[0])
+                gemm2_idx = exe.load_tilelang(so_paths[1])
+
+                variant_map = {"spikformer": 0, "maxformer": 1, "dssa": 2, "token_qk": 3}
+                variant = variant_map.get(ap.variant, 0)
+                C = ap.num_heads * ap.head_dim
+                heads = ap.num_heads
+                hd = ap.head_dim
+
+                # Gather predecessor buffers
+                pred_bufs = [act.get(pid) for pid in preds if act.get(pid) is not None]
+                q_buf = pred_bufs[0] if len(pred_bufs) > 0 else None
+                k_buf = pred_bufs[1] if len(pred_bufs) > 1 else None
+                v_buf = pred_bufs[2] if len(pred_bufs) > 2 else None
+
+                if q_buf is None or output_buf is None:
+                    exe.set_skip_node(nid)
+                    continue
+
+                mem = engine.membranes.get(nid)
+                TB = q_buf.shape[0]
+                N = ap.H * ap.W if ap.H > 0 else (q_buf.numel() // (TB * C))
+                batch = TB * heads
+
+                # Compute workspace: permuted Q/K/V + GEMM1 output
+                if variant == 0:  # SpikFormer — still needs permute workspace
+                    perm_size = TB * N * C
+                    gemm1_size = batch * N * N
+                    needs_permute = 0
+                    ws_perm_q = 0
+                    ws_perm_k = perm_size
+                    ws_perm_v = perm_size * 2
+                    ws_gemm1 = perm_size * 3
+                    ws_total = perm_size * 3 + gemm1_size
+                elif variant == 1:  # MaxFormer — fused NHWC kernels, only kv workspace
+                    gemm1_size = batch * hd * hd
+                    needs_permute = 0
+                    ws_perm_q = 0
+                    ws_perm_k = 0
+                    ws_perm_v = 0
+                    ws_gemm1 = 0
+                    ws_total = gemm1_size
+                else:
+                    exe.set_skip_node(nid)
+                    continue
+
+                workspace = torch.empty(ws_total, dtype=torch.float16, device='cuda')
+                self._attn_workspaces = getattr(self, '_attn_workspaces', [])
+                self._attn_workspaces.append(workspace)
+
+                lif_total = q_buf.numel()
+                lif_spatial = mem.numel() if mem is not None else 0
+                recip_tau = 1.0 / ap.attn_lif_tau if ap.attn_lif_tau > 0 else 0.5
+
+                exe.set_fused_attn_node(
+                    nid, variant, gemm1_idx, gemm2_idx,
+                    p(q_buf), p(k_buf) if k_buf is not None else 0,
+                    p(v_buf) if v_buf is not None else 0,
+                    p(output_buf),
+                    p(workspace), p(mem) if mem is not None else 0,
+                    TB, heads, hd, N, ap.H, ap.W,
+                    lif_total, lif_spatial,
+                    ap.attn_lif_v_threshold, recip_tau,
+                    needs_permute, 0, 0,
+                    ws_gemm1, ws_perm_q, ws_perm_k, ws_perm_v)
 
             else:
                 exe.set_skip_node(nid)

@@ -16,7 +16,8 @@ from sengine.logger import logger
 
 from sengine.ir import (
     OpType, NeuronType, KernelVariant, TensorLayout, BoundType,
-    Node, FusionGroup, EngineIR,
+    Node, Edge, FusionGroup, EngineIR,
+    KERNEL_CONTRACTS,
 )
 
 
@@ -45,6 +46,12 @@ def optimize_ir(ir: EngineIR, tilelang: bool = False,
     if tilelang:
         propagate_shapes(ir, batch_size=batch_size)
         classify_bound_and_assign_tilelang(ir, batch_size=batch_size)
+        propagate_edge_layouts(ir)
+        n_reformats = insert_layout_reformats(ir)
+        if n_reformats > 0:
+            ir.build_edges()
+            ir.compute_topo_order()
+            propagate_edge_layouts(ir)
 
     logger.phase("OPT", "Done: %d nodes, %d fusion groups, %d sparse layers",
                  len(ir.nodes), len(ir.fusion_groups),
@@ -188,15 +195,266 @@ def fold_batchnorm(ir: EngineIR):
 # Pass 2: Fusion Group Detection
 # ============================================================
 
+_TRANSPARENT_OPS = {OpType.Reshape, OpType.Transpose, OpType.Identity, OpType.Flatten}
+
+
+def _find_neuron_through_transparent(ir: EngineIR, start_nid: int, max_depth: int = 3):
+    """Follow single-consumer transparent ops to find a neuron node."""
+    cur = start_nid
+    for _ in range(max_depth):
+        succs = ir.successors(cur)
+        if len(succs) != 1:
+            return None
+        s = ir.nodes.get(succs[0])
+        if s is None:
+            return None
+        if s.op_type in (OpType.IF, OpType.LIF, OpType.MS):
+            return s
+        if s.op_type in _TRANSPARENT_OPS:
+            cur = s.id
+            continue
+        return None
+    return None
+
+
+def _trace_through_zerocost(ir: EngineIR, start_nid: int,
+                            target_ops: set, max_depth: int = 5):
+    """Follow single-consumer transparent ops to find a node of target type.
+
+    Returns the target Node, or None.
+    """
+    cur = start_nid
+    for _ in range(max_depth):
+        succs = ir.successors(cur)
+        if len(succs) != 1:
+            return None
+        s = ir.nodes.get(succs[0])
+        if s is None:
+            return None
+        if s.op_type in target_ops:
+            return s
+        if s.op_type in _TRANSPARENT_OPS:
+            cur = s.id
+            continue
+        return None
+    return None
+
+
+def _find_scale_node(ir: EngineIR, start_nid: int, max_depth: int = 3):
+    """Find a Scale or broadcastable-constant Mul successor through zero-cost ops.
+
+    Handles two patterns:
+      - OpType.Scale: Mul where one operand is a scalar constant (parser-detected)
+      - OpType.Mul with constant: Mul where one operand is a constant tensor
+        (e.g. DSSA4D scale buffers with shape (1, heads, 1, 1))
+
+    Returns (node, scale_value) or (None, None).
+    """
+    cur = start_nid
+    for _ in range(max_depth):
+        succs = ir.successors(cur)
+        if len(succs) != 1:
+            return None, None
+        s = ir.nodes.get(succs[0])
+        if s is None:
+            return None, None
+        if s.op_type == OpType.Scale:
+            return s, s.extra_attrs.get("scale_value", 1.0)
+        if s.op_type == OpType.Mul:
+            # Check if one input is a constant (broadcastable scale).
+            # DSSA4D emits per-head scale tensors like (1, heads, 1, 1) —
+            # if all elements are the same value, treat as uniform scalar.
+            for inp_name in s.input_names:
+                if inp_name in ir.weights:
+                    w = ir.weights[inp_name]
+                    if w.size == 0:
+                        continue
+                    if w.size == 1:
+                        return s, float(w.flat[0])
+                    # Small constant with uniform values → scalar scale
+                    if w.size <= 64 and w.min() == w.max():
+                        return s, float(w.flat[0])
+            return None, None
+        if s.op_type in _TRANSPARENT_OPS:
+            cur = s.id
+            continue
+        return None, None
+    return None, None
+
+
+def _detect_attention_matmul_patterns(ir: EngineIR, FUSED_THRESHOLD: int):
+    """Detect attention matmul patterns and assign optimized kernels.
+
+    Supported patterns (all architectures):
+
+    SpikFormer SSA:       Q@K^T → Scale(0.125) → attn@V → ... → attn_lif
+    MaxFormer SSA:        K^T@V → Q@KV → Scale(0.125) → ... → attn_lif
+    SpikingResformer DSSA: Y1^T@X → Mul(scale1) → attn_lif → Y2@attn → Mul(scale2) → lif
+
+    Detection rules per MatMul node:
+    1. If successor (through zero-cost ops) is Scale/Mul-constant:
+       → Absorb scale into MatMul epilogue (TileLangMatMulScale)
+       → Then check if Scale's successor is a LIF → fused/decomposed
+    2. If successor (through zero-cost ops) is LIF/IF directly:
+       → Apply fused/decomposed threshold (no scale absorption)
+    3. Otherwise: keep as plain TileLangMatMul
+
+    Returns (n_matmulscale, n_fused_matmullif, n_decomposed) for logging.
+    """
+    n_matmulscale = n_fused = n_decomposed = 0
+
+    for nid in ir.topo_order:
+        node = ir.nodes.get(nid)
+        if node is None or node.op_type != OpType.MatMul:
+            continue
+        if node.assigned_kernel != KernelVariant.TileLangMatMul:
+            continue  # already reassigned
+
+        # Try to find a Scale/Mul-constant successor
+        scale_node, scale_value = _find_scale_node(ir, nid, max_depth=3)
+
+        if scale_node is not None and scale_value is not None:
+            # Absorb Scale into MatMul epilogue
+            node.assigned_kernel = KernelVariant.TileLangMatMulScale
+            node.extra_attrs["scale_value"] = scale_value
+            node.bound_type = BoundType.COMPUTE
+            scale_node.assigned_kernel = KernelVariant.ZeroCost
+            scale_node.bound_type = BoundType.ZERO
+
+            # Now check: does the Scale feed into a LIF through zero-cost ops?
+            # This handles MatMul→Scale→...→LIF chains (MaxFormer, DSSA)
+            neuron = _find_neuron_through_transparent(ir, scale_node.id, max_depth=5)
+            if neuron is not None:
+                n_matmulscale += 1  # scale was absorbed
+                # Apply fused/decomposed decision for the LIF
+                M_per_t = _matmul_M_per_t(node, ir)
+                if M_per_t >= FUSED_THRESHOLD:
+                    node.assigned_kernel = KernelVariant.TileLangFusedMatMulLIF
+                    node.neuron_params = neuron.neuron_params
+                    neuron.assigned_kernel = KernelVariant.ZeroCost
+                    neuron.bound_type = BoundType.ZERO
+                    n_fused += 1
+                else:
+                    n_decomposed += 1
+            else:
+                # Scale absorbed but no LIF — just MatMulScale
+                n_matmulscale += 1
+            continue
+
+        if scale_node is not None and scale_value is None:
+            # Mul with non-scalar constant (e.g. per-head scale tensor) —
+            # can't embed in kernel epilogue, leave as separate Elementwise
+            pass
+
+        # No Scale found — check for direct LIF successor
+        neuron = _find_neuron_through_transparent(ir, nid, max_depth=5)
+        if neuron is not None:
+            M_per_t = _matmul_M_per_t(node, ir)
+            if M_per_t >= FUSED_THRESHOLD:
+                node.assigned_kernel = KernelVariant.TileLangFusedMatMulLIF
+                node.neuron_params = neuron.neuron_params
+                node.bound_type = BoundType.COMPUTE
+                neuron.assigned_kernel = KernelVariant.ZeroCost
+                neuron.bound_type = BoundType.ZERO
+                n_fused += 1
+            else:
+                node.assigned_kernel = KernelVariant.TileLangMatMulScale
+                node.extra_attrs["scale_value"] = 1.0
+                node.bound_type = BoundType.COMPUTE
+                n_decomposed += 1
+            continue
+
+    return n_matmulscale, n_fused, n_decomposed
+
+
+def _matmul_M_per_t(node, ir):
+    """Compute per-timestep M dimension for a MatMul node."""
+    if not node.output_shapes or len(node.output_shapes[0]) < 2:
+        return 0
+    M_full = node.output_shapes[0][0]
+    T_val = ir.T if ir.T > 0 else 4
+    return M_full // T_val
+
+
+_ATTN_KERNEL_VARIANTS = {
+    KernelVariant.TileLangMatMulScale,
+    KernelVariant.TileLangFusedMatMulLIF,
+    KernelVariant.TileLangMatMul,
+}
+
+
+def _mark_attention_conv_cudnn(ir: EngineIR) -> int:
+    """Mark Conv nodes adjacent to attention MatMul ops as CuDNNConv.
+
+    Attention Conv projections (Q/K/V/Wproj) have ONNX shapes that may not
+    match TileLang's NHWC layout after attention Reshape/Transpose ops.
+    cuDNN handles any layout natively and is equally fast for these small ops.
+
+    Detection: walk backwards from each attention MatMul through zero-cost
+    ops to find Conv/LIF/BN predecessors, then walk further to find their
+    Conv predecessors.
+    """
+    # Collect all attention MatMul node IDs
+    attn_matmul_nids = set()
+    for nid in ir.topo_order:
+        node = ir.nodes.get(nid)
+        if node and node.assigned_kernel in _ATTN_KERNEL_VARIANTS:
+            attn_matmul_nids.add(nid)
+
+    if not attn_matmul_nids:
+        return 0
+
+    # BFS both directions from attention MatMuls to find ALL Conv/Linear
+    # nodes within attention blocks (Q/K/V projections, proj, MLP convs).
+    _CONTINUE_OPS = _TRANSPARENT_OPS | _NEURON_OPS | {
+        OpType.Add, OpType.Scale, OpType.Mul, OpType.Sub,
+    }
+    attn_conv_nids = set()
+    visited = set(attn_matmul_nids)
+    queue = list(attn_matmul_nids)
+    max_depth = 12
+
+    for _ in range(max_depth):
+        next_queue = []
+        for nid in queue:
+            # Walk both predecessors and successors
+            neighbors = ir.predecessors(nid) + ir.successors(nid)
+            for nb_nid in neighbors:
+                if nb_nid in visited:
+                    continue
+                visited.add(nb_nid)
+                nb = ir.nodes.get(nb_nid)
+                if nb is None:
+                    continue
+                if nb.op_type in (OpType.Conv2d, OpType.Linear):
+                    attn_conv_nids.add(nb_nid)
+                    next_queue.append(nb_nid)
+                elif nb.op_type in _CONTINUE_OPS:
+                    next_queue.append(nb_nid)
+        queue = next_queue
+
+    # Mark attention Conv/Linear nodes as cuDNN/cuBLAS fallback
+    count = 0
+    for nid in attn_conv_nids:
+        node = ir.nodes[nid]
+        if node.op_type == OpType.Conv2d:
+            if node.assigned_kernel not in (KernelVariant.CuDNNConv,):
+                node.assigned_kernel = KernelVariant.CuDNNConv
+                count += 1
+        elif node.op_type == OpType.Linear:
+            if node.assigned_kernel not in (KernelVariant.CuBLASGemm,):
+                node.assigned_kernel = KernelVariant.CuBLASGemm
+                count += 1
+
+    return count
+
+
 def detect_fusion_groups(ir: EngineIR):
-    """Detect Conv→Neuron patterns and create FusionGroups.
+    """Detect Conv→(Reshape/Transpose)→Neuron patterns and create FusionGroups.
 
-    A fusion group requires:
-    - Conv node has exactly one consumer
-    - That consumer is a neuron node (IF/LIF/MS)
-    - No other node consumes the Conv output
-
-    The BN is already folded into Conv, so the pattern is Conv→Neuron directly.
+    Looks through transparent ops (Reshape, Transpose, Identity) between
+    Conv and Neuron. This handles transformer models where TDL inserts
+    reshapes between Conv output and the neuron.
     """
     ir.fusion_groups.clear()
     group_id = 0
@@ -206,36 +464,29 @@ def detect_fusion_groups(ir: EngineIR):
         if node is None or node.op_type != OpType.Conv2d:
             continue
         if node.fusion_group_id >= 0:
-            continue  # already in a group
-
-        # Check if Conv has exactly one consumer that is a neuron
-        succs = ir.successors(nid)
-        if len(succs) != 1:
-            continue
-        succ = ir.nodes.get(succs[0])
-        if succ is None or succ.op_type not in (OpType.IF, OpType.LIF, OpType.MS):
             continue
 
-        # Check that the neuron's only input comes from this Conv
-        neuron_preds = ir.predecessors(succ.id)
-        if len(neuron_preds) != 1 or neuron_preds[0] != nid:
+        # Find neuron through transparent ops
+        neuron = _find_neuron_through_transparent(ir, nid)
+        if neuron is None:
+            continue
+        if neuron.fusion_group_id >= 0:
             continue
 
-        # Create fusion group
         fg = FusionGroup(
             group_id=group_id,
             conv_node_id=nid,
-            neuron_node_id=succ.id,
+            neuron_node_id=neuron.id,
             bn_scale=node.bn_scale,
             bn_bias=node.bn_bias,
         )
         ir.fusion_groups.append(fg)
         node.fusion_group_id = group_id
-        succ.fusion_group_id = group_id
+        neuron.fusion_group_id = group_id
         cp = node.conv_params
         if cp:
             logger.debug("  Fusion %d: Conv(%d→%d) + %s",
-                         group_id, cp.in_channels, cp.out_channels, succ.op_type.name)
+                         group_id, cp.in_channels, cp.out_channels, neuron.op_type.name)
         group_id += 1
 
     logger.phase("FUSION", "Detected %d Conv→Neuron fusion groups", len(ir.fusion_groups))
@@ -321,6 +572,267 @@ def annotate_layout(ir: EngineIR):
 
 
 # ============================================================
+# Pass 4b: Per-Edge Layout Propagation
+# ============================================================
+
+def propagate_edge_layouts(ir: EngineIR):
+    """Propagate tensor layouts along edges based on kernel contracts.
+
+    After this pass, every edge.layout reflects the actual data layout
+    that the producer writes. This enables the reformat insertion pass
+    to detect layout mismatches and insert explicit LayoutTranspose nodes.
+
+    Layout rules:
+      - Kernel with contract: output layout from KERNEL_CONTRACTS
+      - Inherit-type kernel (Elementwise, TemporalMean, etc.): copy predecessor
+      - Reshape to non-4D: ND
+      - Reshape 4D→4D: inherit predecessor
+      - Flatten: ND
+      - Transpose perm (0,2,3,1) on NCHW → NHWC
+      - Transpose perm (0,3,1,2) on NHWC → NCHW
+      - Transpose other perm: ND
+      - Identity: inherit
+    """
+    # Build edge lookup: src_nid → [Edge]
+    src_edges: dict[int, list[Edge]] = {}
+    for e in ir.edges:
+        src_edges.setdefault(e.src_id, []).append(e)
+
+    # Build predecessor-edge lookup: dst_nid → [Edge]
+    dst_edges: dict[int, list[Edge]] = {}
+    for e in ir.edges:
+        dst_edges.setdefault(e.dst_id, []).append(e)
+
+    # The graph input is NCHW (from ONNX), but __call__ converts to NHWC
+    # before the first node. Mark the Tile/Repeat node's output as NHWC
+    # since it produces the first activation after NCHW→NHWC conversion.
+    graph_input_layout = TensorLayout.NHWC  # after entry conversion
+
+    propagated = 0
+    for nid in ir.topo_order:
+        node = ir.nodes[nid]
+        kv = node.assigned_kernel
+
+        # Determine this node's output layout
+        out_layout = _infer_node_output_layout(
+            node, kv, dst_edges.get(nid, []), graph_input_layout)
+
+        # Stamp onto all outgoing edges
+        for e in src_edges.get(nid, []):
+            if e.layout != out_layout:
+                e.layout = out_layout
+                propagated += 1
+
+    logger.phase("LAYOUT", "Propagated edge layouts for %d edges", propagated)
+
+
+def _infer_node_output_layout(node, kv, incoming_edges, default_layout):
+    """Determine what layout a node's output tensor has."""
+    contract = KERNEL_CONTRACTS.get(kv)
+
+    # 1. Kernel with explicit contract → use it
+    if contract is not None:
+        return contract.output_layout
+
+    # 2. Inherit-type kernel → copy from first predecessor edge
+    pred_layout = _get_predecessor_layout(incoming_edges, default_layout)
+
+    # 3. ZeroCost ops: layout depends on op semantics
+    if node.op_type == OpType.Flatten:
+        return TensorLayout.ND
+
+    if node.op_type == OpType.Reshape:
+        out_shape = node.output_shapes[0] if node.output_shapes else ()
+        if len(out_shape) != 4:
+            return TensorLayout.ND
+        # 4D→4D reshape: preserve predecessor layout
+        return pred_layout
+
+    if node.op_type == OpType.Transpose:
+        perm = node.extra_attrs.get("perm", [])
+        if len(perm) == 4:
+            if perm == [0, 2, 3, 1] and pred_layout == TensorLayout.NCHW:
+                return TensorLayout.NHWC
+            if perm == [0, 3, 1, 2] and pred_layout == TensorLayout.NHWC:
+                return TensorLayout.NCHW
+            # Other 4D permutations: could be multi-head reshuffles
+            return TensorLayout.ND
+        return TensorLayout.ND
+
+    if node.op_type == OpType.Identity:
+        return pred_layout
+
+    # For Tile/Repeat at graph entry, output NHWC (after __call__ conversion)
+    if node.op_type == OpType.Tile:
+        return default_layout
+
+    # Default: inherit
+    return pred_layout
+
+
+def _get_predecessor_layout(incoming_edges, default):
+    """Get the layout from the first incoming edge, or default."""
+    for e in incoming_edges:
+        return e.layout
+    return default
+
+
+# ============================================================
+# Pass 4c: Layout Reformat Insertion
+# ============================================================
+
+def insert_layout_reformats(ir: EngineIR) -> int:
+    """Insert LayoutTranspose nodes where layout mismatches occur.
+
+    Two cases:
+    1. Kernel contract mismatch: producer layout ≠ consumer expected layout
+    2. Reshape reinterpretation: NHWC data enters a 4D→4D Reshape whose
+       target_shape assumes NCHW. ONNX shapes are always NCHW, so any
+       Reshape that changes spatial structure on NHWC data needs NHWC→NCHW
+       conversion first.
+
+    Returns the number of reformat nodes inserted.
+    """
+    edges_by_dst: dict[int, list[Edge]] = {}
+    for e in ir.edges:
+        edges_by_dst.setdefault(e.dst_id, []).append(e)
+
+    reformats_to_insert = []
+
+    for nid in ir.topo_order:
+        node = ir.nodes.get(nid)
+        if node is None:
+            continue
+
+        # Case 1: Kernel contract mismatch
+        contract = KERNEL_CONTRACTS.get(node.assigned_kernel)
+        if contract is not None and contract.input_layout not in (TensorLayout.ND, None):
+            expected_input = contract.input_layout
+            for e in edges_by_dst.get(nid, []):
+                if e.layout == expected_input:
+                    continue
+                if e.layout == TensorLayout.ND:
+                    continue  # ND: compatible with any layout
+                elif e.layout == TensorLayout.NCHW and expected_input == TensorLayout.NHWC:
+                    perm = [0, 2, 3, 1]
+                elif e.layout == TensorLayout.NHWC and expected_input == TensorLayout.NCHW:
+                    perm = [0, 3, 1, 2]
+                else:
+                    continue
+                src = ir.nodes.get(e.src_id)
+                if src and src.assigned_kernel == KernelVariant.LayoutTranspose:
+                    continue  # avoid chaining reformats
+                reformats_to_insert.append((e.src_id, nid, perm, e.layout, expected_input))
+            continue
+
+        # Case 2: Reshape in attention path receiving NHWC data.
+        # Only insert NHWC→NCHW before Reshape nodes that feed into
+        # MatMul (attention Q@K^T, attn@V). Detected by checking if
+        # the Reshape's output chain reaches a MatMul through ZeroCost ops.
+        if node.op_type == OpType.Reshape:
+            # Check if this Reshape feeds a MatMul (attention path)
+            feeds_matmul = False
+            cur = nid
+            for _ in range(5):
+                succs = ir.successors(cur)
+                if not succs:
+                    break
+                s = ir.nodes.get(succs[0])
+                if s is None:
+                    break
+                if s.op_type == OpType.MatMul:
+                    feeds_matmul = True
+                    break
+                if s.op_type in (OpType.Reshape, OpType.Transpose,
+                                 OpType.Identity, OpType.Scale):
+                    cur = succs[0]
+                    continue
+                break
+            if not feeds_matmul:
+                continue
+            for e in edges_by_dst.get(nid, []):
+                if e.layout != TensorLayout.NHWC:
+                    continue
+                src = ir.nodes.get(e.src_id)
+                if src is None or src.assigned_kernel == KernelVariant.LayoutTranspose:
+                    continue
+                src_shape = src.output_shapes[0] if src.output_shapes else ()
+                if len(src_shape) != 4:
+                    continue
+                reformats_to_insert.append((
+                    e.src_id, nid, [0, 3, 1, 2],
+                    TensorLayout.NHWC, TensorLayout.NCHW))
+
+        # Case 3: Multi-input node (Add) with mixed layouts.
+        # Both inputs must match. If one is NHWC and one is NCHW,
+        # convert the NCHW one to NHWC (since Conv output is NHWC).
+        if node.op_type == OpType.Add:
+            in_edges = edges_by_dst.get(nid, [])
+            if len(in_edges) >= 2:
+                layouts = [e.layout for e in in_edges]
+                if TensorLayout.NHWC in layouts and TensorLayout.NCHW in layouts:
+                    for e in in_edges:
+                        src = ir.nodes.get(e.src_id)
+                        if (e.layout == TensorLayout.NCHW
+                                and src and src.assigned_kernel != KernelVariant.LayoutTranspose):
+                            reformats_to_insert.append((
+                                e.src_id, nid, [0, 2, 3, 1],
+                                TensorLayout.NCHW, TensorLayout.NHWC))
+
+    # Insert reformat nodes
+    inserted = 0
+    for src_id, dst_id, perm, src_layout, dst_layout in reformats_to_insert:
+        src_node = ir.nodes[src_id]
+
+        # Output shape is SAME as input shape — LayoutTranspose changes
+        # physical memory layout, not logical NCHW shape.
+        src_shape = src_node.output_shapes[0] if src_node.output_shapes else ()
+
+        reformat_name = f"reformat_{src_layout.name}_to_{dst_layout.name}_{src_id}_{dst_id}"
+        out_tensor_name = f"{reformat_name}_output"
+        reformat_node = Node(
+            id=ir._next_id,
+            name=reformat_name,
+            op_type=OpType.Transpose,
+            input_names=list(src_node.output_names),
+            output_names=[out_tensor_name],
+            input_shapes=[src_shape] if src_shape else [],
+            output_shapes=[src_shape] if src_shape else [],  # same shape
+            extra_attrs={"perm": perm},
+            assigned_kernel=KernelVariant.LayoutTranspose,
+            bound_type=BoundType.MEMORY,
+            layout=dst_layout,
+        )
+        ir._next_id += 1
+        ir.nodes[reformat_node.id] = reformat_node
+
+        # Register in producer/consumer tracking (needed for build_edges)
+        ir._tensor_producer[out_tensor_name] = reformat_node.id
+        for in_name in reformat_node.input_names:
+            if in_name not in ir._tensor_consumers:
+                ir._tensor_consumers[in_name] = []
+            ir._tensor_consumers[in_name].append(reformat_node.id)
+
+        # Rewire: dst node consumes reformat's output instead of src's
+        dst_node = ir.nodes[dst_id]
+        for i, inp_name in enumerate(dst_node.input_names):
+            if inp_name in src_node.output_names:
+                dst_node.input_names[i] = out_tensor_name
+                # Update consumer tracking
+                if out_tensor_name not in ir._tensor_consumers:
+                    ir._tensor_consumers[out_tensor_name] = []
+                ir._tensor_consumers[out_tensor_name].append(dst_id)
+                break
+
+        inserted += 1
+
+    if inserted > 0:
+        logger.phase("REFORMAT", "Inserted %d layout reformat nodes", inserted)
+
+    return inserted
+
+
+# ============================================================
 # Pass 5: Kernel Assignment
 # ============================================================
 
@@ -380,11 +892,19 @@ def propagate_shapes(ir: EngineIR, batch_size: int = 1):
     graph_inputs = consumed - produced
 
     # Assign model_input_shape to all graph input tensors that look like data inputs
-    # (skip weight/bias initializers which are in ir.weights)
     if model_input:
         for tensor_name in graph_inputs:
             if tensor_name not in ir.weights:
                 shape_map[tensor_name] = model_input
+
+    # Seed shape_map with weight shapes for Transpose-of-weight nodes
+    # (needed for SpikingResFormer's classifier weight transpose)
+    for nid in ir.topo_order:
+        node = ir.nodes.get(nid)
+        if node and node.op_type == OpType.Transpose:
+            for in_name in node.input_names:
+                if in_name in ir.weights and in_name not in shape_map:
+                    shape_map[in_name] = tuple(int(d) for d in ir.weights[in_name].shape)
 
     propagated = 0
     for nid in ir.topo_order:
@@ -403,13 +923,31 @@ def propagate_shapes(ir: EngineIR, batch_size: int = 1):
             node.input_shapes = in_shapes
 
         # Compute output shape based on op type
-        out_shape = _compute_output_shape(node, in_shapes, ir.T)
-        if out_shape:
-            if not node.output_shapes or node.output_shapes[0] != out_shape:
-                node.output_shapes = [out_shape]
+        # Special handling for Split: each output has a different shape
+        if (node.op_type == OpType.Identity
+                and node.extra_attrs.get("original_op") == "Split"
+                and len(node.output_names) > 1 and in_shapes):
+            axis = node.extra_attrs.get("axis", 0)
+            num_outputs = len(node.output_names)
+            inp_shape = list(in_shapes[0])
+            if 0 <= axis < len(inp_shape):
+                split_dim = inp_shape[axis] // num_outputs
+                for i, out_name in enumerate(node.output_names):
+                    s = list(inp_shape)
+                    s[axis] = split_dim
+                    shape_map[out_name] = tuple(s)
+                node.output_shapes = [tuple(list(inp_shape[:axis])
+                                            + [split_dim]
+                                            + list(inp_shape[axis+1:]))]
                 propagated += 1
-            for out_name in node.output_names:
-                shape_map[out_name] = out_shape
+        else:
+            out_shape = _compute_output_shape(node, in_shapes, ir.T)
+            if out_shape:
+                if not node.output_shapes or node.output_shapes[0] != out_shape:
+                    node.output_shapes = [out_shape]
+                    propagated += 1
+                for out_name in node.output_names:
+                    shape_map[out_name] = out_shape
 
     logger.phase("SHAPES", "Propagated shapes for %d nodes", propagated)
 
@@ -452,6 +990,8 @@ def _compute_output_shape(node: Node, in_shapes: list[tuple], T: int) -> tuple:
     if node.op_type == OpType.GlobalAvgPool:
         if len(inp) >= 4:
             return (inp[0], inp[1], 1, 1)
+        if len(inp) == 3:
+            return (inp[0], inp[1], 1)
         return inp
 
     if node.op_type in (OpType.IF, OpType.LIF, OpType.MS,
@@ -501,13 +1041,20 @@ def _compute_output_shape(node: Node, in_shapes: list[tuple], T: int) -> tuple:
     if node.op_type == OpType.TemporalMean:
         if len(inp) >= 1:
             B = inp[0] // T if T > 0 else inp[0]
-            return (B,) + inp[1:]
+            return (max(B, 1),) + inp[1:]  # clamp for dynamic dims
         return inp
 
     if node.op_type == OpType.Transpose:
         perm = node.extra_attrs.get("perm")
         if perm and inp and len(perm) == len(inp):
             return tuple(inp[p] for p in perm)
+        # Fallback: if input is a weight constant, use its shape
+        if perm and not inp:
+            for name in node.input_names:
+                if name in ir.weights:
+                    w_shape = ir.weights[name].shape
+                    if len(perm) == len(w_shape):
+                        return tuple(w_shape[p] for p in perm)
         if node.output_shapes:
             return node.output_shapes[0]
         return inp
@@ -537,6 +1084,22 @@ def _compute_output_shape(node: Node, in_shapes: list[tuple], T: int) -> tuple:
         return inp
 
     if node.op_type == OpType.Identity:
+        original_op = node.extra_attrs.get("original_op", "")
+        # Slice: output shape differs from input on the sliced axis
+        if original_op == "Slice" and inp:
+            axes = node.extra_attrs.get("axes")
+            starts = node.extra_attrs.get("starts")
+            ends = node.extra_attrs.get("ends")
+            if axes is not None and starts is not None and ends is not None:
+                out = list(inp)
+                for a, s, e in zip(axes, starts, ends):
+                    if 0 <= a < len(out):
+                        dim_size = out[a]
+                        # Clamp per ONNX Slice spec
+                        e_clamped = min(e, dim_size) if e > 0 else max(0, dim_size + e)
+                        s_clamped = max(0, s) if s >= 0 else max(0, dim_size + s)
+                        out[a] = e_clamped - s_clamped
+                return tuple(out)
         if node.output_shapes:
             return node.output_shapes[0]
         return inp
@@ -544,6 +1107,20 @@ def _compute_output_shape(node: Node, in_shapes: list[tuple], T: int) -> tuple:
     if node.op_type == OpType.ReduceMean:
         if node.output_shapes:
             return node.output_shapes[0]
+        return inp
+
+    if node.op_type == OpType.FusedAttention:
+        ap = node.attention_params
+        if ap and ap.variant == "dssa":
+            # DSSA: output is (TB, C, H_in, W_in) from the query path
+            # Use the second input shape (x_query), not the first (y_kv)
+            if len(in_shapes) >= 2:
+                return in_shapes[1]  # x_query shape
+            # Fallback: construct from params
+            C = ap.num_heads * ap.head_dim
+            return (inp[0], C, ap.H, ap.W)
+        # SpikFormer: (TB, N, C) → (TB, N, C)
+        # MaxFormer: (TB, C, H, W) → (TB, C, H, W)
         return inp
 
     return inp
@@ -631,7 +1208,30 @@ def classify_bound_and_assign_tilelang(ir: EngineIR, batch_size: int = 1):
         if node.op_type == OpType.Conv2d and node.conv_params:
             cp = node.conv_params
             K_red = cp.kernel_h * cp.kernel_w * cp.in_channels
-            if cp.in_channels < 4 or K_red % 8 != 0:
+            if cp.groups > 1 and cp.groups == cp.in_channels:
+                # Depthwise conv: use TileLang DW kernel
+                M_per_t = 0
+                if node.output_shapes and len(node.output_shapes[0]) == 4:
+                    TB_out, C_out, OH_out, OW_out = node.output_shapes[0]
+                    B_out = TB_out // ir.T if ir.T > 0 else TB_out
+                    M_per_t = B_out * OH_out * OW_out
+                neuron_nid = conv_to_neuron.get(nid)
+                if M_per_t >= FUSED_THRESHOLD and neuron_nid is not None:
+                    node.assigned_kernel = KernelVariant.TileLangFusedDWConvBNIF
+                    node.bound_type = BoundType.COMPUTE
+                    n_fused += 1
+                    if neuron_nid in ir.nodes:
+                        ir.nodes[neuron_nid].assigned_kernel = KernelVariant.ZeroCost
+                        ir.nodes[neuron_nid].bound_type = BoundType.ZERO
+                else:
+                    node.assigned_kernel = KernelVariant.TileLangDWConvBN
+                    n_decomposed += 1
+            elif cp.groups > 1 and cp.groups != cp.in_channels:
+                # Grouped conv (not depthwise): use TileLang grouped kernel
+                node.assigned_kernel = KernelVariant.TileLangGroupedConvBN
+                n_decomposed += 1
+            elif cp.in_channels < 4 or K_red % 8 != 0:
+                # Stem conv (C_in<4) or misaligned dims: cuDNN fallback
                 node.assigned_kernel = KernelVariant.CuDNNConv
             else:
                 # Compute M_per_timestep from output shapes
@@ -683,6 +1283,10 @@ def classify_bound_and_assign_tilelang(ir: EngineIR, batch_size: int = 1):
         elif node.op_type == OpType.MatMul:
             node.assigned_kernel = KernelVariant.TileLangMatMul
 
+        elif node.op_type == OpType.FusedAttention:
+            # Already assigned by parser — just set bound type
+            node.bound_type = BoundType.COMPUTE
+
         elif node.op_type == OpType.Gemm:
             # Small classifier FC: keep cuBLAS
             node.assigned_kernel = KernelVariant.CuBLASGemm
@@ -699,6 +1303,13 @@ def classify_bound_and_assign_tilelang(ir: EngineIR, batch_size: int = 1):
         elif node.op_type == OpType.Tile:
             node.assigned_kernel = KernelVariant.TileRepeat
 
+    # Attention pattern detection: absorb Scale into first MatMul,
+    # apply fused/decomposed for second MatMul + LIF
+    n_attn_scale, n_attn_fused, n_attn_dec = _detect_attention_matmul_patterns(
+        ir, FUSED_THRESHOLD)
+
     logger.phase("BOUND", "Classified %d compute, %d memory, %d zero-cost nodes "
-                 "(hybrid: %d fused, %d decomposed, threshold M_per_t=%d)",
-                 n_compute, n_memory, n_zero, n_fused, n_decomposed, FUSED_THRESHOLD)
+                 "(hybrid: %d fused, %d decomposed, threshold M_per_t=%d; "
+                 "attn: %d matmul+scale, %d fused matmul+lif, %d decomposed)",
+                 n_compute, n_memory, n_zero, n_fused, n_decomposed, FUSED_THRESHOLD,
+                 n_attn_scale, n_attn_fused, n_attn_dec)

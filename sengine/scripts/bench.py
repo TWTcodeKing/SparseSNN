@@ -32,14 +32,14 @@ os.environ['PATH'] = '/usr/local/cuda-12.8/bin:' + os.environ.get('PATH', '')
 
 def bench_sengine(args) -> float:
     """Build or load sengine, benchmark, return latency in ms."""
-    from sengine.build.engine_builder import EngineBuilder
+    import sengine
 
     if args.sengine:
         print(f"\n{'='*60}")
         print(f"  Loading sengine: {args.sengine}")
         print(f"{'='*60}")
         t0 = time.time()
-        engine = EngineBuilder.load(args.sengine, capture_graph=True)
+        engine = sengine.load(args.sengine)
         print(f"  Loaded in {time.time()-t0:.1f}s")
     elif args.onnx:
         print(f"\n{'='*60}")
@@ -47,28 +47,23 @@ def bench_sengine(args) -> float:
         print(f"  T={args.T}, batch_size={args.batch}")
         print(f"{'='*60}")
         t0 = time.time()
-        builder = EngineBuilder(args.onnx, T=args.T, batch_size=args.batch)
-        engine = builder.build(autotune=args.autotune, capture_graph=True)
+        engine = sengine.build(args.onnx, T=args.T, batch_size=args.batch,
+                               autotune=args.autotune)
         build_time = time.time() - t0
-        print(f"  Built in {build_time:.1f}s")
+        cpp_mode = "C++ CUDA Graph" if not engine._use_python_runtime else "Python"
+        print(f"  Built in {build_time:.1f}s ({cpp_mode})")
 
         # Save if requested
         if args.save:
-            builder.save(args.save)
+            engine.save(args.save)
             size_mb = os.path.getsize(args.save) / 1e6
             print(f"  Saved: {args.save} ({size_mb:.1f} MB)")
-
-        # Export schedule if requested
-        if args.export_schedule:
-            model_name = os.path.splitext(os.path.basename(args.onnx))[0]
-            builder.export_schedule(args.export_schedule, model_name=model_name)
-            print(f"  Schedule: {args.export_schedule}")
     else:
         print("Error: provide --onnx or --sengine")
         return 0.0
 
     # Benchmark
-    ms = engine.benchmark(warmup=args.warmup, n_iters=args.iters)
+    ms = engine.benchmark(warmup=args.warmup, iters=args.iters)
     fps = 1000.0 / ms * args.batch if ms > 0 else 0
     print(f"\n  sengine: {ms:.3f} ms  ({fps:.0f} img/s)")
     return ms

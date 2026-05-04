@@ -58,6 +58,22 @@ def _setup_signatures(lib):
     lib.sengine_set_gemm_node.argtypes = [VP, CI, VP, VP, VP, CI, CI, CI]
     lib.sengine_set_skip_node.argtypes = [VP, CI]
     lib.sengine_set_alias_node.argtypes = [VP, CI, VP, VP, CI]
+    lib.sengine_set_tilelang_node_3.argtypes = [VP, CI, CI, VP, VP, VP]
+    lib.sengine_set_naive_conv_node.argtypes = [VP, CI, VP, VP, VP, VP, VP,
+                                                 CI, CI, CI, CI, CI, CI, CI, CI, CI, CI, CI, CI]
+    lib.sengine_set_layout_transpose_node.argtypes = [VP, CI, VP, VP, CI, CI, CI, CI, CI]
+    lib.sengine_set_fused_attn_node.argtypes = [
+        VP, CI,           # handle, nid
+        CI, CI, CI,       # variant, gemm1_idx, gemm2_idx
+        VP, VP, VP, VP,   # q, k, v, out
+        VP, VP,           # workspace, membrane
+        CI, CI, CI, CI, CI, CI,  # TB, heads, hd, N, H, W
+        CI, CI,           # lif_total, lif_spatial
+        ctypes.c_float, ctypes.c_float,  # v_thresh, recip_tau
+        CI,               # needs_permute
+        VP, VP,           # scale1_ptr, scale2_ptr
+        CI, CI, CI, CI,   # ws_gemm1_out, ws_perm_q, ws_perm_k, ws_perm_v
+    ]
     lib.sengine_add_membrane.argtypes = [VP, VP, CI]
 
     lib.sengine_execute.argtypes = [VP]
@@ -122,6 +138,9 @@ class CppExecutor:
 
     # ─── Node registration ───
 
+    def set_tilelang_3(self, nid: int, tl_idx: int, *ptrs):
+        self._lib.sengine_set_tilelang_node_3(self._handle, nid, tl_idx, *ptrs)
+
     def set_tilelang_5(self, nid: int, tl_idx: int, *ptrs):
         self._lib.sengine_set_tilelang_node_5(self._handle, nid, tl_idx, *ptrs)
 
@@ -164,6 +183,47 @@ class CppExecutor:
     def set_alias_node(self, nid, src_ptr, dst_ptr, n_elems):
         self._lib.sengine_set_alias_node(self._handle, nid,
             src_ptr, dst_ptr, n_elems)
+
+    def set_naive_conv_node(self, nid, in_ptr, w_ptr, sc_ptr, bi_ptr, out_ptr,
+                            N, H, W, Cin, Cout, KH, KW, stride, pad, OH, OW, groups=1):
+        self._lib.sengine_set_naive_conv_node(self._handle, nid,
+            in_ptr, w_ptr, sc_ptr, bi_ptr, out_ptr,
+            N, H, W, Cin, Cout, KH, KW, stride, pad, OH, OW, groups)
+
+    def set_layout_transpose_node(self, nid, in_ptr, out_ptr, N, H, W, C, direction):
+        """Set a layout transpose node (NHWC↔NCHW).
+
+        direction: 0=NHWC→NCHW, 1=NCHW→NHWC
+        """
+        self._lib.sengine_set_layout_transpose_node(self._handle, nid,
+            in_ptr, out_ptr, N, H, W, C, direction)
+
+    def set_fused_attn_node(self, nid, variant, gemm1_idx, gemm2_idx,
+                             q_ptr, k_ptr, v_ptr, out_ptr,
+                             workspace_ptr, mem_ptr,
+                             TB, heads, hd, N, H, W,
+                             lif_total, lif_spatial,
+                             v_thresh, recip_tau,
+                             needs_permute,
+                             scale1_ptr=0, scale2_ptr=0,
+                             ws_gemm1_out=0, ws_perm_q=0,
+                             ws_perm_k=0, ws_perm_v=0):
+        """Set a fused attention node (TileLang batched GEMM + LIF).
+
+        variant: 0=spikformer, 1=maxformer, 2=dssa, 3=token_qk
+        gemm1_idx, gemm2_idx: TileLang .so indices for the two GEMM kernels
+        """
+        import ctypes
+        self._lib.sengine_set_fused_attn_node(
+            self._handle, nid, variant, gemm1_idx, gemm2_idx,
+            q_ptr, k_ptr, v_ptr, out_ptr,
+            workspace_ptr, mem_ptr,
+            TB, heads, hd, N, H, W,
+            lif_total, lif_spatial,
+            ctypes.c_float(v_thresh), ctypes.c_float(recip_tau),
+            needs_permute,
+            scale1_ptr, scale2_ptr,
+            ws_gemm1_out, ws_perm_q, ws_perm_k, ws_perm_v)
 
     # ─── Execution ───
 

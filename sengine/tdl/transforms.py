@@ -338,7 +338,10 @@ class TDLTransform:
             x = x + x_feat
 
             # (T*B, C, H', W') → (T*B, N, C) where N = H'*W'
-            x = x.flatten(2).transpose(1, 2)
+            # Use explicit reshape with Python ints for constant ONNX target.
+            C_dim = int(x.shape[1])
+            N_dim = int(x.shape[2]) * int(x.shape[3])
+            x = x.reshape(-1, C_dim, N_dim).transpose(1, 2)
             return x
 
         self._originals['patch_embed'] = sps.forward
@@ -363,11 +366,21 @@ class TDLTransform:
             x = model.patch_embed(x)         # (T*B, N, C)
             for blk in model.block:
                 x = blk(x)                   # (T*B, N, C)
-            x = x.mean(1)                    # (T*B, C) — mean over tokens
+            # Token pool + temporal mean + classifier.
+            # Reshape (TB, N, C) → (TB, C, sqrt(N), sqrt(N)) as 4D
+            # so the parser sees standard GlobalAvgPool → Flatten → Gemm → TemporalMean.
+            C_dim = int(x.shape[2])
+            N_dim = int(x.shape[1])
+            # N should be a perfect square (H'*W' from patch embed)
+            import math
+            side = int(math.isqrt(N_dim))
+            x = x.transpose(1, 2).reshape(-1, C_dim, side, side)   # (TB, C, H', W')
+            x = torch.nn.functional.adaptive_avg_pool2d(x, 1)       # (TB, C, 1, 1)
+            x = x.flatten(1)                                         # (TB, C)
             TB = x.shape[0]
             B = TB // T
-            x = x.view(T, B, -1).mean(0)    # (B, C) — mean over T
-            x = model.head(x)                # (B, num_classes)
+            x = x.view(T, B, -1).mean(0)           # (B, C) — mean over T
+            x = model.head(x)                       # (B, num_classes)
             return x
 
         model.forward = forward_4d
@@ -498,8 +511,8 @@ class TDLTransform:
             x = model.patch_embed3(x)
             for blk in model.stage3:
                 x = blk(x)
-            # Global average pool: (T*B, C, H, W) → (T*B, C)
-            x = x.flatten(2).mean(2)
+            # Global average pool: (T*B, C, H, W) → (T*B, C, 1, 1) → (T*B, C)
+            x = torch.nn.functional.adaptive_avg_pool2d(x, 1).flatten(1)
             x = model.head_lif(x)
             x = model.head(x)
             TB = x.shape[0]

@@ -30,13 +30,16 @@ class DSSA4D(nn.Module):
     def __init__(self, dim, num_heads, lenth, T,
                  activation_in=None, activation_attn=None, activation_out=None,
                  W=None, norm=None, Wproj=None, norm_proj=None,
-                 scale1=None, scale2=None):
+                 scale1=None, scale2=None,
+                 attn_lif_tau=2.0, attn_lif_v_threshold=1.0):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.lenth = lenth
         self.T = T
+        self._attn_lif_tau = float(attn_lif_tau)
+        self._attn_lif_v_thresh = float(attn_lif_v_threshold)
 
         # Neurons (will be patched by TDL-2 with fused ops)
         self.activation_in = activation_in
@@ -88,6 +91,17 @@ class DSSA4D(nn.Module):
         scale2 = 1.0 / torch.sqrt(fr_attn.clamp(min=1e-8) * lenth)
         scale2 = scale2.unsqueeze(0)  # (1, num_heads, 1, 1)
 
+        # Extract activation_attn LIF params
+        attn_lif_tau = 2.0
+        attn_lif_v_thresh = 1.0
+        if hasattr(dssa.activation_attn, 'neuron'):
+            n = dssa.activation_attn.neuron
+            tau = n.tau
+            attn_lif_tau = float(tau.item() if isinstance(tau, torch.Tensor) else tau)
+            attn_lif_v_thresh = float(n.v_threshold.item()
+                                      if isinstance(n.v_threshold, torch.Tensor)
+                                      else n.v_threshold)
+
         return cls(
             dim=dim, num_heads=num_heads, lenth=lenth, T=T,
             activation_in=dssa.activation_in,
@@ -95,6 +109,7 @@ class DSSA4D(nn.Module):
             activation_out=dssa.activation_out,
             W=W_conv, norm=norm_bn, Wproj=Wproj_conv, norm_proj=norm_proj_bn,
             scale1=scale1, scale2=scale2,
+            attn_lif_tau=attn_lif_tau, attn_lif_v_threshold=attn_lif_v_thresh,
         )
 
     def forward(self, x):
@@ -106,49 +121,24 @@ class DSSA4D(nn.Module):
             (T*B, C, H, W) output tensor
         """
         C = self.dim
-        head_dim = self.head_dim
+        H_in = int(x.shape[2])
+        W_in = int(x.shape[3])
 
         x_feat = x.clone()
 
         # LIF neuron — operates on 4D via TDL-2
         x = self.activation_in(x)
 
-        # Conv + BN — plain 4D ops
+        # Conv + BN — produces (TB, 2C, h', w') with K and V concatenated
         y = nn.Conv2d.forward(self.W, x)
         y = self.norm(y)
 
-        # Head split: (TB, 2C, h', w') → (TB, heads, 2*head_dim, spatial)
-        # Use explicit shape[0] for batch dim so TRT can track it
-        # through Slice/Concat (native ONNX neurons) + reshapes.
-        TB = y.shape[0]
-        h_out, w_out = y.shape[2], y.shape[3]
-        spatial = h_out * w_out
-        y = y.view(TB, self.num_heads, 2 * head_dim, spatial)
-        y1 = y[:, :, :head_dim, :]      # keys
-        y2 = y[:, :, head_dim:, :]       # values
-
-        # Query: (TB, C, H, W) → (TB, heads, head_dim, spatial_q)
-        TB_x = x.shape[0]
-        spatial_q = x.shape[2] * x.shape[3]
-        xq = x.view(TB_x, self.num_heads, head_dim, spatial_q)
-
-        # Attention — per-frame matmul
-        attn = torch.matmul(y1.transpose(-2, -1), xq)
-        attn = attn * self.scale1
-
-        # LIF neuron on attention scores
-        attn = self.activation_attn(attn)
-
-        # Output: (TB, heads, head_dim, spatial) @ (TB, heads, spatial, spatial)
-        out = torch.matmul(y2, attn)
-        out = out * self.scale2
-
-        # Reshape back to 4D (TB, C, H, W) for Conv projection.
-        # Use contiguous reshape so ONNX tracer sees a clean 4D tensor
-        # (not a view alias of the multi-head layout).
-        H_in = x_feat.shape[2]
-        W_in = x_feat.shape[3]
-        out = out.reshape(out.shape[0], C, H_in, W_in).contiguous()
+        # Fused attention core: split K/V → K^T@Q*scale1 → LIF → V@attn*scale2 → reshape
+        from sengine.tdl.attention_ops import FusedDSSAAttnOp
+        out = FusedDSSAAttnOp.apply(
+            y, x, self.scale1, self.scale2,
+            self.T, self.num_heads, self.head_dim, H_in, W_in,
+            self._attn_lif_tau, self._attn_lif_v_thresh)
 
         # LIF neuron + projection + residual
         out = self.activation_out(out)

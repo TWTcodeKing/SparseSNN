@@ -32,7 +32,7 @@ from sengine.logger import logger
 
 # ─── Magic and version ───
 MAGIC = b"SENG"
-VERSION = 2
+VERSION = 3
 
 
 def save_sengine(path: str, ir: EngineIR, schedule: list[int],
@@ -132,6 +132,7 @@ def save_sengine(path: str, ir: EngineIR, schedule: list[int],
             "tensor_name": edge.tensor_name,
             "tensor_shape": list(edge.tensor_shape),
             "tensor_bytes": edge.tensor_bytes,
+            "layout": edge.layout.name,
         })
     header["edges"] = edges_json
 
@@ -301,6 +302,7 @@ def load_sengine(path: str) -> tuple[EngineIR, list[int], int, int]:
             tensor_name=ed.get("tensor_name", ""),
             tensor_shape=tuple(ed.get("tensor_shape", ())),
             tensor_bytes=ed.get("tensor_bytes", 0),
+            layout=TensorLayout[ed.get("layout", "NCHW")],
         )
         ir.edges.append(edge)
 

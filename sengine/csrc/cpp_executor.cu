@@ -154,11 +154,132 @@ __global__ void gemm_fp16_kernel(
     output[row * N + col] = __float2half(sum);
 }
 
+// Naive Conv2d+BN NHWC: for stem/grouped Conv (not perf-critical)
+// Supports groups (g=1 for standard, g>1 for grouped conv).
+// input:  (N, H, W, C_in) NHWC FP16
+// weight: (KH, KW, C_in/g, C_out) NHWC FP16
+// output: (N, OH, OW, C_out) NHWC FP16
+__global__ void naive_conv2d_bn_nhwc_kernel(
+    const half* __restrict__ input, const half* __restrict__ weight,
+    const float* __restrict__ bn_scale, const float* __restrict__ bn_bias,
+    half* __restrict__ output,
+    int N, int H, int W, int C_in, int C_out,
+    int KH, int KW, int stride, int pad, int OH, int OW, int groups
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * OH * OW * C_out;
+    if (idx >= total) return;
+
+    int co = idx % C_out;
+    int rem = idx / C_out;
+    int ow = rem % OW;
+    rem = rem / OW;
+    int oh = rem % OH;
+    int n = rem / OH;
+
+    int C_in_per_g = C_in / groups;
+    int C_out_per_g = C_out / groups;
+    int g = co / C_out_per_g;           // which group this output channel belongs to
+    int ci_start = g * C_in_per_g;      // input channel range for this group
+
+    float sum = 0.0f;
+    for (int kh = 0; kh < KH; kh++) {
+        int ih = oh * stride - pad + kh;
+        if (ih < 0 || ih >= H) continue;
+        for (int kw = 0; kw < KW; kw++) {
+            int iw = ow * stride - pad + kw;
+            if (iw < 0 || iw >= W) continue;
+            for (int ci_local = 0; ci_local < C_in_per_g; ci_local++) {
+                int ci = ci_start + ci_local;
+                float iv = __half2float(input[((n * H + ih) * W + iw) * C_in + ci]);
+                float wv = __half2float(weight[((kh * KW + kw) * C_in_per_g + ci_local) * C_out + co]);
+                sum += iv * wv;
+            }
+        }
+    }
+    // BN epilogue
+    sum = sum * bn_scale[co] + bn_bias[co];
+    output[idx] = __float2half(sum);
+}
+
+// Layout Transpose: NHWC↔NCHW
+// direction=0: NHWC(N,H,W,C) → NCHW(N,C,H,W)
+// direction=1: NCHW(N,C,H,W) → NHWC(N,H,W,C)
+__global__ void layout_transpose_kernel(
+    const half* __restrict__ input, half* __restrict__ output,
+    int N, int H, int W, int C, int direction
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * H * W;
+    if (idx >= total) return;
+
+    if (direction == 0) {
+        // NHWC → NCHW: input[n,h,w,c] → output[n,c,h,w]
+        int c = idx % C;
+        int w = (idx / C) % W;
+        int h = (idx / C / W) % H;
+        int n = idx / (C * W * H);
+        output[n*C*H*W + c*H*W + h*W + w] = input[idx];
+    } else {
+        // NCHW → NHWC: input[n,c,h,w] → output[n,h,w,c]
+        int w = idx % W;
+        int h = (idx / W) % H;
+        int c = (idx / W / H) % C;
+        int n = idx / (W * H * C);
+        output[n*H*W*C + h*W*C + w*C + c] = input[idx];
+    }
+}
+
+// ─── Fused attention helper kernels ───
+
+// Element-wise scale: data[i] *= scale
+__global__ void scale_fp16_kernel(half* data, int n, half scale_val) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) data[i] = __hmul(data[i], scale_val);
+}
+
+// Element-wise multiply: out[i] = a[i] * b[i]
+__global__ void mul_fp16_kernel(const half* a, const half* b, half* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2half(__half2float(a[i]) * __half2float(b[i]));
+}
+
+// Broadcast scale tensor: data shape (TB, heads, D1, D2), scale shape (1, heads, 1, 1)
+// data[tb, h, d1, d2] *= scale[h]
+__global__ void scale_tensor_broadcast_kernel(
+    half* data, const half* scale, int total, int heads, int inner
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    int h = (i / inner) % heads;
+    data[i] = __float2half(__half2float(data[i]) * __half2float(scale[h]));
+}
+
+// ReduceSum over dim=2 (head_dim): (TB*heads, head_dim, N) → (TB*heads, 1, N)
+// For TokenQK attention: sum Q over head_dim
+__global__ void reduce_sum_head_dim_kernel(
+    const half* input, half* output, int outer, int head_dim, int N
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_out = outer * N;
+    if (idx >= total_out) return;
+    int n_idx = idx % N;
+    int o_idx = idx / N;  // TB*heads index
+    float sum = 0.0f;
+    for (int d = 0; d < head_dim; d++) {
+        sum += __half2float(input[(o_idx * head_dim + d) * N + n_idx]);
+    }
+    output[o_idx * N + n_idx] = __float2half(sum);
+}
+
 // ─── Kernel types ───
 enum KernelType {
     KT_TILELANG = 0, KT_IF = 1, KT_LIF = 2, KT_ADD = 3, KT_SKIP = 4,
     KT_MAXPOOL = 5, KT_GLOBAL_AVGPOOL = 6, KT_TEMPORAL_MEAN = 7,
-    KT_GEMM = 8, KT_ALIAS = 9
+    KT_GEMM = 8, KT_ALIAS = 9, KT_LAYOUT_TRANSPOSE = 10,
+    KT_TILELANG_3 = 11,  // 3-arg TileLang (MatMul: A, B, output)
+    KT_NAIVE_CONV = 12,  // Naive Conv2d+BN for stem (C_in=3)
+    KT_FUSED_ATTN = 13   // Fused attention (cuBLAS batched GEMM + LIF)
 };
 
 // ─── TileLang standalone kernel (loaded via dlopen) ───
@@ -221,6 +342,38 @@ struct NodeDesc {
     // For alias (zero-cost: reshape/transpose — just pointer copy)
     half** alias_src;
     half** alias_dst;
+
+    // For layout transpose (NHWC↔NCHW)
+    half* lt_in;
+    half* lt_out;
+    int lt_N, lt_H, lt_W, lt_C, lt_direction;
+
+    // For naive conv2d+BN (stem)
+    half* nc_in;
+    half* nc_w;
+    float* nc_sc;
+    float* nc_bi;
+    half* nc_out;
+    int nc_N, nc_H, nc_W, nc_Cin, nc_Cout, nc_KH, nc_KW, nc_stride, nc_pad, nc_OH, nc_OW, nc_groups;
+
+    // For fused attention (KT_FUSED_ATTN)
+    // variant: 0=spikformer, 1=maxformer, 2=dssa, 3=token_qk
+    int fa_variant;
+    int fa_tl_gemm1_idx;         // TileLang .so index for GEMM1
+    int fa_tl_gemm2_idx;         // TileLang .so index for GEMM2
+    half *fa_q, *fa_k, *fa_v, *fa_out;
+    half *fa_workspace;          // scratch (attn scores, permuted buffers)
+    float *fa_membrane;
+    half *fa_scale1_ptr, *fa_scale2_ptr;  // DSSA per-head tensor scales
+    int fa_TB, fa_heads, fa_hd, fa_N;
+    int fa_H, fa_W;              // spatial dims for NHWC↔NCHW
+    int fa_spatial_kv;           // LIF membrane spatial size
+    float fa_v_thresh, fa_recip_tau;
+    int fa_needs_permute;        // Whether NHWC↔NCHW needed (maxformer/dssa)
+    int fa_lif_total, fa_lif_spatial;  // LIF kernel dims
+    // Workspace offsets (in half elements)
+    int fa_ws_gemm1_out;         // GEMM1 output / GEMM2 input
+    int fa_ws_perm_q, fa_ws_perm_k, fa_ws_perm_v;  // permuted Q/K/V
 };
 
 // ─── Executor ───
@@ -318,6 +471,19 @@ void sengine_set_schedule(SEngineExecutor* e, int* sched, int len) {
 void sengine_alloc_nodes(SEngineExecutor* e, int max_id) {
     e->max_node_id = max_id;
     e->nodes = (NodeDesc*)calloc(max_id + 1, sizeof(NodeDesc));
+}
+
+/// ─── TileLang MatMul node (3 args: A, B, output) ───
+void sengine_set_tilelang_node_3(SEngineExecutor* e, int nid, int tl_idx,
+                                  void* arg0, void* arg1, void* arg2) {
+    auto& n = e->nodes[nid];
+    n.type = KT_TILELANG_3;
+    n.tilelang_idx = tl_idx;
+    n.tl_n_args = 3;
+    n.tl_args = (void**)malloc(3 * sizeof(void*));
+    n.tl_args[0] = arg0;  // A
+    n.tl_args[1] = arg1;  // B
+    n.tl_args[2] = arg2;  // output
 }
 
 // ─── TileLang Conv+BN node (5 args: data, weight, scale, bias, output) ───
@@ -434,6 +600,37 @@ void sengine_set_gemm_node(SEngineExecutor* e, int nid,
     nd.gemm_M = M; nd.gemm_K = K; nd.gemm_N = N;
 }
 
+void sengine_set_fused_attn_node(SEngineExecutor* e, int nid,
+    int variant, int gemm1_idx, int gemm2_idx,
+    half* q, half* k, half* v, half* out,
+    half* workspace, float* membrane,
+    int TB, int heads, int hd, int N, int H, int W,
+    int lif_total, int lif_spatial,
+    float v_thresh, float recip_tau,
+    int needs_permute,
+    half* scale1_ptr, half* scale2_ptr,
+    int ws_gemm1_out, int ws_perm_q, int ws_perm_k, int ws_perm_v)
+{
+    auto& nd = e->nodes[nid];
+    nd.type = KT_FUSED_ATTN;
+    nd.fa_variant = variant;
+    nd.fa_tl_gemm1_idx = gemm1_idx;
+    nd.fa_tl_gemm2_idx = gemm2_idx;
+    nd.fa_q = q; nd.fa_k = k; nd.fa_v = v; nd.fa_out = out;
+    nd.fa_workspace = workspace;
+    nd.fa_membrane = membrane;
+    nd.fa_scale1_ptr = scale1_ptr; nd.fa_scale2_ptr = scale2_ptr;
+    nd.fa_TB = TB; nd.fa_heads = heads; nd.fa_hd = hd; nd.fa_N = N;
+    nd.fa_H = H; nd.fa_W = W;
+    nd.fa_lif_total = lif_total; nd.fa_lif_spatial = lif_spatial;
+    nd.fa_v_thresh = v_thresh; nd.fa_recip_tau = recip_tau;
+    nd.fa_needs_permute = needs_permute;
+    nd.fa_ws_gemm1_out = ws_gemm1_out;
+    nd.fa_ws_perm_q = ws_perm_q;
+    nd.fa_ws_perm_k = ws_perm_k;
+    nd.fa_ws_perm_v = ws_perm_v;
+}
+
 void sengine_set_skip_node(SEngineExecutor* e, int nid) {
     e->nodes[nid].type = KT_SKIP;
 }
@@ -445,6 +642,34 @@ void sengine_set_alias_node(SEngineExecutor* e, int nid,
     nd.input_ptr = src;
     nd.output_ptr = dst;
     nd.total_elems = n_elems;
+}
+
+void sengine_set_naive_conv_node(SEngineExecutor* e, int nid,
+                                 half* input, half* weight,
+                                 float* bn_scale, float* bn_bias, half* output,
+                                 int N, int H, int W, int Cin, int Cout,
+                                 int KH, int KW, int stride, int pad, int OH, int OW,
+                                 int groups) {
+    auto& nd = e->nodes[nid];
+    nd.type = KT_NAIVE_CONV;
+    nd.nc_in = input; nd.nc_w = weight;
+    nd.nc_sc = bn_scale; nd.nc_bi = bn_bias; nd.nc_out = output;
+    nd.nc_N = N; nd.nc_H = H; nd.nc_W = W;
+    nd.nc_Cin = Cin; nd.nc_Cout = Cout;
+    nd.nc_KH = KH; nd.nc_KW = KW;
+    nd.nc_stride = stride; nd.nc_pad = pad;
+    nd.nc_OH = OH; nd.nc_OW = OW; nd.nc_groups = groups;
+}
+
+void sengine_set_layout_transpose_node(SEngineExecutor* e, int nid,
+                                        half* input, half* output,
+                                        int N, int H, int W, int C, int direction) {
+    auto& nd = e->nodes[nid];
+    nd.type = KT_LAYOUT_TRANSPOSE;
+    nd.lt_in = input;
+    nd.lt_out = output;
+    nd.lt_N = N; nd.lt_H = H; nd.lt_W = W; nd.lt_C = C;
+    nd.lt_direction = direction;
 }
 
 void sengine_add_membrane(SEngineExecutor* e, float* ptr, int size) {
@@ -464,11 +689,20 @@ void sengine_execute(SEngineExecutor* e) {
         auto& nd = e->nodes[nid];
 
         switch (nd.type) {
-        case KT_TILELANG: {
+        case KT_TILELANG:
+        case KT_TILELANG_3: {
             auto& tl = e->tl_kernels[nd.tilelang_idx];
             // call(arg0, arg1, ..., argN, stream)
-            // We use function pointer cast based on arg count
-            if (nd.tl_n_args == 5) {
+            if (nd.tl_n_args == 3) {
+                typedef int (*CallFn3)(void*, void*, void*, cudaStream_t);
+                auto fn = (CallFn3)tl.call_fn;
+                fn(nd.tl_args[0], nd.tl_args[1], nd.tl_args[2], s);
+            } else if (nd.tl_n_args == 4) {
+                typedef int (*CallFn4)(void*, void*, void*, void*, cudaStream_t);
+                auto fn = (CallFn4)tl.call_fn;
+                fn(nd.tl_args[0], nd.tl_args[1], nd.tl_args[2],
+                   nd.tl_args[3], s);
+            } else if (nd.tl_n_args == 5) {
                 typedef int (*CallFn5)(void*, void*, void*, void*, void*, cudaStream_t);
                 auto fn = (CallFn5)tl.call_fn;
                 fn(nd.tl_args[0], nd.tl_args[1], nd.tl_args[2],
@@ -541,11 +775,103 @@ void sengine_execute(SEngineExecutor* e) {
                 nd.gemm_out, nd.gemm_N);
             break;
         }
+        case KT_NAIVE_CONV: {
+            int total = nd.nc_N * nd.nc_OH * nd.nc_OW * nd.nc_Cout;
+            int thr = 256, blk = (total + thr - 1) / thr;
+            naive_conv2d_bn_nhwc_kernel<<<blk, thr, 0, s>>>(
+                nd.nc_in, nd.nc_w, nd.nc_sc, nd.nc_bi, nd.nc_out,
+                nd.nc_N, nd.nc_H, nd.nc_W, nd.nc_Cin, nd.nc_Cout,
+                nd.nc_KH, nd.nc_KW, nd.nc_stride, nd.nc_pad, nd.nc_OH, nd.nc_OW,
+                nd.nc_groups);
+            break;
+        }
+        case KT_LAYOUT_TRANSPOSE: {
+            int total = nd.lt_N * nd.lt_H * nd.lt_W * nd.lt_C;
+            int thr = 256, blk = (total + thr - 1) / thr;
+            layout_transpose_kernel<<<blk, thr, 0, s>>>(
+                nd.lt_in, nd.lt_out, nd.lt_N, nd.lt_H, nd.lt_W, nd.lt_C, nd.lt_direction);
+            break;
+        }
         case KT_ALIAS: {
             // Just memcpy (for reshape/transpose that need contiguous copy)
             if (nd.input_ptr != nd.output_ptr && nd.total_elems > 0) {
                 cudaMemcpyAsync(nd.output_ptr, nd.input_ptr,
                     nd.total_elems * sizeof(half), cudaMemcpyDeviceToDevice, s);
+            }
+            break;
+        }
+        case KT_FUSED_ATTN: {
+            // ─── Fused Attention: TileLang batched GEMM .so + native LIF + permute ───
+            typedef int (*CallFn3)(void*, void*, void*, cudaStream_t);
+            auto& tl1 = e->tl_kernels[nd.fa_tl_gemm1_idx];
+            auto& tl2 = e->tl_kernels[nd.fa_tl_gemm2_idx];
+            int TB = nd.fa_TB, heads = nd.fa_heads, hd = nd.fa_hd;
+            int N = nd.fa_N, H = nd.fa_H, W = nd.fa_W;
+            int C = heads * hd;
+            half* ws = nd.fa_workspace;
+            half* pq = ws + nd.fa_ws_perm_q;
+            half* pk = ws + nd.fa_ws_perm_k;
+            half* pv = ws + nd.fa_ws_perm_v;
+            half* gemm1_out = ws + nd.fa_ws_gemm1_out;
+
+            if (nd.fa_variant == 0) {
+                // ── SpikFormer: TileLang batched GEMM ──
+                // 1. Permute Q,K,V: (TB,N,heads,hd) → (TB,heads,N,hd) via layout_transpose
+                // 2. GEMM1 (bt): Q@K^T*scale via TileLang .so
+                // 3. GEMM2: attn@V via TileLang .so
+                // 4. Permute back: (TB,heads,N,hd) → (TB,N,heads,hd)
+                // 5. LIF neuron
+                int total = TB * N * C;
+                int thr = 256, blk = (total + thr - 1) / thr;
+
+                // Permute
+                layout_transpose_kernel<<<blk, thr, 0, s>>>(nd.fa_q, pq, TB, N, heads, hd, 0);
+                layout_transpose_kernel<<<blk, thr, 0, s>>>(nd.fa_k, pk, TB, N, heads, hd, 0);
+                layout_transpose_kernel<<<blk, thr, 0, s>>>(nd.fa_v, pv, TB, N, heads, hd, 0);
+
+                // GEMM1: attn_scores(batch*N, N) = Q(batch*N, hd) @ K(batch*N, hd)^T * scale
+                ((CallFn3)tl1.call_fn)(pq, pk, gemm1_out, s);
+
+                // GEMM2: out(batch*N, hd) = attn(batch*N, N) @ V(batch*N, hd)
+                half* g2out = pq;  // reuse Q buffer
+                ((CallFn3)tl2.call_fn)(gemm1_out, pv, g2out, s);
+
+                // Permute back
+                layout_transpose_kernel<<<blk, thr, 0, s>>>(g2out, nd.fa_out, TB, heads, N, hd, 1);
+
+                // LIF
+                if (nd.fa_lif_spatial > 0 && nd.fa_lif_spatial < nd.fa_lif_total) {
+                    blk = (nd.fa_lif_spatial + thr - 1) / thr;
+                    lif_neuron_kernel<<<blk, thr, 0, s>>>(
+                        nd.fa_out, nd.fa_membrane, nd.fa_out,
+                        nd.fa_lif_total, nd.fa_lif_spatial, nd.fa_v_thresh, nd.fa_recip_tau);
+                }
+            }
+            else if (nd.fa_variant == 1) {
+                // ── MaxFormer: fused NHWC TileLang attention ──
+                // GEMM1 .so: reads K,V from NHWC, writes kv(batch*hd, hd)
+                // GEMM2 .so: reads Q from NHWC + kv, writes NHWC (scaled, no LIF)
+                // LIF: native CUDA kernel (sequential across T timesteps)
+                // ZERO explicit permute/transpose kernel calls.
+
+                // GEMM1: kv = K^T @ V (3-arg: K_nhwc, V_nhwc, kv_out)
+                ((CallFn3)tl1.call_fn)(nd.fa_k, nd.fa_v, gemm1_out, s);
+
+                // GEMM2: out = (Q @ kv) * scale → NHWC (3-arg: Q_nhwc, kv, out_nhwc)
+                ((CallFn3)tl2.call_fn)(nd.fa_q, gemm1_out, nd.fa_out, s);
+
+                // LIF: sequential across T (native CUDA, not TileLang)
+                if (nd.fa_lif_spatial > 0 && nd.fa_lif_spatial < nd.fa_lif_total) {
+                    int thr = 256;
+                    int blk = (nd.fa_lif_spatial + thr - 1) / thr;
+                    lif_neuron_kernel<<<blk, thr, 0, s>>>(
+                        nd.fa_out, nd.fa_membrane, nd.fa_out,
+                        nd.fa_lif_total, nd.fa_lif_spatial,
+                        nd.fa_v_thresh, nd.fa_recip_tau);
+                }
+            }
+            else if (nd.fa_variant == 2 || nd.fa_variant == 3) {
+                // DSSA and TokenQK: not yet in C++, handled by Python runtime.
             }
             break;
         }

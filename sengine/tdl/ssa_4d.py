@@ -58,7 +58,9 @@ class SpikformerSSA4D(nn.Module):
     Original SSA operates on (T, B, N, C) with 5D reshapes for neurons.
     This version operates on (T*B, N, C) — neurons are TDL-2 fused (4D).
 
-    Attention pattern: (Q @ K.T) * scale → @ V → attn_lif → proj
+    Attention pattern: Q/K/V projections → FusedSpikformerAttention → proj
+    The attention core (reshape→matmul→scale→matmul→merge→lif) is emitted
+    as a single ONNX custom op to avoid layout tracking issues.
     """
 
     def __init__(self, dim, num_heads, scale, T,
@@ -66,7 +68,8 @@ class SpikformerSSA4D(nn.Module):
                  k_linear=None, k_bn=None, k_lif=None,
                  v_linear=None, v_bn=None, v_lif=None,
                  attn_lif=None,
-                 proj_linear=None, proj_bn=None, proj_lif=None):
+                 proj_linear=None, proj_bn=None, proj_lif=None,
+                 attn_lif_tau=2.0, attn_lif_v_threshold=1.0):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -87,10 +90,23 @@ class SpikformerSSA4D(nn.Module):
         self.proj_linear = proj_linear
         self.proj_bn = proj_bn
         self.proj_lif = proj_lif
+        # Store LIF params for the fused attention custom op
+        self._attn_lif_tau = float(attn_lif_tau)
+        self._attn_lif_v_thresh = float(attn_lif_v_threshold)
 
     @classmethod
     def from_ssa(cls, ssa, T):
         """Convert a 5D spikformer.SSA to 4D, sharing weights."""
+        # Extract attn_lif params
+        attn_lif_tau = 2.0
+        attn_lif_v_thresh = 1.0
+        if hasattr(ssa.attn_lif, 'neuron'):
+            n = ssa.attn_lif.neuron
+            tau = n.tau
+            attn_lif_tau = float(tau.item() if isinstance(tau, torch.Tensor) else tau)
+            attn_lif_v_thresh = float(n.v_threshold.item()
+                                      if isinstance(n.v_threshold, torch.Tensor)
+                                      else n.v_threshold)
         return cls(
             dim=ssa.dim, num_heads=ssa.num_heads, scale=ssa.scale, T=T,
             q_linear=ssa.q_linear, q_bn=ssa.q_bn, q_lif=ssa.q_lif,
@@ -99,6 +115,8 @@ class SpikformerSSA4D(nn.Module):
             attn_lif=ssa.attn_lif,
             proj_linear=ssa.proj_linear, proj_bn=ssa.proj_bn,
             proj_lif=ssa.proj_lif,
+            attn_lif_tau=attn_lif_tau,
+            attn_lif_v_threshold=attn_lif_v_thresh,
         )
 
     def forward(self, x):
@@ -115,31 +133,26 @@ class SpikformerSSA4D(nn.Module):
         head_dim = self.head_dim
 
         # Q projection: Linear → BN1d → LIF
-        # BN1d expects (TB, C, N), Linear outputs (TB, N, C)
-        q = self.q_linear(x)                           # (TB, N, C)
-        q = self.q_bn(q.transpose(-1, -2)).transpose(-1, -2)  # BN on channels
-        q = self.q_lif(q)                              # (TB, N, C) — TDL-2 fused
-        q = q.view(TB, N, self.num_heads, head_dim).permute(0, 2, 1, 3)  # (TB, heads, N, head_dim)
+        q = self.q_linear(x)
+        q = self.q_bn(q.transpose(-1, -2)).transpose(-1, -2)
+        q = self.q_lif(q)                              # (TB, N, C)
 
         # K projection
         k = self.k_linear(x)
         k = self.k_bn(k.transpose(-1, -2)).transpose(-1, -2)
         k = self.k_lif(k)
-        k = k.view(TB, N, self.num_heads, head_dim).permute(0, 2, 1, 3)
 
         # V projection
         v = self.v_linear(x)
         v = self.v_bn(v.transpose(-1, -2)).transpose(-1, -2)
         v = self.v_lif(v)
-        v = v.view(TB, N, self.num_heads, head_dim).permute(0, 2, 1, 3)
 
-        # Attention: (Q @ K^T) * scale → @ V
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # (TB, heads, N, N)
-        x = attn @ v                                    # (TB, heads, N, head_dim)
-
-        # Merge heads → attn_lif → proj
-        x = x.transpose(1, 2).reshape(TB, N, C)        # (TB, N, C)
-        x = self.attn_lif(x)
+        # Fused attention core: reshape→Q@K^T*scale→@V→merge→attn_lif
+        # Emits a single FusedSpikformerAttention ONNX custom op.
+        from sengine.tdl.attention_ops import FusedSpikformerAttnOp
+        x = FusedSpikformerAttnOp.apply(
+            q, k, v, self.T, self.num_heads, self.head_dim, self.scale,
+            self._attn_lif_tau, self._attn_lif_v_thresh)
 
         # Output projection: Linear → BN1d → proj_lif
         x = self.proj_linear(x)
@@ -205,7 +218,8 @@ class MaxFormerSSA4D(nn.Module):
     This version operates on (T*B, C, H, W).
 
     Attention pattern (reversed / linear attention):
-        K.T @ V → Q @ result * scale → attn_lif → proj
+        Q/K/V projections → FusedMaxformerAttention → proj + residual
+    The attention core is emitted as a single ONNX custom op.
     """
 
     def __init__(self, dim, num_heads, scale, T,
@@ -214,7 +228,8 @@ class MaxFormerSSA4D(nn.Module):
                  k_conv=None, k_bn=None, k_lif=None,
                  v_conv=None, v_bn=None, v_lif=None,
                  attn_lif=None,
-                 proj_conv=None, proj_bn=None):
+                 proj_conv=None, proj_bn=None,
+                 attn_lif_tau=2.0, attn_lif_v_threshold=1.0):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -235,6 +250,8 @@ class MaxFormerSSA4D(nn.Module):
         self.attn_lif = attn_lif
         self.proj_conv = proj_conv
         self.proj_bn = proj_bn
+        self._attn_lif_tau = float(attn_lif_tau)
+        self._attn_lif_v_thresh = float(attn_lif_v_threshold)
 
     @classmethod
     def from_ssa(cls, ssa, T):
@@ -244,6 +261,15 @@ class MaxFormerSSA4D(nn.Module):
         so the entire module operates on 4D (TB, C, H, W) without any
         3D reshaping that would confuse ONNX shape inference.
         """
+        attn_lif_tau = 2.0
+        attn_lif_v_thresh = 1.0
+        if hasattr(ssa.attn_lif, 'neuron'):
+            n = ssa.attn_lif.neuron
+            tau = n.tau
+            attn_lif_tau = float(tau.item() if isinstance(tau, torch.Tensor) else tau)
+            attn_lif_v_thresh = float(n.v_threshold.item()
+                                      if isinstance(n.v_threshold, torch.Tensor)
+                                      else n.v_threshold)
         return cls(
             dim=ssa.dim, num_heads=ssa.num_heads, scale=ssa.scale, T=T,
             x_lif=ssa.x_lif,
@@ -256,6 +282,8 @@ class MaxFormerSSA4D(nn.Module):
             attn_lif=ssa.attn_lif,
             proj_conv=_conv1d_to_conv2d(ssa.proj_conv),
             proj_bn=_bn1d_to_bn2d(ssa.proj_bn),
+            attn_lif_tau=attn_lif_tau,
+            attn_lif_v_threshold=attn_lif_v_thresh,
         )
 
     def forward(self, x):
@@ -265,34 +293,25 @@ class MaxFormerSSA4D(nn.Module):
         Returns:
             (T*B, C, H, W) with residual already added
         """
-        TB, C, H, W = x.shape
-        N = H * W
+        H = int(x.shape[2])
+        W = int(x.shape[3])
         identity = x
 
         x = self.x_lif(x)                                # (TB, C, H, W)
 
-        # Q/K/V projections: Conv2d(k=1×1) → BN2d → LIF — all 4D, no reshaping
-        q = self.q_bn(self.q_conv(x))
-        q = self.q_lif(q)
-        q = q.view(TB, self.num_heads, self.head_dim, N).transpose(-2, -1)
+        # Q/K/V projections: Conv2d(k=1×1) → BN2d → LIF — all 4D
+        q = self.q_lif(self.q_bn(self.q_conv(x)))         # (TB, C, H, W)
+        k = self.k_lif(self.k_bn(self.k_conv(x)))
+        v = self.v_lif(self.v_bn(self.v_conv(x)))
 
-        k = self.k_bn(self.k_conv(x))
-        k = self.k_lif(k)
-        k = k.view(TB, self.num_heads, self.head_dim, N).transpose(-2, -1)
+        # Fused attention core: reshape→K^T@V→Q@result*scale→merge→attn_lif
+        from sengine.tdl.attention_ops import FusedMaxformerAttnOp
+        x = FusedMaxformerAttnOp.apply(
+            q, k, v, self.T, self.num_heads, self.head_dim, self.scale,
+            H, W, self._attn_lif_tau, self._attn_lif_v_thresh)
 
-        v = self.v_bn(self.v_conv(x))
-        v = self.v_lif(v)
-        v = v.view(TB, self.num_heads, self.head_dim, N).transpose(-2, -1)
-
-        # Linear attention: K^T @ V → Q @ result * scale
-        kv = k.transpose(-2, -1) @ v                     # (TB, heads, head_dim, head_dim)
-        x = (q @ kv) * self.scale                        # (TB, heads, N, head_dim)
-
-        # Merge heads → proj → residual
-        x = x.transpose(-2, -1).reshape(TB, C, H, W)
-        x = self.attn_lif(x)
+        # Output projection + residual
         x = self.proj_bn(self.proj_conv(x))               # (TB, C, H, W)
-
         return x + identity
 
 
@@ -310,7 +329,8 @@ class TokenQKA4D(nn.Module):
                  q_conv=None, q_bn=None, q_lif=None,
                  k_conv=None, k_bn=None, k_lif=None,
                  attn_lif=None,
-                 proj_conv=None, proj_bn=None):
+                 proj_conv=None, proj_bn=None,
+                 attn_lif_tau=2.0, attn_lif_v_threshold=1.0):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -327,10 +347,21 @@ class TokenQKA4D(nn.Module):
         self.attn_lif = attn_lif
         self.proj_conv = proj_conv
         self.proj_bn = proj_bn
+        self._attn_lif_tau = float(attn_lif_tau)
+        self._attn_lif_v_thresh = float(attn_lif_v_threshold)
 
     @classmethod
     def from_qka(cls, qka, T):
         """Convert a 5D maxformer.Token_QK_Attention to 4D, sharing weights."""
+        attn_lif_tau = 2.0
+        attn_lif_v_thresh = 1.0
+        if hasattr(qka.attn_lif, 'neuron'):
+            n = qka.attn_lif.neuron
+            tau = n.tau
+            attn_lif_tau = float(tau.item() if isinstance(tau, torch.Tensor) else tau)
+            attn_lif_v_thresh = float(n.v_threshold.item()
+                                      if isinstance(n.v_threshold, torch.Tensor)
+                                      else n.v_threshold)
         return cls(
             dim=qka.dim, num_heads=qka.num_heads, T=T,
             proj_lif=qka.proj_lif,
@@ -341,6 +372,8 @@ class TokenQKA4D(nn.Module):
             attn_lif=qka.attn_lif,
             proj_conv=_conv1d_to_conv2d(qka.proj_conv),
             proj_bn=_bn1d_to_bn2d(qka.proj_bn),
+            attn_lif_tau=attn_lif_tau,
+            attn_lif_v_threshold=attn_lif_v_thresh,
         )
 
     def forward(self, x):
@@ -350,28 +383,22 @@ class TokenQKA4D(nn.Module):
         Returns:
             (T*B, C, H, W) with residual already added
         """
-        TB, C, H, W = x.shape
+        H = int(x.shape[2])
+        W = int(x.shape[3])
         identity = x
-        N = H * W
 
         x = self.proj_lif(x)                              # (TB, C, H, W)
 
         # Q/K: Conv2d(k=1×1) → BN2d → LIF — all 4D
-        q = self.q_bn(self.q_conv(x))
-        q = self.q_lif(q)
-        q = q.view(TB, self.num_heads, self.head_dim, N)
+        q = self.q_lif(self.q_bn(self.q_conv(x)))          # (TB, C, H, W)
+        k = self.k_lif(self.k_bn(self.k_conv(x)))
 
-        k = self.k_bn(self.k_conv(x))
-        k = self.k_lif(k)
-        k = k.view(TB, self.num_heads, self.head_dim, N)
+        # Fused scalar attention: sum(Q,head_dim) → LIF → mul(attn, K) → merge
+        from sengine.tdl.attention_ops import FusedTokenQKAttnOp
+        x = FusedTokenQKAttnOp.apply(
+            q, k, self.T, self.num_heads, self.head_dim,
+            H, W, self._attn_lif_tau, self._attn_lif_v_thresh)
 
-        # Scalar attention: sum Q over head_dim → LIF → multiply with K
-        attn = q.sum(dim=2, keepdim=True)                  # (TB, heads, 1, N)
-        attn = self.attn_lif(attn)
-        x = torch.mul(attn, k)                             # (TB, heads, head_dim, N)
-
-        # Merge heads → proj → residual
-        x = x.reshape(TB, C, H, W)
+        # proj → residual
         x = self.proj_bn(self.proj_conv(x))
-
         return x + identity

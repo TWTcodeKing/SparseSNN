@@ -135,14 +135,52 @@ def export_all_kernels(kernels: dict, ir, build_dir: str,
         KernelVariant.TileLangFusedConv1x1BNIF,
         KernelVariant.TileLangLinearBN,
         KernelVariant.TileLangLinearBNLIF,
+        KernelVariant.TileLangDWConvBN,
+        KernelVariant.TileLangFusedDWConvBNIF,
+        KernelVariant.TileLangGroupedConvBN,
+        KernelVariant.TileLangMatMulScale,
+        KernelVariant.TileLangFusedMatMulLIF,
     }
+
+    fused_attn_variants = {
+        KernelVariant.FusedSpikformerAttn,
+        KernelVariant.FusedMaxformerAttn,
+        KernelVariant.FusedDSSAAttn,
+        KernelVariant.FusedTokenQKAttn,
+    }
+
+    def _export_one(kern_obj, so_path):
+        kid = id(kern_obj)
+        if kid in kern_to_so:
+            return kern_to_so[kid]
+        if os.path.exists(so_path):
+            kern_to_so[kid] = so_path
+            return so_path
+        export_kernel_so(kern_obj, so_path, nvcc=nvcc, arch=arch)
+        kern_to_so[kid] = so_path
+        return so_path
 
     count = 0
     for nid, kern in kernels.items():
         if kern is None:
             continue
         node = ir.nodes.get(nid)
-        if node is None or node.assigned_kernel not in tilelang_variants:
+        if node is None:
+            continue
+
+        # Fused attention: kern is (gemm1, gemm2) tuple
+        if node.assigned_kernel in fused_attn_variants and isinstance(kern, tuple):
+            gemm1, gemm2 = kern
+            try:
+                so1 = _export_one(gemm1, os.path.join(build_dir, f'kern_{nid}_g1.so'))
+                so2 = _export_one(gemm2, os.path.join(build_dir, f'kern_{nid}_g2.so'))
+                nid_to_so[nid] = (so1, so2)  # tuple of paths
+                count += 2
+            except Exception as e:
+                logger.error("Failed to export attention kernel for node %d: %s", nid, e)
+            continue
+
+        if node.assigned_kernel not in tilelang_variants:
             continue
 
         kid = id(kern)
@@ -152,7 +190,6 @@ def export_all_kernels(kernels: dict, ir, build_dir: str,
 
         so_path = os.path.join(build_dir, f'kern_{nid}.so')
         if os.path.exists(so_path):
-            # Cached — skip nvcc compilation
             kern_to_so[kid] = so_path
             nid_to_so[nid] = so_path
             continue

@@ -2,8 +2,11 @@
 
 Extended from SpikeEngine with STAKG co-scheduling group support.
 """
-
 from __future__ import annotations
+
+# Module-level ref to the current EngineIR during shape propagation.
+# Set by propagate_shapes(), read by _compute_output_shape() for Slice resolution.
+_ir_ref = None
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
@@ -35,6 +38,7 @@ class OpType(Enum):
     Gemm = auto()            # ONNX Gemm (classifier FC)
     Concat = auto()
     ReduceMean = auto()
+    FusedAttention = auto()      # Fused attention core (all variants)
 
 
 class NeuronType(Enum):
@@ -73,6 +77,19 @@ class KernelVariant(Enum):
     # Per-timestep fused Conv+BN+IF (T=1 per launch, correct, for large batch)
     TileLangFusedConvBNIF = auto() # Fused Conv+BN+IF epilogue (T_steps=1)
     TileLangFusedConv1x1BNIF = auto()  # Fused 1×1 Conv+BN+IF (T_steps=1)
+    # Depthwise conv kernels (for MaxFormer, QKFormer)
+    TileLangDWConvBN = auto()          # DW Conv+BN (groups=C_in)
+    TileLangFusedDWConvBNIF = auto()   # Fused DW Conv+BN+IF (T_steps=1)
+    # Grouped Conv kernel (for SpikingResFormer GWFFN)
+    TileLangGroupedConvBN = auto()     # Grouped Conv+BN (groups > 1, groups != C_in)
+    # Attention matmul kernels (for SpikFormer/MaxFormer attention)
+    TileLangMatMulScale = auto()       # MatMul + scale epilogue, COMPUTE-bound
+    TileLangFusedMatMulLIF = auto()    # Fused MatMul + LIF epilogue (T=1/launch)
+    # Fused attention cores (single op replacing Reshape→MatMul→Scale→LIF chains)
+    FusedSpikformerAttn = auto()       # SpikFormer: Q@K^T*scale→@V→merge→LIF
+    FusedMaxformerAttn = auto()        # MaxFormer:  K^T@V→Q@result*scale→merge→LIF
+    FusedDSSAAttn = auto()             # DSSA: split K/V→K^T@Q*s1→LIF→V@attn*s2→reshape
+    FusedTokenQKAttn = auto()          # MS_QKFormer: sum(Q)→LIF→mul(attn,K)→merge
 
 
 class BoundType(Enum):
@@ -98,8 +115,62 @@ class STAKGPattern(Enum):
 
 
 class TensorLayout(Enum):
-    NCHW = auto()
-    NHWC = auto()
+    NCHW = auto()    # 4D channel-first (N, C, H, W)
+    NHWC = auto()    # 4D channel-last (N, H, W, C)
+    ND = auto()      # non-spatial (2D, 3D, or any dim without H/W semantics)
+
+
+@dataclass
+class KernelLayoutContract:
+    """Declares the expected input/output data layouts for a kernel variant."""
+    input_layout: TensorLayout
+    output_layout: TensorLayout
+
+
+# Maps each KernelVariant to its layout contract.
+# None means "inherits from predecessor" (layout-transparent).
+KERNEL_CONTRACTS: dict = {
+    # TileLang Conv: compiled for NHWC
+    KernelVariant.TileLangConvBN:            KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.TileLangConv1x1BN:         KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.TileLangStemConvBN:         KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.TileLangFusedConvBNIF:      KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.TileLangFusedConv1x1BNIF:   KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.TileLangDWConvBN:           KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.TileLangFusedDWConvBNIF:    KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.TileLangGroupedConvBN:     KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    # cuDNN Conv/Pool: dispatch wrapper handles NHWC→NCHW internally
+    KernelVariant.CuDNNConv:                  KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.CuDNNPool:                  KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    # Linear/MatMul/Neuron: layout-agnostic (2D flattened)
+    KernelVariant.TileLangLinearBN:           KernelLayoutContract(TensorLayout.ND, TensorLayout.ND),
+    KernelVariant.TileLangLinearBNLIF:        KernelLayoutContract(TensorLayout.ND, TensorLayout.ND),
+    KernelVariant.TileLangMatMul:             KernelLayoutContract(TensorLayout.ND, TensorLayout.ND),
+    KernelVariant.TileLangMatMulScale:        KernelLayoutContract(TensorLayout.ND, TensorLayout.ND),
+    KernelVariant.TileLangFusedMatMulLIF:     KernelLayoutContract(TensorLayout.ND, TensorLayout.ND),
+    KernelVariant.CuBLASGemm:                KernelLayoutContract(TensorLayout.ND, TensorLayout.ND),
+    # Fused attention: handle NHWC↔NCHW internally, no external reformats needed
+    KernelVariant.FusedSpikformerAttn:       KernelLayoutContract(TensorLayout.ND, TensorLayout.ND),
+    KernelVariant.FusedMaxformerAttn:        KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.FusedDSSAAttn:             KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.FusedTokenQKAttn:          KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    # Neuron kernels: flatten internally but preserve predecessor layout
+    KernelVariant.CUDAVec4IF:                None,
+    KernelVariant.CUDAVec4LIF:               None,
+    # Layout-transparent (inherit from predecessor)
+    KernelVariant.Elementwise:               None,
+    KernelVariant.ZeroCost:                  None,
+    KernelVariant.TemporalMean:              None,
+    KernelVariant.TileRepeat:                None,
+    KernelVariant.LayoutTranspose:           None,  # special: reformat node
+    KernelVariant.StandaloneLIF:             None,
+    KernelVariant.FusedSparseConvBNLIF:      KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.FusedSparseConvBNLIF_TileSkip: KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.CuSPARSELtLinear:          KernelLayoutContract(TensorLayout.ND, TensorLayout.ND),
+    KernelVariant.WaveFuseInterleaved:       KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.WaveFuseConvBN:            KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.WaveFuseLIF:               None,
+}
 
 
 @dataclass
@@ -128,6 +199,20 @@ class NeuronParams:
 
 
 @dataclass
+class AttentionParams:
+    """Parameters for a fused attention custom op."""
+    variant: str = ""               # "spikformer", "maxformer", "dssa"
+    num_heads: int = 1
+    head_dim: int = 64
+    scale: float = 1.0
+    H: int = 0                      # spatial dims for reshape-back (maxformer/dssa)
+    W: int = 0
+    # Attention LIF neuron params (embedded in the fused op)
+    attn_lif_tau: float = 2.0
+    attn_lif_v_threshold: float = 1.0
+
+
+@dataclass
 class WeightInfo:
     """Metadata about a weight tensor (actual data loaded separately)."""
     name: str = ""             # ONNX initializer name
@@ -151,6 +236,7 @@ class Node:
     # Op-specific params
     conv_params: Optional[ConvParams] = None
     neuron_params: Optional[NeuronParams] = None
+    attention_params: Optional[AttentionParams] = None
     pool_params: Optional[dict] = None
     gemm_params: Optional[dict] = None
     extra_attrs: dict = field(default_factory=dict)
@@ -187,6 +273,7 @@ class Edge:
     tensor_name: str = ""
     tensor_shape: tuple = ()
     tensor_bytes: int = 0
+    layout: TensorLayout = TensorLayout.NCHW
 
 
 @dataclass
@@ -348,6 +435,20 @@ class EngineIR:
 
     def node(self, nid: int) -> Node:
         return self.nodes[nid]
+
+    def get_edge(self, src_id: int, dst_id: int) -> Optional[Edge]:
+        """Find edge between two specific nodes."""
+        for e in self.edges:
+            if e.src_id == src_id and e.dst_id == dst_id:
+                return e
+        return None
+
+    def output_edge_layout(self, nid: int) -> TensorLayout:
+        """Get the layout of a node's outgoing edges (all share the same layout)."""
+        for e in self.edges:
+            if e.src_id == nid:
+                return e.layout
+        return TensorLayout.NCHW  # default
 
     def remove_node(self, nid: int):
         """Remove a node (for absorbed BN nodes). Relinks edges around it.

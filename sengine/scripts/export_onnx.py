@@ -39,6 +39,7 @@ def export_model(model_name: str, output_dir: str, T: int = 4,
         img_size = 32 if 'cifar' in dataset else 224
 
     num_classes = 100 if 'cifar100' in dataset else (10 if 'cifar10' in dataset else 1000)
+    in_channels = 2 if 'dvs' in dataset else 3
 
     print(f"\n=== Exporting {model_name} (T={T}, img={img_size}x{img_size}) ===")
 
@@ -49,12 +50,13 @@ def export_model(model_name: str, output_dir: str, T: int = 4,
         with open(config) as f:
             cfg = yaml.safe_load(f)
         cfg['num_classes'] = num_classes
+        cfg['in_channels'] = in_channels
         cfg['T'] = T
         cfg['img_size'] = img_size
         model = build_model_from_config(cfg)
     else:
         from tengine.utils import build_model
-        model = build_model(model_name, T=T, num_classes=num_classes, in_channels=3)
+        model = build_model(model_name, T=T, num_classes=num_classes, in_channels=in_channels)
 
     model = model.to(device).eval()
 
@@ -67,7 +69,7 @@ def export_model(model_name: str, output_dir: str, T: int = 4,
     else:
         print(f"  No checkpoint (random weights)")
 
-    input_shape = (1, 3, img_size, img_size)
+    input_shape = (1, in_channels, img_size, img_size)
     tag = f"{model_name}_{dataset}"
     plugin_path = os.path.join(output_dir, f"{tag}_plugin.onnx")
 
@@ -78,7 +80,7 @@ def export_model(model_name: str, output_dir: str, T: int = 4,
         from sengine.tdl.transforms import export_with_fused_neurons
         export_with_fused_neurons(
             model, plugin_path, input_shape=input_shape, opset=17,
-            dynamic_batch=False, verbose=True)
+            dynamic_batch=False, force_native_onnx=False, verbose=True)
         print(f"  Saved: {plugin_path} ({os.path.getsize(plugin_path)/1e6:.1f} MB)")
     except Exception as e:
         print(f"  Export FAILED: {e}")

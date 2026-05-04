@@ -17,7 +17,7 @@ from onnx import numpy_helper
 
 from sengine.ir import (
     OpType, NeuronType, KernelVariant, TensorLayout,
-    ConvParams, NeuronParams, Node, Edge, WeightInfo, EngineIR,
+    ConvParams, NeuronParams, AttentionParams, Node, Edge, WeightInfo, EngineIR,
 )
 
 
@@ -26,6 +26,13 @@ _NEURON_OP_MAP = {
     "FusedIFNeuron": NeuronType.IF,
     "FusedLIFNeuron": NeuronType.LIF,
     "FusedMSNeuron": NeuronType.MS,
+}
+
+_ATTENTION_OP_MAP = {
+    "FusedSpikformerAttention": "spikformer",
+    "FusedMaxformerAttention": "maxformer",
+    "FusedDSSAAttention": "dssa",
+    "FusedTokenQKAttention": "token_qk",
 }
 
 # ONNX ops that are part of the temporal-mean tail and can be collapsed
@@ -82,6 +89,32 @@ class ONNXParser:
         # Also extract constants from Identity/Constant nodes that produce
         # BN running stats (not always in graph.initializer)
         self._resolve_constant_identity_nodes()
+
+        # Extract Constant node values (for Slice starts/ends/axes resolution)
+        # Also trace through Unsqueeze/Squeeze/Reshape applied to constants.
+        self._constants: dict[str, np.ndarray] = dict(self._initializers)
+        for node in self.graph.node:
+            if node.op_type == "Constant" and node.output:
+                for attr in node.attribute:
+                    if attr.name == "value":
+                        self._constants[node.output[0]] = numpy_helper.to_array(attr.t)
+        # Propagate constants through shape-preserving ops
+        for node in self.graph.node:
+            if node.op_type in ("Unsqueeze", "Squeeze", "Reshape", "Cast"):
+                if node.input and node.input[0] in self._constants and node.output:
+                    self._constants[node.output[0]] = self._constants[node.input[0]]
+            elif node.op_type == "Concat" and node.output:
+                # Concat of constants → constant
+                parts = []
+                all_const = True
+                for inp in node.input:
+                    if inp in self._constants:
+                        parts.append(self._constants[inp].flatten())
+                    else:
+                        all_const = False
+                        break
+                if all_const and parts:
+                    self._constants[node.output[0]] = np.concatenate(parts)
 
         # Build tensor shape map from value_info + graph inputs
         self._tensor_shapes: dict[str, tuple] = {}
@@ -144,6 +177,8 @@ class ONNXParser:
                 self._parse_bn(onnx_node, ir)
             elif op_type in _NEURON_OP_MAP:
                 self._parse_neuron(onnx_node, ir)
+            elif op_type in _ATTENTION_OP_MAP:
+                self._parse_fused_attention(onnx_node, ir)
             elif op_type == "Add":
                 self._parse_add(onnx_node, ir)
             elif op_type == "MaxPool":
@@ -172,13 +207,21 @@ class ONNXParser:
                 # and aren't structural (Reshape/Transpose/Mul handled above) — skip
                 continue
             else:
+                extra = {"original_op": op_type}
+                # For Slice ops, resolve starts/ends/axes from constants
+                if op_type == "Slice" and len(onnx_node.input) >= 4:
+                    for idx, key in [(1, "starts"), (2, "ends"), (3, "axes")]:
+                        if idx < len(onnx_node.input):
+                            val = self._constants.get(onnx_node.input[idx])
+                            if val is not None:
+                                extra[key] = [int(v) for v in val.flatten().tolist()]
                 node = Node(
                     id=-1,
                     name=node_name or f"unknown_{op_type}",
                     op_type=OpType.Identity,
                     input_names=[n for n in onnx_node.input if n],
                     output_names=list(onnx_node.output),
-                    extra_attrs={"original_op": op_type},
+                    extra_attrs=extra,
                 )
                 ir.add_node(node)
 
@@ -321,6 +364,61 @@ class ONNXParser:
             output_names=list(onnx_node.output),
             neuron_params=params,
             assigned_kernel=KernelVariant.StandaloneLIF,
+        )
+        ir.add_node(node)
+
+    def _parse_fused_attention(self, onnx_node, ir: EngineIR):
+        """Parse fused attention custom ops (FusedSpikformer/Maxformer/DSSAAttention)."""
+        variant = _ATTENTION_OP_MAP[onnx_node.op_type]
+
+        def _ga(name, default=None):
+            """Get attribute with _i/_f suffix fallback."""
+            # Try exact name first, then strip _i or _f suffix
+            val = _get_attr(onnx_node, name)
+            if val is not None:
+                return val
+            base = name[:-2] if name.endswith(('_i', '_f')) else name
+            val = _get_attr(onnx_node, base)
+            if val is not None:
+                return val
+            return default
+
+        params = AttentionParams(
+            variant=variant,
+            num_heads=int(_ga("num_heads_i", 1) or 1),
+            head_dim=int(_ga("head_dim_i", 64) or 64),
+            scale=float(_ga("scale_f", 1.0) or 1.0),
+            H=int(_ga("H_i", 0) or _ga("H_in_i", 0) or _ga("H_in", 0) or 0),
+            W=int(_ga("W_i", 0) or _ga("W_in_i", 0) or _ga("W_in", 0) or 0),
+            attn_lif_tau=float(_ga("attn_lif_tau_f", 2.0) or 2.0),
+            attn_lif_v_threshold=float(_ga("attn_lif_v_threshold_f", 1.0) or 1.0),
+        )
+
+        # Determine kernel variant from attention type
+        kv_map = {
+            "spikformer": KernelVariant.FusedSpikformerAttn,
+            "maxformer": KernelVariant.FusedMaxformerAttn,
+            "dssa": KernelVariant.FusedDSSAAttn,
+            "token_qk": KernelVariant.FusedTokenQKAttn,
+        }
+
+        # For DSSA, scale1/scale2 are tensor inputs (inputs[2] and [3])
+        # Store their initializer names for runtime weight loading
+        extra = {}
+        if variant == "dssa" and len(onnx_node.input) >= 4:
+            extra["scale1_name"] = onnx_node.input[2]
+            extra["scale2_name"] = onnx_node.input[3]
+
+        node = Node(
+            id=-1,
+            name=onnx_node.name or f"fused_attn_{onnx_node.output[0]}",
+            op_type=OpType.FusedAttention,
+            is_stateful=True,  # contains attn_lif
+            input_names=[n for n in onnx_node.input if n],
+            output_names=list(onnx_node.output),
+            attention_params=params,
+            assigned_kernel=kv_map.get(variant, KernelVariant.FusedSpikformerAttn),
+            extra_attrs=extra,
         )
         ir.add_node(node)
 

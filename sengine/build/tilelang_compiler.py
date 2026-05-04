@@ -756,8 +756,55 @@ class TileLangCompiler:
                 except Exception:
                     gemm2 = None
                 self._kernel_cache[key2] = gemm2
+        elif ap.variant == "dssa":
+            from sengine.kernels.fused_attention_kernels import (
+                dssa_kTq_kernel, dssa_v_attn_kernel)
+
+            H_in, W_in = ap.H, ap.W
+            spatial_q = H_in * W_in
+            # Derive spatial_kv from first input shape (y_kv)
+            s0 = node.input_shapes[0] if node.input_shapes else ()
+            if len(s0) >= 2:
+                s0_total = 1
+                for d in s0:
+                    s0_total *= d
+                spatial_kv = s0_total // (TB * 2 * C) if (TB * 2 * C) > 0 else 0
+            else:
+                spatial_kv = 0
+            if spatial_kv <= 0 or spatial_q <= 0:
+                return None
+
+            key1 = f"dssa_kTq_{TB}_{heads}_{hd}_{spatial_kv}_{spatial_q}"
+            key2 = f"dssa_v_attn_{TB}_{heads}_{hd}_{spatial_kv}_{spatial_q}"
+
+            gemm1 = self._kernel_cache.get(key1)
+            if gemm1 is None:
+                cfg1 = self._resolve_config(key1, spatial_kv, hd, spatial_q)
+                try:
+                    gemm1 = dssa_kTq_kernel(
+                        TB=TB, heads=heads, hd=hd,
+                        spatial_kv=spatial_kv, spatial_q=spatial_q,
+                        **{k: cfg1[k] for k in ('block_M', 'block_N', 'block_K',
+                                                 'num_stages', 'threads')})
+                except Exception:
+                    gemm1 = None
+                self._kernel_cache[key1] = gemm1
+
+            gemm2 = self._kernel_cache.get(key2)
+            if gemm2 is None:
+                cfg2 = self._resolve_config(key2, hd, spatial_kv, spatial_q)
+                try:
+                    gemm2 = dssa_v_attn_kernel(
+                        TB=TB, heads=heads, hd=hd,
+                        spatial_kv=spatial_kv, spatial_q=spatial_q,
+                        H_out=H_in, W_out=W_in,
+                        **{k: cfg2[k] for k in ('block_M', 'block_N', 'block_K',
+                                                 'num_stages', 'threads')})
+                except Exception:
+                    gemm2 = None
+                self._kernel_cache[key2] = gemm2
         else:
-            # DSSA and TokenQK: TODO — for now return None (Python dispatch)
+            # TokenQK: TODO — for now return None (Python dispatch)
             gemm1 = gemm2 = None
 
         if gemm1 is None or gemm2 is None:

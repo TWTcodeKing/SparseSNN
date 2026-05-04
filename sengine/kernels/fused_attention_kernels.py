@@ -160,3 +160,146 @@ def maxformer_qkv_kernel(
                     out_nhwc[tb * N + n, head * hd + d] = out_shared[i, j]
 
     return main
+
+
+# ---------------------------------------------------------------------------
+# SpikingResFormer DSSA: K^T@Q*scale1 → LIF → V@attn*scale2
+# Two GEMM kernels that read NHWC y_kv and x_query directly.
+# ---------------------------------------------------------------------------
+
+@tilelang.jit(out_idx=[-1])
+def dssa_kTq_kernel(
+    TB, heads, hd, spatial_kv, spatial_q,
+    block_M, block_N, block_K, num_stages, threads,
+):
+    """GEMM1 for DSSA: attn[b,head] = K[b,head]^T @ Q[b,head].
+
+    Reads K from y_kv NHWC (TB, h'*w', 2*heads*hd) — first C channels.
+    Reads Q from x_query NHWC (TB, H*W, heads*hd).
+    Output: attn (TB*heads, spatial_kv, spatial_q) contiguous.
+
+    GEMM per (tb, head): C(spatial_kv, spatial_q) = K^T(spatial_kv, hd) @ Q(hd, spatial_q)
+    Scale1 applied separately (it's a per-head tensor, not a scalar).
+    """
+    C = heads * hd
+    C2 = 2 * C  # y_kv has 2C channels
+    batch = TB * heads
+
+    @T.prim_func
+    def main(
+        y_kv_nhwc:  T.Tensor((TB * spatial_kv, C2), T.float16),
+        x_q_nhwc:   T.Tensor((TB * spatial_q, C), T.float16),
+        attn_out:   T.Tensor((batch * spatial_kv, spatial_q), T.float16),
+    ):
+        with T.Kernel(
+            T.ceildiv(spatial_q, block_N), T.ceildiv(spatial_kv, block_M), batch,
+            threads=threads,
+        ) as (bx, by, bz):
+            A_shared = T.alloc_shared((block_M, block_K), T.float16)
+            B_shared = T.alloc_shared((block_K, block_N), T.float16)
+            acc      = T.alloc_fragment((block_M, block_N), T.float32)
+            T.clear(acc)
+
+            tb = bz // heads
+            head = bz % heads
+
+            for k_iter in T.Pipelined(T.ceildiv(hd, block_K), num_stages=num_stages):
+                # Load A = K^T: A[n_kv, d] = y_kv[tb*spatial_kv + n_kv, head*hd + d]
+                for i, j in T.Parallel(block_M, block_K):
+                    n_kv = by * block_M + i
+                    d = k_iter * block_K + j
+                    if n_kv < spatial_kv and d < hd:
+                        A_shared[i, j] = y_kv_nhwc[tb * spatial_kv + n_kv, head * hd + d]
+                    else:
+                        A_shared[i, j] = T.float16(0)
+
+                # Load B = Q: B[d, n_q] = x_q[tb*spatial_q + n_q, head*hd + d]
+                for i, j in T.Parallel(block_K, block_N):
+                    d = k_iter * block_K + i
+                    n_q = bx * block_N + j
+                    if d < hd and n_q < spatial_q:
+                        B_shared[i, j] = x_q_nhwc[tb * spatial_q + n_q, head * hd + d]
+                    else:
+                        B_shared[i, j] = T.float16(0)
+
+                T.gemm(A_shared, B_shared, acc)
+
+            # Write attn_out contiguous: [bz * spatial_kv + n_kv, n_q]
+            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            for i, j in T.Parallel(block_M, block_N):
+                n_kv = by * block_M + i
+                n_q = bx * block_N + j
+                if n_kv < spatial_kv and n_q < spatial_q:
+                    out_shared[i, j] = T.cast(acc[i, j], T.float16)
+            T.copy(out_shared, attn_out[bz * spatial_kv + by * block_M, bx * block_N])
+
+    return main
+
+
+@tilelang.jit(out_idx=[-1])
+def dssa_v_attn_kernel(
+    TB, heads, hd, spatial_kv, spatial_q, H_out, W_out,
+    block_M, block_N, block_K, num_stages, threads,
+):
+    """GEMM2 for DSSA: out[b,head] = V[b,head] @ attn[b,head].
+
+    Reads V from y_kv NHWC — second C channels (offset by C).
+    Reads attn from contiguous (TB*heads, spatial_kv, spatial_q) — GEMM1 output.
+    Writes output to NHWC (TB, H_out, W_out, C).
+
+    GEMM per (tb, head): C(hd, spatial_q) = V(hd, spatial_kv) @ attn(spatial_kv, spatial_q)
+    Scale2 applied separately (per-head tensor).
+    """
+    C = heads * hd
+    C2 = 2 * C
+    batch = TB * heads
+
+    @T.prim_func
+    def main(
+        y_kv_nhwc:  T.Tensor((TB * spatial_kv, C2), T.float16),
+        attn_in:    T.Tensor((batch * spatial_kv, spatial_q), T.float16),
+        out_nhwc:   T.Tensor((TB * spatial_q, C), T.float16),
+    ):
+        with T.Kernel(
+            T.ceildiv(spatial_q, block_N), T.ceildiv(hd, block_M), batch,
+            threads=threads,
+        ) as (bx, by, bz):
+            A_shared = T.alloc_shared((block_M, block_K), T.float16)
+            B_shared = T.alloc_shared((block_K, block_N), T.float16)
+            acc      = T.alloc_fragment((block_M, block_N), T.float32)
+            T.clear(acc)
+
+            tb = bz // heads
+            head = bz % heads
+
+            for k_iter in T.Pipelined(T.ceildiv(spatial_kv, block_K), num_stages=num_stages):
+                # Load A = V: A[d, n_kv] = y_kv[tb*spatial_kv + n_kv, C + head*hd + d]
+                # (V is second half of channels, offset by C)
+                for i, j in T.Parallel(block_M, block_K):
+                    d = by * block_M + i
+                    n_kv = k_iter * block_K + j
+                    if d < hd and n_kv < spatial_kv:
+                        A_shared[i, j] = y_kv_nhwc[tb * spatial_kv + n_kv, C + head * hd + d]
+                    else:
+                        A_shared[i, j] = T.float16(0)
+
+                # Load B = attn: contiguous
+                T.copy(attn_in[bz * spatial_kv + k_iter * block_K, bx * block_N], B_shared)
+
+                T.gemm(A_shared, B_shared, acc)
+
+            # Write to NHWC: out[tb*spatial_q + n_q, head*hd + d]
+            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            for i, j in T.Parallel(block_M, block_N):
+                d = by * block_M + i
+                n_q = bx * block_N + j
+                if d < hd and n_q < spatial_q:
+                    out_shared[i, j] = T.cast(acc[i, j], T.float16)
+
+            for i, j in T.Parallel(block_M, block_N):
+                d = by * block_M + i
+                n_q = bx * block_N + j
+                if d < hd and n_q < spatial_q:
+                    out_nhwc[tb * spatial_q + n_q, head * hd + d] = out_shared[i, j]
+
+    return main

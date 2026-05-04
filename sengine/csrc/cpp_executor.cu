@@ -870,8 +870,54 @@ void sengine_execute(SEngineExecutor* e) {
                         nd.fa_v_thresh, nd.fa_recip_tau);
                 }
             }
-            else if (nd.fa_variant == 2 || nd.fa_variant == 3) {
-                // DSSA and TokenQK: not yet in C++, handled by Python runtime.
+            else if (nd.fa_variant == 2) {
+                // ── DSSA: fused NHWC TileLang attention ──
+                // GEMM1 .so: reads K from y_kv, Q from x_query (both NHWC)
+                // Scale1: element-wise per-head broadcast
+                // LIF: native CUDA (sequential across T)
+                // GEMM2 .so: reads V from y_kv, attn from GEMM1 (writes NHWC)
+                // Scale2: element-wise per-head broadcast
+
+                // GEMM1: attn = K^T @ Q (3-arg: y_kv, x_query, attn_out)
+                ((CallFn3)tl1.call_fn)(nd.fa_q, nd.fa_k, gemm1_out, s);
+
+                // Scale1: attn *= scale1 (per-head broadcast)
+                if (nd.fa_scale1_ptr) {
+                    int batch = TB * heads;
+                    int spatial_kv = nd.fa_ws_perm_q;   // DSSA spatial_kv stored here
+                    int spatial_q = nd.fa_N;
+                    int total_attn = batch * spatial_kv * spatial_q;
+                    int inner = spatial_kv * spatial_q;
+                    int thr = 256, blk = (total_attn + thr - 1) / thr;
+                    scale_tensor_broadcast_kernel<<<blk, thr, 0, s>>>(
+                        gemm1_out, nd.fa_scale1_ptr, total_attn, heads, inner);
+                }
+
+                // LIF
+                if (nd.fa_lif_spatial > 0 && nd.fa_lif_spatial < nd.fa_lif_total) {
+                    int thr = 256, blk = (nd.fa_lif_spatial + thr - 1) / thr;
+                    lif_neuron_kernel<<<blk, thr, 0, s>>>(
+                        gemm1_out, nd.fa_membrane, gemm1_out,
+                        nd.fa_lif_total, nd.fa_lif_spatial,
+                        nd.fa_v_thresh, nd.fa_recip_tau);
+                }
+
+                // GEMM2: out = V @ attn (3-arg: y_kv, attn, out_nhwc)
+                ((CallFn3)tl2.call_fn)(nd.fa_q, gemm1_out, nd.fa_out, s);
+
+                // Scale2: out *= scale2 (per-head broadcast)
+                if (nd.fa_scale2_ptr) {
+                    int batch = TB * heads;
+                    int spatial_q = nd.fa_N;
+                    int total_out = batch * hd * spatial_q;
+                    int inner = hd * spatial_q;
+                    int thr = 256, blk = (total_out + thr - 1) / thr;
+                    scale_tensor_broadcast_kernel<<<blk, thr, 0, s>>>(
+                        nd.fa_out, nd.fa_scale2_ptr, total_out, heads, inner);
+                }
+            }
+            else if (nd.fa_variant == 3) {
+                // TokenQK: not yet in C++, handled by Python runtime.
             }
             break;
         }

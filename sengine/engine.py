@@ -474,7 +474,7 @@ class SEngine:
                     OW = (s[2] + 2*pad - ks) // st + 1
                     exe.set_maxpool_node(nid, p(input_buf), p(output_buf),
                                         s[0], s[1], s[2], s[3], OH, OW, ks, st, pad)
-                elif node.op_type == OpType.GlobalAvgPool and input_buf is not None and output_buf is not None:
+                elif node.op_type == OpType.GlobalAvgPool and input_buf is not None and output_buf is not None and input_buf.ndim == 4:
                     s = input_buf.shape
                     exe.set_global_avgpool_node(nid, p(input_buf), p(output_buf),
                                                s[0], s[1], s[2], s[3])
@@ -567,9 +567,17 @@ class SEngine:
 
                 # Gather predecessor buffers
                 pred_bufs = [act.get(pid) for pid in preds if act.get(pid) is not None]
-                q_buf = pred_bufs[0] if len(pred_bufs) > 0 else None
-                k_buf = pred_bufs[1] if len(pred_bufs) > 1 else None
-                v_buf = pred_bufs[2] if len(pred_bufs) > 2 else None
+                if variant == 2 and len(pred_bufs) >= 2:
+                    # DSSA: disambiguate y_kv (2C channels) vs x_query (C channels)
+                    if pred_bufs[0].shape[-1] == 2 * C:
+                        q_buf, k_buf = pred_bufs[0], pred_bufs[1]  # q=y_kv, k=x_query
+                    else:
+                        q_buf, k_buf = pred_bufs[1], pred_bufs[0]
+                    v_buf = None
+                else:
+                    q_buf = pred_bufs[0] if len(pred_bufs) > 0 else None
+                    k_buf = pred_bufs[1] if len(pred_bufs) > 1 else None
+                    v_buf = pred_bufs[2] if len(pred_bufs) > 2 else None
 
                 if q_buf is None or output_buf is None:
                     exe.set_skip_node(nid)
@@ -598,6 +606,21 @@ class SEngine:
                     ws_perm_v = 0
                     ws_gemm1 = 0
                     ws_total = gemm1_size
+                elif variant == 2:  # DSSA — fused NHWC kernels
+                    spatial_q = N  # N = H * W
+                    spatial_kv = 0
+                    if q_buf is not None:
+                        spatial_kv = q_buf.numel() // (TB * 2 * C) if (TB * 2 * C) > 0 else 0
+                    if spatial_kv <= 0:
+                        exe.set_skip_node(nid)
+                        continue
+                    gemm1_size = batch * spatial_kv * spatial_q
+                    needs_permute = 0
+                    ws_perm_q = spatial_kv   # encode spatial_kv for C++ DSSA dispatch
+                    ws_perm_k = 0
+                    ws_perm_v = 0
+                    ws_gemm1 = 0
+                    ws_total = gemm1_size
                 else:
                     exe.set_skip_node(nid)
                     continue
@@ -613,6 +636,27 @@ class SEngine:
                 lif_spatial = mem.numel() if mem is not None else 0
                 recip_tau = 1.0 / ap.attn_lif_tau if ap.attn_lif_tau > 0 else 0.5
 
+                # Scale tensor pointers (DSSA per-head scales)
+                s1_ptr, s2_ptr = 0, 0
+                if variant == 2:
+                    import numpy as np
+                    s1_name = node.extra_attrs.get("scale1_name")
+                    s2_name = node.extra_attrs.get("scale2_name")
+                    for sname, attr in [(s1_name, '_dssa_s1'), (s2_name, '_dssa_s2')]:
+                        if sname:
+                            sw = ir.weights.get(sname)
+                            if sw is not None:
+                                st = torch.from_numpy(sw.copy()).half().cuda() if isinstance(sw, np.ndarray) else sw.half().cuda()
+                                setattr(self, f'{attr}_{nid}', st)  # prevent GC
+                                if attr == '_dssa_s1':
+                                    s1_ptr = st.data_ptr()
+                                else:
+                                    s2_ptr = st.data_ptr()
+                    # For DSSA, lif_total = attn size (not q_buf size)
+                    lif_total = gemm1_size
+                    # spatial_kv is used in C++ for scale broadcast inner dim
+                    # Store it in the fa_spatial_kv field (reuse for DSSA)
+
                 exe.set_fused_attn_node(
                     nid, variant, gemm1_idx, gemm2_idx,
                     p(q_buf), p(k_buf) if k_buf is not None else 0,
@@ -622,7 +666,7 @@ class SEngine:
                     TB, heads, hd, N, ap.H, ap.W,
                     lif_total, lif_spatial,
                     ap.attn_lif_v_threshold, recip_tau,
-                    needs_permute, 0, 0,
+                    needs_permute, s1_ptr, s2_ptr,
                     ws_gemm1, ws_perm_q, ws_perm_k, ws_perm_v)
 
             else:

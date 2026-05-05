@@ -17,6 +17,10 @@ Usage:
     python scripts/bench_sengine_latency.py --model sew_resnet34 --dataset cifar100 \
         --checkpoint obc_pt/sew_resnet34_cifar100_sbc_2_4_global.pth \
         --batch-sizes 1,4,8,16,32
+
+    # Export plugin ONNX only (for cross-platform workflows)
+    python scripts/bench_sengine_latency.py --model sew_resnet34 --dataset imagenet \
+        --export-only
 """
 
 import argparse
@@ -56,7 +60,44 @@ def export_plugin_onnx(args, ds_cfg, img_size, output_dir):
         checkpoint=args.checkpoint,
     )
     if result and os.path.exists(result):
-        print(f"  Saved: {result}")
+        # Consolidate external data into single/minimal file(s)
+        if args.single_file:
+            import onnx
+            onnx_dir = os.path.dirname(os.path.abspath(result)) or '.'
+            onnx_model = onnx.load(result, load_external_data=False)
+            # Collect external data file names
+            ext_files = set()
+            for tensor in onnx_model.graph.initializer:
+                for entry in tensor.external_data:
+                    if entry.key == 'location':
+                        ext_files.add(entry.value)
+            for node in onnx_model.graph.node:
+                for attr in node.attribute:
+                    if attr.type == 4 and attr.t.data_location == 1:
+                        for entry in attr.t.external_data:
+                            if entry.key == 'location':
+                                ext_files.add(entry.value)
+            # Reload with data
+            onnx_model = onnx.load(result)
+            # Try single file; fall back to one .data file if > 2GB
+            try:
+                onnx.save(onnx_model, result)
+                msg = "single file"
+            except Exception:
+                data_file = os.path.basename(result) + '.data'
+                onnx.save(onnx_model, result,
+                          save_as_external_data=True,
+                          all_tensors_to_one_file=True,
+                          location=data_file)
+                msg = f"onnx + {data_file} (model > 2GB)"
+            # Remove old external data files
+            for f in ext_files:
+                fpath = os.path.join(onnx_dir, f)
+                if os.path.isfile(fpath):
+                    os.remove(fpath)
+            print(f"  Saved ({msg}): {result}")
+        else:
+            print(f"  Saved: {result}")
     else:
         raise RuntimeError(f"ONNX export failed for {model_name}")
     return result
@@ -93,6 +134,10 @@ def main():
     # Output
     parser.add_argument('--export-dir', type=str, default='sengine/exports',
                         help='Directory for ONNX and .sengine files')
+    parser.add_argument('--export-only', action='store_true',
+                        help='Export plugin ONNX only, skip build and benchmark')
+    parser.add_argument('--single-file', action='store_true',
+                        help='Consolidate ONNX external data into a single .onnx file')
 
     args = parser.parse_args()
 
@@ -115,6 +160,10 @@ def main():
     print(f"{'='*60}")
     plugin_onnx = export_plugin_onnx(args, ds_cfg, img_size, args.export_dir)
 
+    if args.export_only:
+        print(f"\n  Export complete. Plugin ONNX: {plugin_onnx}")
+        return
+
     # Step 2: Build/load + benchmark for each batch size
     print(f"\n{'='*60}")
     print(f"  Phase 2: Build + benchmark sengine (C++ executor)")
@@ -135,7 +184,7 @@ def main():
             else:
                 print(f"\n  [B={B}] Building sengine from ONNX...")
                 t0 = time.time()
-                engine = sengine.build(plugin_onnx, T=args.T, batch_size=B)
+                engine = sengine.build(plugin_onnx, T=args.T, batch_size=B, autotune=True)
                 build_s = time.time() - t0
                 print(f"          Built in {build_s:.1f}s")
                 engine.save(sengine_path)

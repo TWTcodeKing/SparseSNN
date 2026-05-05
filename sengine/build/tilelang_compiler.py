@@ -146,47 +146,40 @@ def _pick_config(M: int, K_red: int, F: int) -> dict:
 
 
 def _autotune_config(compile_fn, profile_args: tuple, M: int, K_red: int, F: int,
-                     n_profile: int = 200) -> dict:
-    """Try multiple tile configs and return the fastest.
+                     n_profile: int = 50) -> dict:
+    """Fast coordinate-descent autotuning.
 
-    Hardware-adaptive: uses detected SM count and max smem to prune config space.
+    Instead of exhaustive grid search (96+ configs, ~6 min/kernel), uses:
+    1. Start with 3-5 high-probability configs based on problem size
+    2. Coordinate descent: sweep each axis independently
+    Total: ~8-12 compilations per kernel (~30-50s), not 40+ (~3 min).
     """
     hw = _get_hw_info()
-    smem_limit = min(hw['max_smem'], 100 * 1024)  # conservative
+    smem_limit = min(hw['max_smem'], 100 * 1024)
     sm_count = hw['sm_count']
 
-    candidates = []
-    for bm in [32, 64, 128, 256]:
-        for bn in [32, 64, 128]:
-            for bk in [32, 64]:
-                for ns in [2, 3]:
-                    for thr in [128, 256]:
-                        if bk > K_red or bn > F * 2 or bm > M:
-                            continue
-                        smem = (bm * bk + bk * bn) * 2 * ns
-                        if smem > smem_limit:
-                            continue
-                        # Require minimum parallelism: at least sm_count/4 tiles
-                        n_tiles = ((M + bm - 1) // bm) * ((F + bn - 1) // bn)
-                        if n_tiles < sm_count // 4:
-                            continue
-                        min_threads = max(bm, bn) // 2
-                        if thr < min_threads:
-                            continue
-                        candidates.append(dict(block_M=bm, block_N=bn, block_K=bk,
-                                               num_stages=ns, threads=thr))
+    def _is_valid(cfg):
+        bm, bn, bk, ns, thr = cfg['block_M'], cfg['block_N'], cfg['block_K'], cfg['num_stages'], cfg['threads']
+        if bk > K_red or bn > F * 2 or bm > M:
+            return False
+        smem = (bm * bk + bk * bn) * 2 * ns
+        if smem > smem_limit:
+            return False
+        n_tiles = ((M + bm - 1) // bm) * ((F + bn - 1) // bn)
+        if n_tiles < sm_count // 4:
+            return False
+        if thr < max(bm, bn) // 2:
+            return False
+        return True
 
-    best_us = float('inf')
-    best_cfg = _pick_config(M, K_red, F)
-
-    for cfg in candidates:
+    def _profile(cfg):
+        if not _is_valid(cfg):
+            return float('inf')
         try:
             kern = compile_fn(cfg)
-            # Warmup
-            for _ in range(20):
+            for _ in range(10):
                 kern(*profile_args)
             torch.cuda.synchronize()
-            # Profile
             s = torch.cuda.Event(enable_timing=True)
             e = torch.cuda.Event(enable_timing=True)
             s.record()
@@ -194,12 +187,78 @@ def _autotune_config(compile_fn, profile_args: tuple, M: int, K_red: int, F: int
                 kern(*profile_args)
             e.record()
             torch.cuda.synchronize()
-            us = s.elapsed_time(e) / n_profile * 1000
-            if us < best_us:
-                best_us = us
-                best_cfg = cfg
+            return s.elapsed_time(e) / n_profile * 1000  # microseconds
         except Exception:
+            return float('inf')
+
+    # Phase 1: Try 4 seed configs (covers common sweet spots)
+    seeds = [
+        dict(block_M=64, block_N=64, block_K=32, num_stages=2, threads=128),
+        dict(block_M=128, block_N=64, block_K=32, num_stages=2, threads=128),
+        dict(block_M=64, block_N=128, block_K=32, num_stages=2, threads=256),
+        dict(block_M=128, block_N=128, block_K=32, num_stages=2, threads=256),
+    ]
+    # Add heuristic default
+    seeds.append(_pick_config(M, K_red, F))
+
+    best_us = float('inf')
+    best_cfg = seeds[-1]
+    for cfg in seeds:
+        us = _profile(cfg)
+        if us < best_us:
+            best_us = us
+            best_cfg = dict(cfg)
+
+    # Phase 2: Coordinate descent from best seed
+    # Sweep block_M
+    for bm in [32, 64, 128, 256]:
+        if bm == best_cfg['block_M']:
             continue
+        cfg = dict(best_cfg, block_M=bm)
+        us = _profile(cfg)
+        if us < best_us:
+            best_us = us
+            best_cfg = cfg
+
+    # Sweep block_N
+    for bn in [32, 64, 128]:
+        if bn == best_cfg['block_N']:
+            continue
+        cfg = dict(best_cfg, block_N=bn)
+        us = _profile(cfg)
+        if us < best_us:
+            best_us = us
+            best_cfg = cfg
+
+    # Sweep block_K
+    for bk in [32, 64]:
+        if bk == best_cfg['block_K']:
+            continue
+        cfg = dict(best_cfg, block_K=bk)
+        us = _profile(cfg)
+        if us < best_us:
+            best_us = us
+            best_cfg = cfg
+
+    # Sweep num_stages
+    for ns in [2, 3, 4]:
+        if ns == best_cfg['num_stages']:
+            continue
+        cfg = dict(best_cfg, num_stages=ns)
+        us = _profile(cfg)
+        if us < best_us:
+            best_us = us
+            best_cfg = cfg
+
+    # Sweep threads
+    for thr in [128, 256]:
+        if thr == best_cfg['threads']:
+            continue
+        cfg = dict(best_cfg, threads=thr)
+        us = _profile(cfg)
+        if us < best_us:
+            best_us = us
+            best_cfg = cfg
 
     best_cfg['latency_us'] = best_us
     return best_cfg

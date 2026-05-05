@@ -49,10 +49,12 @@ def profile_tilelang_kernel(so_path: str, input_shapes: list[tuple],
         t = torch.empty(*shape, dtype=dtype, device='cuda')
         tensors.append(t)
 
-    # Determine arg count from number of tensors
+    # Use PyTorch's current CUDA stream so events and kernel are synchronized
+    stream_ptr = torch.cuda.current_stream().cuda_stream
+
     call_fn = lib.call
     args = [ctypes.c_void_p(t.data_ptr()) for t in tensors]
-    args.append(ctypes.c_void_p(0))  # stream = 0
+    args.append(ctypes.c_void_p(stream_ptr))
 
     # Warmup
     for _ in range(n_warmup):
@@ -310,11 +312,15 @@ def main():
 
     # C++ CUDA Graph (via sengine.build)
     import sengine as se
-    cpp_engine = se.build(args.onnx, T=args.T, batch_size=args.batch)
-    cpp_ms = cpp_engine.benchmark(warmup=args.warmup, iters=args.iters)
-    cpp_us = cpp_ms * 1000
-    cpp_mode = "C++" if not cpp_engine._use_python_runtime else "Python"
-    cpp_engine.destroy()
+    try:
+        cpp_engine = se.build(args.onnx, T=args.T, batch_size=args.batch)
+        cpp_ms = cpp_engine.benchmark(warmup=min(args.warmup, 200), iters=min(args.iters, 500))
+        cpp_us = cpp_ms * 1000  # ms → us
+        cpp_mode = "C++" if not cpp_engine._use_python_runtime else "Python"
+        cpp_engine.destroy()
+    except Exception as e:
+        cpp_us = 0
+        cpp_mode = f"FAILED: {e}"
     torch.cuda.empty_cache()
 
     full_us = py_us  # for breakdown percentages (matches per-kernel profiling)

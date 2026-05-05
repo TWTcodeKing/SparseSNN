@@ -87,6 +87,8 @@ def main():
                         help='Model checkpoint path (random weights if omitted)')
     parser.add_argument('--sparse', action='store_true',
                         help='Enable TRT SPARSE_WEIGHTS flag (2:4 sparse)')
+    parser.add_argument('--no-simplify', action='store_true',
+                        help='Skip onnxsim (required on ARM/Jetson where onnxruntime crashes)')
 
     # Benchmark
     parser.add_argument('--batch-sizes', type=str, default='1,4,8,16',
@@ -131,7 +133,8 @@ def main():
             print(f"\n  [B={B}] Exporting ONNX (standard torch.onnx.export)...")
             reset_net(model)
             export_onnx(model, onnx_path, input_shape=input_shape,
-                        dynamic_batch=False, simplify=True, verbose=False)
+                        dynamic_batch=False, simplify=not args.no_simplify,
+                        verbose=False)
             print(f"          Saved: {onnx_path}")
         else:
             print(f"\n  [B={B}] ONNX exists: {onnx_path}")

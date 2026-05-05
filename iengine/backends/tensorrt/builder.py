@@ -23,8 +23,12 @@ def _try_import_trt():
         return trt
     except ImportError:
         raise ImportError(
-            "tensorrt not found. Install with: "
-            "uv pip install tensorrt-cu12 --python .venv/bin/python"
+            "tensorrt not found. Install with:\n"
+            "  pip install tensorrt-cu12\n"
+            "On Jetson, TensorRT is system-installed — if using conda/venv, "
+            "link it:\n"
+            "  ln -s /usr/lib/python3.*/dist-packages/tensorrt* "
+            "$(python -c 'import site; print(site.getsitepackages()[0])')/"
         )
 
 

@@ -340,15 +340,24 @@ class TileLangCompiler:
         M = self.TB * OH * OW
         K_red = cp.kernel_h * cp.kernel_w * cp.in_channels
 
-        cfg = self._resolve_config(key, M, K_red, cp.out_channels)
+        def _compile(cfg):
+            return _conv2d_bn_t4(
+                TB=self.TB, C_in=cp.in_channels, H=H, W=W, F=cp.out_channels,
+                K=cp.kernel_h, S=cp.stride_h, D=cp.dilation_h, P=cp.pad_h,
+                **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
+        _profile_args = (
+            torch.empty(self.TB, H, W, cp.in_channels, dtype=torch.float16, device='cuda'),
+            torch.empty(cp.kernel_h, cp.kernel_w, cp.in_channels, cp.out_channels, dtype=torch.float16, device='cuda'),
+            torch.ones(cp.out_channels, dtype=torch.float32, device='cuda'),
+            torch.zeros(cp.out_channels, dtype=torch.float32, device='cuda'),
+        )
+        cfg = self._resolve_config(key, M, K_red, cp.out_channels,
+                                    compile_fn=_compile, profile_args=_profile_args)
         logger.debug("  Conv+BN %d→%d %dx%d s=%d M=%d cfg=%dx%dx%d",
                      cp.in_channels, cp.out_channels, H, W, cp.stride_h, M,
                      cfg['block_M'], cfg['block_N'], cfg['block_K'])
 
-        kern = _conv2d_bn_t4(
-            TB=self.TB, C_in=cp.in_channels, H=H, W=W, F=cp.out_channels,
-            K=cp.kernel_h, S=cp.stride_h, D=cp.dilation_h, P=cp.pad_h,
-            **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
+        kern = _compile(cfg)
 
         self._kernel_cache[key] = kern
         self._config_cache[key] = cfg
@@ -376,23 +385,34 @@ class TileLangCompiler:
         M = self.B * OH * OW
         K_red = cp.kernel_h * cp.kernel_w * cp.in_channels
 
-        cfg = self._resolve_config(key, M, K_red, cp.out_channels)
-        logger.debug("  Fused Conv+BN+IF %d→%d %dx%d B=%d M=%d cfg=%dx%dx%d",
-                     cp.in_channels, cp.out_channels, H, W, self.B, M,
-                     cfg['block_M'], cfg['block_N'], cfg['block_K'])
-
-        # Use the existing fused T4 kernels with T_steps=1 (no temporal race)
-        if cp.kernel_h == 1 and cp.kernel_w == 1:
-            kern = conv1x1_bn_if_t4_kernel(
-                TB=self.B, C_in=cp.in_channels, H=H, W=W, F=cp.out_channels,
-                S=cp.stride_h, T_steps=1,
-                **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
-        else:
-            kern = conv2d_bn_if_t4_kernel(
+        is_1x1 = (cp.kernel_h == 1 and cp.kernel_w == 1)
+        def _compile(cfg):
+            if is_1x1:
+                return conv1x1_bn_if_t4_kernel(
+                    TB=self.B, C_in=cp.in_channels, H=H, W=W, F=cp.out_channels,
+                    S=cp.stride_h, T_steps=1,
+                    **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
+            return conv2d_bn_if_t4_kernel(
                 TB=self.B, C_in=cp.in_channels, H=H, W=W, F=cp.out_channels,
                 K=cp.kernel_h, S=cp.stride_h, D=cp.dilation_h, P=cp.pad_h,
                 T_steps=1,
                 **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
+        _profile_args = (
+            torch.empty(self.B, H, W, cp.in_channels, dtype=torch.float16, device='cuda'),
+            torch.empty(1, 1, cp.in_channels, cp.out_channels, dtype=torch.float16, device='cuda')
+                if is_1x1 else
+                torch.empty(cp.kernel_h, cp.kernel_w, cp.in_channels, cp.out_channels, dtype=torch.float16, device='cuda'),
+            torch.ones(cp.out_channels, dtype=torch.float32, device='cuda'),
+            torch.zeros(cp.out_channels, dtype=torch.float32, device='cuda'),
+            torch.zeros(self.B * OH * OW, cp.out_channels, dtype=torch.float32, device='cuda'),  # membrane
+        )
+        cfg = self._resolve_config(key, M, K_red, cp.out_channels,
+                                    compile_fn=_compile, profile_args=_profile_args)
+        logger.debug("  Fused Conv+BN+IF %d→%d %dx%d B=%d M=%d cfg=%dx%dx%d",
+                     cp.in_channels, cp.out_channels, H, W, self.B, M,
+                     cfg['block_M'], cfg['block_N'], cfg['block_K'])
+
+        kern = _compile(cfg)
 
         self._kernel_cache[key] = kern
         self._config_cache[key] = cfg
@@ -416,12 +436,21 @@ class TileLangCompiler:
         OW = (W + cp.stride_w - 1) // cp.stride_w
         M = self.TB * OH * OW
 
-        cfg = self._resolve_config(key, M, cp.in_channels, cp.out_channels)
+        def _compile(cfg):
+            return _conv1x1_bn_t4(
+                TB=self.TB, C_in=cp.in_channels, H=H, W=W, F=cp.out_channels,
+                S=cp.stride_h,
+                **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
+        _profile_args = (
+            torch.empty(self.TB, H, W, cp.in_channels, dtype=torch.float16, device='cuda'),
+            torch.empty(1, 1, cp.in_channels, cp.out_channels, dtype=torch.float16, device='cuda'),
+            torch.ones(cp.out_channels, dtype=torch.float32, device='cuda'),
+            torch.zeros(cp.out_channels, dtype=torch.float32, device='cuda'),
+        )
+        cfg = self._resolve_config(key, M, cp.in_channels, cp.out_channels,
+                                    compile_fn=_compile, profile_args=_profile_args)
 
-        kern = _conv1x1_bn_t4(
-            TB=self.TB, C_in=cp.in_channels, H=H, W=W, F=cp.out_channels,
-            S=cp.stride_h,
-            **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
+        kern = _compile(cfg)
 
         self._kernel_cache[key] = kern
         self._config_cache[key] = cfg
@@ -447,14 +476,24 @@ class TileLangCompiler:
         M = self.TB * OH * OW
         K_red = cp.kernel_h * cp.kernel_w * C_padded
 
-        cfg = self._resolve_config(key, M, K_red, cp.out_channels)
+        def _compile(cfg):
+            return _stem_conv_bn_if_t4(
+                TB=self.TB, H=H, W=W,
+                C_in_padded=C_padded, C_in_real=cp.in_channels, F=cp.out_channels,
+                KH=cp.kernel_h, KW=cp.kernel_w, S=cp.stride_h, P=cp.pad_h,
+                T_steps=self.T,
+                **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
+        _profile_args = (
+            torch.empty(self.TB, H, W, C_padded, dtype=torch.float16, device='cuda'),
+            torch.empty(cp.kernel_h, cp.kernel_w, C_padded, cp.out_channels, dtype=torch.float16, device='cuda'),
+            torch.ones(cp.out_channels, dtype=torch.float32, device='cuda'),
+            torch.zeros(cp.out_channels, dtype=torch.float32, device='cuda'),
+            torch.zeros(OH * OW, cp.out_channels, dtype=torch.float32, device='cuda'),
+        )
+        cfg = self._resolve_config(key, M, K_red, cp.out_channels,
+                                    compile_fn=_compile, profile_args=_profile_args)
 
-        kern = _stem_conv_bn_if_t4(
-            TB=self.TB, H=H, W=W,
-            C_in_padded=C_padded, C_in_real=cp.in_channels, F=cp.out_channels,
-            KH=cp.kernel_h, KW=cp.kernel_w, S=cp.stride_h, P=cp.pad_h,
-            T_steps=self.T,
-            **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
+        kern = _compile(cfg)
 
         self._kernel_cache[key] = kern
         self._config_cache[key] = cfg
@@ -473,11 +512,20 @@ class TileLangCompiler:
             return self._kernel_cache[key], False
 
         _load_linear_kernels()
-        cfg = self._resolve_config(key, M, K, N)
+        def _compile(cfg):
+            return _linear_bn(
+                M=M, K=K, N_out=N,
+                **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
+        _profile_args = (
+            torch.empty(M, K, dtype=torch.float16, device='cuda'),
+            torch.empty(K, N, dtype=torch.float16, device='cuda'),
+            torch.ones(N, dtype=torch.float32, device='cuda'),
+            torch.zeros(N, dtype=torch.float32, device='cuda'),
+        )
+        cfg = self._resolve_config(key, M, K, N,
+                                    compile_fn=_compile, profile_args=_profile_args)
 
-        kern = _linear_bn(
-            M=M, K=K, N_out=N,
-            **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
+        kern = _compile(cfg)
 
         self._kernel_cache[key] = kern
         self._config_cache[key] = cfg

@@ -53,18 +53,28 @@ def profile_tilelang_kernel(so_path: str, input_shapes: list[tuple],
     args = [ctypes.c_void_p(t.data_ptr()) for t in tensors]
     args.append(ctypes.c_void_p(0))  # stream 0
 
+    # Check init succeeded by verifying no CUDA error after first call
+    import time as _time
+    cuda_rt = ctypes.CDLL('libcudart.so')
+    cuda_rt.cudaGetLastError()  # clear
+    ret = call_fn(*args)
+    cuda_rt.cudaDeviceSynchronize()
+    err = cuda_rt.cudaGetLastError()
+    if err != 0:
+        # Kernel failed — likely arch mismatch
+        return -1.0
+
     # Warmup
     for _ in range(n_warmup):
         call_fn(*args)
-    torch.cuda.synchronize()
+    cuda_rt.cudaDeviceSynchronize()
 
-    # Profile with wall-clock + device sync (guaranteed accurate)
-    import time as _time
-    torch.cuda.synchronize()
+    # Profile with cudaDeviceSynchronize (not torch — avoids stream issues)
+    cuda_rt.cudaDeviceSynchronize()
     t0 = _time.perf_counter()
     for _ in range(n_iters):
         call_fn(*args)
-    torch.cuda.synchronize()
+    cuda_rt.cudaDeviceSynchronize()
     t1 = _time.perf_counter()
     us = (t1 - t0) / n_iters * 1e6
     return us
@@ -179,9 +189,9 @@ def main():
     builder = EngineBuilder(args.onnx, T=args.T, batch_size=args.batch)
     engine = builder.build(capture_graph=False)
 
-    # Export .so files
+    # Export .so files (reuse main build cache to avoid arch mismatch)
     cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                             '.cache', f'sengine_analysis_B{args.batch}')
+                             '.cache', f'sengine_B{args.batch}')
     kernel_so_map = export_all_kernels(engine.kernels, builder._ir, cache_dir)
 
     # Get per-node info
@@ -268,6 +278,9 @@ def main():
 
             us = profile_tilelang_kernel(so_path, shapes, dtypes,
                                           n_warmup=args.warmup, n_iters=args.iters)
+            if us < 0:
+                print(f"  {nid:>4} {cat:<18} CUDA ERROR (arch mismatch? check .so)")
+                continue
             gflops = ki['flops'] / 1e9
             shape_str = f"{ki['in_shape'][:3]}→{ki['out_shape'][:3]}" if ki['in_shape'] else str(ki['out_shape'][:3])
             print(f"  {nid:>4} {cat:<18} {ki['kv_name'][:24]:<24} "

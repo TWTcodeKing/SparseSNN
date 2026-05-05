@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark TensorRT inference latency for SNN models.
 
-Exports ONNX (standard for ResNets, TDL-native for Transformers),
+Exports standard ONNX via torch.onnx.export (no TDL, no custom ops),
 builds TRT engines, and measures latency across batch sizes.
 
 Usage:
@@ -109,7 +109,6 @@ def main():
     ds_cfg = get_dataset_config(args.dataset)
     img_size = args.img_size or ds_cfg['img_size']
     in_channels = ds_cfg['in_channels']
-    is_transformer = args.config is not None
 
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
@@ -125,19 +124,14 @@ def main():
         engine_path = os.path.join(args.engine_dir, f"{tag}_b{B}{sparse_tag}.engine")
         input_shape = (B, in_channels, img_size, img_size)
 
-        # Step 1: Export ONNX
+        # Step 1: Export standard ONNX (no TDL, no custom ops)
+        # The model's native 5D forward is traced directly — TRT's Myelin
+        # handles all reshapes, attention patterns, and neuron subgraphs.
         if not os.path.exists(onnx_path):
-            print(f"\n  [B={B}] Exporting ONNX "
-                  f"({'TDL native' if is_transformer else 'direct'})...")
+            print(f"\n  [B={B}] Exporting ONNX (standard torch.onnx.export)...")
             reset_net(model)
-            if is_transformer:
-                from sengine.tdl.transforms import export_with_fused_neurons
-                export_with_fused_neurons(
-                    model, onnx_path, input_shape=input_shape,
-                    opset=17, dynamic_batch=False, verbose=False)
-            else:
-                export_onnx(model, onnx_path, input_shape=input_shape,
-                            dynamic_batch=False, simplify=True, verbose=False)
+            export_onnx(model, onnx_path, input_shape=input_shape,
+                        dynamic_batch=False, simplify=True, verbose=False)
             print(f"          Saved: {onnx_path}")
         else:
             print(f"\n  [B={B}] ONNX exists: {onnx_path}")

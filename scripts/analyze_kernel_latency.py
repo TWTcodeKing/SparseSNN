@@ -49,27 +49,24 @@ def profile_tilelang_kernel(so_path: str, input_shapes: list[tuple],
         t = torch.empty(*shape, dtype=dtype, device='cuda')
         tensors.append(t)
 
-    # Use PyTorch's current CUDA stream so events and kernel are synchronized
-    stream_ptr = torch.cuda.current_stream().cuda_stream
-
     call_fn = lib.call
     args = [ctypes.c_void_p(t.data_ptr()) for t in tensors]
-    args.append(ctypes.c_void_p(stream_ptr))
+    args.append(ctypes.c_void_p(0))  # stream 0
 
     # Warmup
     for _ in range(n_warmup):
         call_fn(*args)
     torch.cuda.synchronize()
 
-    # Profile
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
+    # Profile with wall-clock + device sync (guaranteed accurate)
+    import time as _time
+    torch.cuda.synchronize()
+    t0 = _time.perf_counter()
     for _ in range(n_iters):
         call_fn(*args)
-    end.record()
     torch.cuda.synchronize()
-    us = start.elapsed_time(end) / n_iters * 1000
+    t1 = _time.perf_counter()
+    us = (t1 - t0) / n_iters * 1e6
     return us
 
 

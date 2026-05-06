@@ -15,8 +15,8 @@ config dict (loaded from YAML). ResNet models retain their direct factory functi
 
 # Neuron primitives
 from .neurons import (
-    LIFNeuron, IFNeuron,
-    MultiStepLIFNeuron, MultiStepIFNeuron,
+    LIFNeuron, IFNeuron, ILIFNeuron,
+    MultiStepLIFNeuron, MultiStepIFNeuron, MultiStepILIFNeuron,
     reset_net, heaviside,
 )
 from .layers import SeqToANNContainer, SeqToANNContainerT
@@ -44,6 +44,13 @@ from .metaformer import SpikeDrivenTransformerV2, build_metaformer
 from .qkformer import QKFormer, build_qkformer
 from .maxformer import MaxFormer, build_maxformer, MS_QKFormer, build_ms_qkformer
 
+# ---- Detection models ----
+from .spike_yolo import SpikeYOLO, build_spike_yolo, spike_yolo_n, spike_yolo_s, spike_yolo_m
+from .ems_yolo import EMSYOLO, build_ems_yolo, ems_yolo_res34
+
+# ---- NLP models ----
+from .spike_bert import SpikeBERT, build_spike_bert
+
 # arch name -> build function mapping
 ARCH_BUILDERS = {
     'spikformer': build_spikformer,
@@ -52,4 +59,7 @@ ARCH_BUILDERS = {
     'maxformer': build_maxformer,
     'ms_qkformer': build_ms_qkformer,
     'spikingresformer': build_spikingresformer,
+    'spike_yolo': build_spike_yolo,
+    'ems_yolo': build_ems_yolo,
+    'spike_bert': build_spike_bert,
 }

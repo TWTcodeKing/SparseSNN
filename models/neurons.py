@@ -231,6 +231,78 @@ class MultiStepIFNeuron(nn.Module):
         return torch.stack(spikes, dim=0)
 
 
+class ILIFNeuron(nn.Module):
+    """
+    Integer LIF neuron (I-LIF) for SpikeYOLO.
+
+    Emits multi-level spikes (0, 1, 2, ..., max_level) instead of binary.
+    Uses round(clamp(mem, 0, max_level)) for quantized spike output.
+
+    v[t] = decay * (v[t-1] - spike[t-1]) + x[t]
+    spike[t] = round(clamp(v[t], 0, max_level))
+
+    Args:
+        decay: membrane potential decay factor, default 0.25
+        max_level: maximum spike level, default 4
+        surrogate: surrogate gradient function name, default 'atan'
+    """
+
+    def __init__(self, decay=0.25, max_level=4, surrogate='atan'):
+        super().__init__()
+        self.decay = decay
+        self.max_level = max_level
+        self.surrogate = surrogate
+        self.v = 0.0
+        self.last_spike = 0.0
+
+    def reset(self):
+        self.v = 0.0
+        self.last_spike = 0.0
+
+    def forward(self, x):
+        if isinstance(self.v, float):
+            self.v = torch.zeros_like(x)
+            self.last_spike = torch.zeros_like(x)
+        self.v = self.decay * (self.v - self.last_spike) + x
+        # STE: round in forward, pass gradient through in backward
+        spike = torch.clamp(self.v, 0, self.max_level)
+        spike = spike + (torch.round(spike) - spike).detach()
+        self.last_spike = spike
+        return spike
+
+
+class MultiStepILIFNeuron(nn.Module):
+    """
+    I-LIF neuron that processes multiple timesteps at once.
+
+    Input: (T, B, C, ...) tensor
+    Output: same shape, integer spike levels (0..max_level)
+    """
+
+    def __init__(self, decay=0.25, max_level=4, surrogate='atan'):
+        super().__init__()
+        self.neuron = ILIFNeuron(decay, max_level, surrogate)
+
+    @property
+    def decay(self):
+        return self.neuron.decay
+
+    @property
+    def max_level(self):
+        return self.neuron.max_level
+
+    def reset(self):
+        self.neuron.reset()
+
+    def forward(self, x_seq):
+        """x_seq: (T, B, ...) tensor"""
+        self.neuron.reset()
+        spikes = []
+        for t in range(x_seq.shape[0]):
+            spikes.append(self.neuron(x_seq[t]))
+        return torch.stack(spikes, dim=0)
+
+
 # ---------------------------------------------------------------------------
 # Utility: reset all spiking neurons in a model
 # ---------------------------------------------------------------------------

@@ -10,3 +10,6 @@ from .cifar import cifar10_dataloaders, cifar100_dataloaders
 from .imagenet import imagenet_dataloaders
 from .cifar10dvs import cifar10dvs_dataloaders
 from .dvs128gesture import dvs128gesture_dataloaders
+from .coco import coco_dataloaders
+from .gen1 import gen1_dataloaders
+from .glue import glue_dataloaders

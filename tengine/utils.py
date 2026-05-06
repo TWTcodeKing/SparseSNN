@@ -209,7 +209,9 @@ def _populate_resnet_registry():
                  'ms_resnet_cifar56', 'ms_resnet_cifar110',
                  'ms_resnet_dvs20',
                  'dvs_sew_resnet',
-                 'snn_vgg9', 'snn_vgg11', 'snn_vgg16', 'snn_vgg19']:
+                 'snn_vgg9', 'snn_vgg11', 'snn_vgg16', 'snn_vgg19',
+                 'ems_yolo_res34',
+                 'spike_yolo_n', 'spike_yolo_s', 'spike_yolo_m']:
         fn = getattr(M, name, None)
         if fn:
             _RESNET_REGISTRY[name] = fn
@@ -258,6 +260,10 @@ _DATASET_CONFIG = {
     'imagenet':   {'num_classes': 1000, 'img_size': 224, 'in_channels': 3},
     'cifar10dvs': {'num_classes': 10,   'img_size': 128, 'in_channels': 2},
     'dvs128gesture': {'num_classes': 11, 'img_size': 128, 'in_channels': 2},
+    'coco':       {'num_classes': 80,   'img_size': 640, 'in_channels': 3, 'task': 'detection'},
+    'gen1':       {'num_classes': 2,    'img_size': 320, 'in_channels': 3, 'task': 'detection'},
+    'sst2':       {'num_classes': 2,    'img_size': 1,   'in_channels': 1, 'task': 'nlp', 'seq_len': 128},
+    'mrpc':       {'num_classes': 2,    'img_size': 1,   'in_channels': 1, 'task': 'nlp', 'seq_len': 128},
 }
 
 
@@ -300,4 +306,20 @@ def build_dataloaders(dataset_name, data_root, batch_size, img_size=None,
         frames = kwargs.pop('frames_number', 16)
         return dvs128gesture_dataloaders(
             data_root, batch_size, frames_number=frames,
+            num_workers=num_workers, distributed=distributed, **kwargs)
+    elif dataset_name == 'coco':
+        from datasets import coco_dataloaders
+        return coco_dataloaders(
+            data_root, batch_size, img_size=img_size,
+            num_workers=num_workers, distributed=distributed, **kwargs)
+    elif dataset_name == 'gen1':
+        from datasets import gen1_dataloaders
+        return gen1_dataloaders(
+            data_root, batch_size, img_size=img_size,
+            num_workers=num_workers, distributed=distributed, **kwargs)
+    elif dataset_name in ('sst2', 'mrpc', 'cola', 'qnli'):
+        from datasets import glue_dataloaders
+        seq_len = kwargs.pop('seq_len', cfg.get('seq_len', 128))
+        return glue_dataloaders(
+            data_root, batch_size, task=dataset_name, seq_len=seq_len,
             num_workers=num_workers, distributed=distributed, **kwargs)

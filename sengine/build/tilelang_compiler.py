@@ -135,10 +135,8 @@ def _pick_config(M: int, K_red: int, F: int) -> dict:
         bm = 128
     elif M >= 10000:
         bm = 64
-    elif M >= 1024:
-        bm = 32
     else:
-        bm = 16
+        bm = 32  # min 32: TileLang T.gemm requires >=32 for MMA register layout
 
     # Wider N tiles for large output channels (expansion layers)
     if F >= 512:
@@ -209,11 +207,13 @@ def _autotune_config(compile_fn, profile_args: tuple, M: int, K_red: int, F: int
         dict(block_M=128, block_N=128, block_K=32, num_stages=2, threads=256),
     ]
     # Small-M seeds for transformer spatial dims (14x14, 7x7 etc.)
+    # NOTE: block_M=16 is invalid for TileLang T.gemm (requires >=32 for MMA)
     if M < 4096:
         seeds.extend([
-            dict(block_M=16, block_N=128, block_K=32, num_stages=3, threads=128),
-            dict(block_M=16, block_N=64, block_K=64, num_stages=4, threads=128),
+            dict(block_M=32, block_N=128, block_K=32, num_stages=3, threads=128),
+            dict(block_M=32, block_N=64, block_K=64, num_stages=4, threads=128),
             dict(block_M=32, block_N=128, block_K=64, num_stages=3, threads=256),
+            dict(block_M=32, block_N=256, block_K=32, num_stages=2, threads=256),
         ])
     # Add heuristic default
     seeds.append(_pick_config(M, K_red, F))
@@ -227,8 +227,8 @@ def _autotune_config(compile_fn, profile_args: tuple, M: int, K_red: int, F: int
             best_cfg = dict(cfg)
 
     # Phase 2: Coordinate descent from best seed
-    # Sweep block_M (include 16 for small-M transformers)
-    for bm in [16, 32, 64, 128, 256]:
+    # Sweep block_M (min 32 — TileLang T.gemm requires >=32 for MMA layout)
+    for bm in [32, 64, 128, 256]:
         if bm == best_cfg['block_M']:
             continue
         cfg = dict(best_cfg, block_M=bm)

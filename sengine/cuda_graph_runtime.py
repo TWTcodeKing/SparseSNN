@@ -522,7 +522,11 @@ class CUDAGraphEngine:
             KernelVariant.TileLangStemConvBN, KernelVariant.TileLangDWConvBN,
             KernelVariant.TileLangGroupedConvBN,
             KernelVariant.TileLangFusedConvBNIF,
+            KernelVariant.TileLangFusedConv1x1BNIF,
+            KernelVariant.TileLangFusedConvBNIFAdd,
+            KernelVariant.TileLangFusedConv1x1BNIFAdd,
             KernelVariant.TileLangFusedDWConvBNIF,
+            KernelVariant.TileLangFusedDWConvBNIFAdd,
             KernelVariant.CuDNNConv, KernelVariant.CuDNNPool,
         }
         inputs = []
@@ -573,14 +577,19 @@ class CUDAGraphEngine:
                     self.activations[nid] = result
 
         elif kv in (KernelVariant.TileLangFusedConvBNIF,
-                    KernelVariant.TileLangFusedConv1x1BNIF):
-            # Per-timestep fused Conv+BN+IF: call T times, once per timestep
+                    KernelVariant.TileLangFusedConv1x1BNIF,
+                    KernelVariant.TileLangFusedConvBNIFAdd,
+                    KernelVariant.TileLangFusedConv1x1BNIFAdd):
+            # Per-timestep fused Conv+BN+IF (±Add): call T times, once per timestep
             kern = self.kernels.get(nid)
             w = self.weights.get(nid)
-            if kv == KernelVariant.TileLangFusedConv1x1BNIF:
+            if kv in (KernelVariant.TileLangFusedConv1x1BNIF,
+                      KernelVariant.TileLangFusedConv1x1BNIFAdd):
                 w = self.weights_1x1.get(nid)
             sc = self.bn_scales.get(nid)
             bi = self.bn_biases.get(nid)
+            has_residual = kv in (KernelVariant.TileLangFusedConvBNIFAdd,
+                                  KernelVariant.TileLangFusedConv1x1BNIFAdd)
             # Find successor neuron's membrane
             succs = self.ir.successors(nid)
             mem = None
@@ -596,14 +605,39 @@ class CUDAGraphEngine:
                         TB_out, C_out, OH_out, OW_out = node.output_shapes[0]
                         B_out = TB_out // self.T
                         mem_4d = mem.reshape(B_out, OH_out, OW_out, C_out)
+                        # Get residual tensor if this is a *Add variant
+                        residual_buf = None
+                        if has_residual:
+                            add_nid = node.extra_attrs.get("residual_add_nid")
+                            if add_nid is not None:
+                                # Find the Add's other input (the skip connection)
+                                add_node = self.ir.nodes.get(add_nid)
+                                if add_node:
+                                    for in_name in add_node.input_names:
+                                        # The residual is the input NOT produced by this conv's neuron
+                                        for pred_nid in self.ir.predecessors(add_nid):
+                                            if pred_nid != nid and pred_nid in self.activations:
+                                                residual_buf = self.activations[pred_nid]
+                                                break
+                                        if residual_buf is not None:
+                                            break
                         # Call T times — each processes one timestep
                         spk_frames = []
                         for t in range(self.T):
-                            frame = x[t*B_out:(t+1)*B_out]  # (B, H, W, C) for timestep t
-                            spk_t = kern(frame, w, mem_4d, sc, bi)
+                            frame = x[t*B_out:(t+1)*B_out]
+                            if has_residual and residual_buf is not None:
+                                res_frame = residual_buf[t*B_out:(t+1)*B_out]
+                                spk_t = kern(frame, w, mem_4d, sc, bi, res_frame)
+                            else:
+                                spk_t = kern(frame, w, mem_4d, sc, bi)
                             spk_frames.append(spk_t)
                         result = torch.cat(spk_frames, dim=0)  # (TB, OH, OW, C)
                         self.activations[nid] = result
+                        # If *Add variant, also store result under the Add node
+                        if has_residual:
+                            add_nid = node.extra_attrs.get("residual_add_nid")
+                            if add_nid is not None:
+                                self.activations[add_nid] = result
                     else:
                         # No membrane — just run as Conv+BN
                         result = kern(x, w, sc, bi)

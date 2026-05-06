@@ -21,15 +21,16 @@ def _try_import_trt():
     try:
         import tensorrt as trt
         return trt
-    except ImportError:
+    except ImportError as e:
         raise ImportError(
-            "tensorrt not found. Install with:\n"
+            f"tensorrt import failed: {e}\n"
+            "Install with:\n"
             "  pip install tensorrt-cu12\n"
             "On Jetson, TensorRT is system-installed — if using conda/venv, "
             "link it:\n"
             "  ln -s /usr/lib/python3.*/dist-packages/tensorrt* "
             "$(python -c 'import site; print(site.getsitepackages()[0])')/"
-        )
+        ) from e
 
 
 class _TRTLogger:

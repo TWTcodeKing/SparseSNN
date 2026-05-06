@@ -84,21 +84,27 @@ def build_snn_model(args, ds_cfg, device):
 
 
 def export_onnx(model, input_shape, onnx_path, opset, device):
-    """Export model to standard ONNX (no custom ops)."""
+    """Export model to standard ONNX (no custom ops).
+
+    SNN models have internal reshapes that merge (T, B) dimensions, so the
+    batch dimension cannot be dynamic. Export must be done per batch size.
+    """
     if os.path.exists(onnx_path):
         print(f"  [ort] Reusing existing ONNX: {onnx_path}")
         return
 
-    print(f"  [ort] Exporting ONNX (opset={opset})...")
+    print(f"  [ort] Exporting ONNX (opset={opset}, shape={input_shape})...")
     dummy_input = torch.randn(*input_shape, device=device)
     reset_net(model)
 
+    # Force legacy TorchScript exporter (dynamo exporter has issues with
+    # opset downgrade and dynamic_axes on internal reshape ops)
     torch.onnx.export(
         model, dummy_input, onnx_path,
         opset_version=opset,
         input_names=["input"],
         output_names=["output"],
-        dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+        dynamo=False,
     )
 
     # Simplify with onnxsim if available
@@ -118,8 +124,28 @@ def export_onnx(model, input_shape, onnx_path, opset, device):
         print(f"  [ort] Simplification error: {e}, using original")
 
 
+def convert_onnx_to_fp16(onnx_path):
+    """Convert ONNX model internal computation to FP16 (I/O stays fp32)."""
+    fp16_path = onnx_path.replace(".onnx", "_fp16.onnx")
+    if os.path.exists(fp16_path):
+        print(f"  [ort] Reusing existing FP16 ONNX: {fp16_path}")
+        return fp16_path
+
+    import onnx
+    from onnxconverter_common import float16
+    print(f"  [ort] Converting model to FP16 (keep_io_types=True)...")
+    model = onnx.load(onnx_path)
+    model_fp16 = float16.convert_float_to_float16(
+        model, keep_io_types=True, op_block_list=['Cast']
+    )
+    onnx.save(model_fp16, fp16_path)
+    print(f"  [ort] FP16 model saved: {fp16_path}")
+    return fp16_path
+
+
 def create_ort_session(onnx_path, device_id, graph_opt):
     """Create ONNX Runtime inference session with CUDA EP."""
+    import platform
     import onnxruntime as ort
 
     opt_map = {
@@ -128,6 +154,12 @@ def create_ort_session(onnx_path, device_id, graph_opt):
         "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
         "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
     }
+
+    # ORT_ENABLE_ALL includes x86-specific passes that crash on ARM (Jetson)
+    if platform.machine() == 'aarch64' and graph_opt == 'all':
+        print("  [ort] WARNING: downgrading graph_opt 'all' -> 'extended' on aarch64 "
+              "(ORT x86-specific passes crash on ARM)")
+        graph_opt = 'extended'
 
     sess_opts = ort.SessionOptions()
     sess_opts.graph_optimization_level = opt_map[graph_opt]
@@ -192,27 +224,23 @@ def main():
     model_name = args.model or os.path.splitext(os.path.basename(args.config))[0]
 
     batch_sizes = [int(b) for b in args.batch_sizes.split(",")]
-
-    # Export ONNX (use first batch size for export, dynamic axes handle the rest)
     os.makedirs(args.onnx_dir, exist_ok=True)
-    onnx_path = os.path.join(
-        args.onnx_dir, f"{model_name}_{args.dataset}_T{args.T}.onnx"
-    )
-    export_shape = (1, ds_cfg['in_channels'], img_size, img_size)
-    export_onnx(model, export_shape, onnx_path, args.opset, device)
+
+    # SNN models have internal (T,B)->T*B reshapes with baked-in constants,
+    # so we must export a separate ONNX per batch size.
+    for bs in batch_sizes:
+        onnx_path = os.path.join(
+            args.onnx_dir, f"{model_name}_{args.dataset}_T{args.T}_B{bs}.onnx"
+        )
+        export_shape = (bs, ds_cfg['in_channels'], img_size, img_size)
+        export_onnx(model, export_shape, onnx_path, args.opset, device)
 
     # Free PyTorch model
     del model
     torch.cuda.empty_cache()
 
-    # Create ORT session
-    print(f"  [ort] Creating session (graph_opt={args.graph_opt})...")
-    session = create_ort_session(onnx_path, args.gpu_ids, args.graph_opt)
-    active_ep = session.get_providers()
-    print(f"  [ort] Active providers: {active_ep}")
-
     gpu_name = torch.cuda.get_device_name(device)
-    dtype = np.float16 if args.fp16 else np.float32
+    dtype = np.float32  # I/O is always fp32; --fp16 controls internal compute
 
     # Header
     print()
@@ -226,6 +254,17 @@ def main():
     results = {}
     for bs in batch_sizes:
         try:
+            onnx_path = os.path.join(
+                args.onnx_dir, f"{model_name}_{args.dataset}_T{args.T}_B{bs}.onnx"
+            )
+
+            # Convert to FP16 if requested
+            if args.fp16:
+                onnx_path = convert_onnx_to_fp16(onnx_path)
+
+            # Create ORT session for this batch size
+            session = create_ort_session(onnx_path, args.gpu_ids, args.graph_opt)
+
             input_array = np.random.randn(
                 bs, ds_cfg['in_channels'], img_size, img_size
             ).astype(dtype)
@@ -237,6 +276,8 @@ def main():
 
             results[bs] = {'mean_ms': mean_ms, 'std_ms': std_ms, 'throughput': throughput}
             print(f"  B={bs:<7} {mean_ms:>11.3f}ms {std_ms:>9.3f}ms {throughput:>9.0f}/s")
+
+            del session
 
         except Exception as e:
             print(f"  B={bs:<7} FAILED: {e}")

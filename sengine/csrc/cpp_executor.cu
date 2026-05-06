@@ -255,6 +255,18 @@ __global__ void scale_tensor_broadcast_kernel(
     data[i] = __float2half(__half2float(data[i]) * __half2float(scale[h]));
 }
 
+// NHWC scale broadcast: data shape (rows, C) where C = heads*hd, scale shape (heads,)
+// data[r, head*hd + d] *= scale[head]
+__global__ void scale_nhwc_broadcast_kernel(
+    half* data, const half* scale, int total, int C, int hd
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    int col = i % C;
+    int h = col / hd;
+    data[i] = __float2half(__half2float(data[i]) * __half2float(scale[h]));
+}
+
 // ReduceSum over dim=2 (head_dim): (TB*heads, head_dim, N) → (TB*heads, 1, N)
 // For TokenQK attention: sum Q over head_dim
 __global__ void reduce_sum_head_dim_kernel(
@@ -893,7 +905,7 @@ void sengine_execute(SEngineExecutor* e) {
                         gemm1_out, nd.fa_scale1_ptr, total_attn, heads, inner);
                 }
 
-                // LIF
+                // LIF on attention scores
                 if (nd.fa_lif_spatial > 0 && nd.fa_lif_spatial < nd.fa_lif_total) {
                     int thr = 256, blk = (nd.fa_lif_spatial + thr - 1) / thr;
                     lif_neuron_kernel<<<blk, thr, 0, s>>>(
@@ -905,15 +917,13 @@ void sengine_execute(SEngineExecutor* e) {
                 // GEMM2: out = V @ attn (3-arg: y_kv, attn, out_nhwc)
                 ((CallFn3)tl2.call_fn)(nd.fa_q, gemm1_out, nd.fa_out, s);
 
-                // Scale2: out *= scale2 (per-head broadcast)
+                // Scale2: out *= scale2 (per-head broadcast on NHWC output)
                 if (nd.fa_scale2_ptr) {
-                    int batch = TB * heads;
                     int spatial_q = nd.fa_N;
-                    int total_out = batch * hd * spatial_q;
-                    int inner = hd * spatial_q;
+                    int total_out = TB * spatial_q * C;
                     int thr = 256, blk = (total_out + thr - 1) / thr;
-                    scale_tensor_broadcast_kernel<<<blk, thr, 0, s>>>(
-                        nd.fa_out, nd.fa_scale2_ptr, total_out, heads, inner);
+                    scale_nhwc_broadcast_kernel<<<blk, thr, 0, s>>>(
+                        nd.fa_out, nd.fa_scale2_ptr, total_out, C, hd);
                 }
             }
             else if (nd.fa_variant == 3) {

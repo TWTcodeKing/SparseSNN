@@ -121,10 +121,20 @@ class SEngine:
 
         # 3. Wire up C++ executor (if all attention kernels are compiled)
         has_uncompiled_attn = any(
-            isinstance(eng._kernel_so_map.get(nid), type(None))
+            eng._kernel_so_map.get(nid) is None
             for nid in eng._schedule
             if eng._ir.nodes.get(nid) and eng._ir.nodes[nid].op_type == OpType.FusedAttention
         )
+        # DSSA multi-head has a known C++ dispatch bug — fall back to Python
+        has_dssa_multihead = any(
+            eng._ir.nodes[nid].attention_params.variant == 'dssa'
+            and eng._ir.nodes[nid].attention_params.num_heads > 1
+            for nid in eng._schedule
+            if eng._ir.nodes.get(nid) and eng._ir.nodes[nid].op_type == OpType.FusedAttention
+            and eng._ir.nodes[nid].attention_params
+        )
+        if has_dssa_multihead:
+            has_uncompiled_attn = True
         if eng._py_engine._lazy_mode:
             logger.phase("BUILD", "Lazy mode: using Python runtime (OOM during pre-allocation)")
             eng._graph_captured = True
@@ -652,8 +662,10 @@ class SEngine:
                                     s1_ptr = st.data_ptr()
                                 else:
                                     s2_ptr = st.data_ptr()
-                    # For DSSA, lif_total = attn size (not q_buf size)
+                    # For DSSA, LIF operates on attn scores (gemm1_out), NOT the final output.
+                    # attn shape: (batch, spatial_kv, spatial_q) = (TB*heads, spatial_kv, spatial_q)
                     lif_total = gemm1_size
+                    lif_spatial = gemm1_size // 4  # = B*heads*spatial_kv*spatial_q (T=4)
                     # spatial_kv is used in C++ for scale broadcast inner dim
                     # Store it in the fa_spatial_kv field (reuse for DSSA)
 

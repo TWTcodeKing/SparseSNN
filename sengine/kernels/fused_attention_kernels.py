@@ -245,7 +245,7 @@ def dssa_v_attn_kernel(
 
     Reads V from y_kv NHWC — second C channels (offset by C).
     Reads attn from contiguous (TB*heads, spatial_kv, spatial_q) — GEMM1 output.
-    Writes output to NHWC (TB, H_out, W_out, C).
+    Writes output to NHWC (TB*spatial_q, C) — matches successor Conv/LIF layout.
 
     GEMM per (tb, head): C(hd, spatial_q) = V(hd, spatial_kv) @ attn(spatial_kv, spatial_q)
     Scale2 applied separately (per-head tensor).

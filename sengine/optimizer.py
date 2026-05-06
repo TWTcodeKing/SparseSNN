@@ -326,9 +326,10 @@ def _detect_attention_matmul_patterns(ir: EngineIR, FUSED_THRESHOLD: int):
             neuron = _find_neuron_through_transparent(ir, scale_node.id, max_depth=5)
             if neuron is not None:
                 n_matmulscale += 1  # scale was absorbed
-                # Apply fused/decomposed decision for the LIF
+                # Context-aware: MatMul→Scale→LIF in attention is always
+                # sequential (neuron depends on this matmul) — always fuse.
                 M_per_t = _matmul_M_per_t(node, ir)
-                if M_per_t >= FUSED_THRESHOLD:
+                if _is_sequential_context(ir, nid) or M_per_t >= FUSED_THRESHOLD:
                     node.assigned_kernel = KernelVariant.TileLangFusedMatMulLIF
                     node.neuron_params = neuron.neuron_params
                     neuron.assigned_kernel = KernelVariant.ZeroCost
@@ -350,7 +351,8 @@ def _detect_attention_matmul_patterns(ir: EngineIR, FUSED_THRESHOLD: int):
         neuron = _find_neuron_through_transparent(ir, nid, max_depth=5)
         if neuron is not None:
             M_per_t = _matmul_M_per_t(node, ir)
-            if M_per_t >= FUSED_THRESHOLD:
+            # Context-aware: always fuse sequential MatMul→LIF
+            if _is_sequential_context(ir, nid) or M_per_t >= FUSED_THRESHOLD:
                 node.assigned_kernel = KernelVariant.TileLangFusedMatMulLIF
                 node.neuron_params = neuron.neuron_params
                 node.bound_type = BoundType.COMPUTE
@@ -1139,25 +1141,39 @@ _ZERO_OPS = {OpType.Flatten, OpType.Reshape, OpType.Transpose, OpType.Identity,
              OpType.Concat, OpType.ReduceMean}
 
 
-def _should_use_fused_per_t(cp, ir: EngineIR, batch_size: int,
-                            sm_count: int = 128) -> bool:
-    """Decide whether a Conv+IF pair should use per-timestep fused kernel.
+def _is_sequential_context(ir: EngineIR, conv_nid: int) -> bool:
+    """Return True if this Conv is in a sequential chain with no parallel siblings.
 
-    The per-timestep fused kernel (T=1 per launch) wins when the per-timestep
-    GEMM M dimension saturates SMs. This happens at large batch sizes where
-    B * OH * OW is large enough for efficient tile parallelism.
+    A Conv is in a sequential context if its data-producing predecessors do NOT
+    fan out to multiple compute-bound consumers. Sequential chains (backbone
+    Conv→IF→Conv→IF) should always fuse because there is no parallel work
+    available to overlap with standalone neuron kernels.
 
-    Returns True if fused is expected to be faster.
+    Multi-branch contexts (e.g., Q/K/V parallel projections sharing the same
+    input) can benefit from decomposition: BA-MTTS interleaves the separate
+    compute and memory ops for hardware overlap.
     """
-    T = ir.T
-    if T <= 1:
-        return True  # no temporal issue, always fuse
-
-    OH = (cp.out_channels  # placeholder, real OH computed from shapes
-          if not hasattr(cp, '_oh') else cp._oh)
-    # Estimate OH from conv params (approximate)
-    # This is set by propagate_shapes on the node's output_shapes
-    return False  # conservative: need output shapes to decide
+    for pred_nid in ir.predecessors(conv_nid):
+        pred = ir.nodes.get(pred_nid)
+        if pred is None:
+            continue
+        # Walk through transparent ops to find the real data producer
+        if pred.op_type in _ZERO_OPS:
+            # Check the transparent node's predecessors recursively (1 level)
+            for gpred_nid in ir.predecessors(pred_nid):
+                succs = ir.successors(gpred_nid)
+                compute_succs = sum(1 for s in succs
+                                    if ir.nodes.get(s) and
+                                    ir.nodes[s].op_type in _COMPUTE_OPS)
+                if compute_succs >= 2:
+                    return False
+        succs = ir.successors(pred_nid)
+        compute_succs = sum(1 for s in succs
+                            if ir.nodes.get(s) and
+                            ir.nodes[s].op_type in _COMPUTE_OPS)
+        if compute_succs >= 2:
+            return False
+    return True
 
 
 def classify_bound_and_assign_tilelang(ir: EngineIR, batch_size: int = 1):
@@ -1216,7 +1232,14 @@ def classify_bound_and_assign_tilelang(ir: EngineIR, batch_size: int = 1):
                     B_out = TB_out // ir.T if ir.T > 0 else TB_out
                     M_per_t = B_out * OH_out * OW_out
                 neuron_nid = conv_to_neuron.get(nid)
-                if M_per_t >= FUSED_THRESHOLD and neuron_nid is not None:
+                # Context-aware: DWConv in backbone is sequential, always fuse
+                if neuron_nid is None:
+                    dw_fused = False
+                elif _is_sequential_context(ir, nid):
+                    dw_fused = True
+                else:
+                    dw_fused = M_per_t >= FUSED_THRESHOLD
+                if dw_fused:
                     node.assigned_kernel = KernelVariant.TileLangFusedDWConvBNIF
                     node.bound_type = BoundType.COMPUTE
                     n_fused += 1
@@ -1242,15 +1265,46 @@ def classify_bound_and_assign_tilelang(ir: EngineIR, batch_size: int = 1):
                     M_per_t = B_out * OH_out * OW_out
 
                 neuron_nid = conv_to_neuron.get(nid)
-                use_fused = (M_per_t >= FUSED_THRESHOLD and neuron_nid is not None)
+                # Context-aware fusion: sequential chains always fuse (no
+                # overlap opportunity for standalone neuron); multi-branch
+                # (Q/K/V) uses threshold (BA-MTTS can interleave C↔M).
+                if neuron_nid is None:
+                    use_fused = False
+                elif _is_sequential_context(ir, nid):
+                    use_fused = True
+                else:
+                    use_fused = M_per_t >= FUSED_THRESHOLD
 
                 if use_fused:
                     # Per-timestep fused: Conv+BN+IF in one kernel (T=1/launch)
                     # Both Conv and neuron are handled by the fused kernel
-                    if cp.kernel_h == 1 and cp.kernel_w == 1:
-                        node.assigned_kernel = KernelVariant.TileLangFusedConv1x1BNIF
+                    #
+                    # Check if neuron feeds into a residual Add that can be
+                    # absorbed into the epilogue (avoids extra DRAM round-trip)
+                    has_residual = False
+                    if neuron_nid is not None and neuron_nid in ir.nodes:
+                        neuron_succs = ir.successors(neuron_nid)
+                        if len(neuron_succs) == 1:
+                            add_cand = ir.nodes.get(neuron_succs[0])
+                            if (add_cand is not None and
+                                    add_cand.op_type == OpType.Add and
+                                    add_cand.assigned_kernel != KernelVariant.ZeroCost):
+                                has_residual = True
+                                add_cand.assigned_kernel = KernelVariant.ZeroCost
+                                add_cand.bound_type = BoundType.ZERO
+                                node.extra_attrs["has_residual_add"] = True
+                                node.extra_attrs["residual_add_nid"] = add_cand.id
+
+                    if has_residual:
+                        if cp.kernel_h == 1 and cp.kernel_w == 1:
+                            node.assigned_kernel = KernelVariant.TileLangFusedConv1x1BNIFAdd
+                        else:
+                            node.assigned_kernel = KernelVariant.TileLangFusedConvBNIFAdd
                     else:
-                        node.assigned_kernel = KernelVariant.TileLangFusedConvBNIF
+                        if cp.kernel_h == 1 and cp.kernel_w == 1:
+                            node.assigned_kernel = KernelVariant.TileLangFusedConv1x1BNIF
+                        else:
+                            node.assigned_kernel = KernelVariant.TileLangFusedConvBNIF
                     node.bound_type = BoundType.COMPUTE  # fused = single compute op
                     n_fused += 1
                     # Mark the neuron as handled (zero-cost passthrough)

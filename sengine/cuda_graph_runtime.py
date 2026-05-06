@@ -399,7 +399,8 @@ class CUDAGraphEngine:
                 # - Everything else: ONNX shape as-is
                 _NHWC_OPS = {OpType.Conv2d, OpType.MaxPool, OpType.GlobalAvgPool,
                              OpType.Add, OpType.IF, OpType.LIF, OpType.MS,
-                             OpType.Tile, OpType.Sub, OpType.Mul, OpType.Scale}
+                             OpType.Tile, OpType.Sub, OpType.Mul, OpType.Scale,
+                             OpType.FusedAttention}
                 _GEMM_OPS = {OpType.MatMul, OpType.Linear}
                 if len(shape) == 4 and node.op_type in _NHWC_OPS:
                     N, C, H, W = shape

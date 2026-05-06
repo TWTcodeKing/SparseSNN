@@ -710,3 +710,193 @@ def if_neuron_t4_kernel(
                     state_flat[s_idx, f] = v_new
                     spikes_flat[m, f] = T.cast(spike, T.float16)
     return main
+
+
+# ---------------------------------------------------------------------------
+# Kernel: 1×1 Conv+BN+IF+Residual Add — fused epilogue with skip connection
+# ---------------------------------------------------------------------------
+
+@tilelang.jit(out_idx=[-1])
+def conv1x1_bn_if_add_t4_kernel(
+    TB, C_in, H, W, F, S,
+    block_M, block_N, block_K, num_stages, threads,
+    v_threshold=1.0, v_reset=0.0, T_steps=4,
+):
+    """Fused 1×1 Conv+BN+IF+ResidualAdd.
+
+    Same as conv1x1_bn_if_t4_kernel but adds a residual tensor in the epilogue:
+        output = spike + residual
+    This eliminates a separate Add kernel + DRAM round-trip.
+    """
+    OH = (H + S - 1) // S
+    OW = (W + S - 1) // S
+    M = TB * OH * OW
+    B = TB // T_steps
+    spatial = B * OH * OW
+
+    @T.prim_func
+    def main(
+        data:     T.Tensor((TB, H, W, C_in), T.float16),
+        weight:   T.Tensor((C_in, F), T.float16),
+        state:    T.Tensor((B, OH, OW, F), T.float32),
+        bn_scale: T.Tensor((F,), T.float32),
+        bn_bias:  T.Tensor((F,), T.float32),
+        residual: T.Tensor((TB, OH, OW, F), T.float16),
+        output:   T.Tensor((TB, OH, OW, F), T.float16),
+    ):
+        with T.Kernel(
+            T.ceildiv(F, block_N), T.ceildiv(M, block_M),
+            threads=threads,
+        ) as (bx, by):
+            data_shared   = T.alloc_shared((block_M, block_K), T.float16)
+            weight_shared = T.alloc_shared((block_K, block_N), T.float16)
+            acc           = T.alloc_fragment((block_M, block_N), T.float32)
+
+            output_flat   = T.Tensor((M, F), T.float16, output.data)
+            residual_flat = T.Tensor((M, F), T.float16, residual.data)
+            state_flat    = T.Tensor((B * OH * OW, F), T.float32, state.data)
+
+            T.clear(acc)
+
+            for k_iter in T.Pipelined(
+                T.ceildiv(C_in, block_K), num_stages=num_stages,
+            ):
+                for i, j in T.Parallel(block_M, block_K):
+                    cin = k_iter * block_K + j
+                    m = by * block_M + i
+                    n_idx = m // (OH * OW)
+                    hw = m % (OH * OW)
+                    oh = hw // OW
+                    ow = hw % OW
+                    ib = (m < M) and (cin < C_in)
+                    data_shared[i, j] = T.if_then_else(
+                        ib, data[n_idx, oh * S, ow * S, cin], T.float16(0))
+
+                T.copy(weight[k_iter * block_K, bx * block_N], weight_shared)
+                T.gemm(data_shared, weight_shared, acc)
+
+            # BN + IF + Residual Add epilogue
+            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            for i, j in T.Parallel(block_M, block_N):
+                m = by * block_M + i
+                f = bx * block_N + j
+                if m < M and f < F:
+                    bn_out = acc[i, j] * bn_scale[f] + bn_bias[f]
+                    s_idx = m % spatial
+                    v = state_flat[s_idx, f]
+                    h = v + bn_out
+                    spike = T.if_then_else(
+                        h >= v_threshold, T.float32(1), T.float32(0))
+                    v_new = (T.float32(1) - spike) * h + spike * T.float32(v_reset)
+                    state_flat[s_idx, f] = v_new
+                    # Fused residual add: spike + skip connection
+                    res_val = T.cast(residual_flat[m, f], T.float32)
+                    out_shared[i, j] = T.cast(spike + res_val, T.float16)
+
+            T.copy(out_shared, output_flat[by * block_M, bx * block_N])
+
+    return main
+
+
+# ---------------------------------------------------------------------------
+# Kernel: 3×3 Conv+BN+IF+Residual Add — fused epilogue with skip connection
+# ---------------------------------------------------------------------------
+
+@tilelang.jit(out_idx=[-1])
+def conv2d_bn_if_add_t4_kernel(
+    TB, C_in, H, W, F, K, S, D, P,
+    block_M, block_N, block_K, num_stages, threads,
+    v_threshold=1.0, v_reset=0.0, T_steps=4,
+):
+    """Fused Conv+BN+IF+ResidualAdd (general KxK conv with im2col).
+
+    Same as conv2d_bn_if_t4_kernel but adds a residual tensor in the epilogue.
+    """
+    KH = KW = K
+    OH = (H + 2 * P - D * (K - 1) - 1) // S + 1
+    OW = (W + 2 * P - D * (K - 1) - 1) // S + 1
+    M = TB * OH * OW
+    B = TB // T_steps
+    spatial = B * OH * OW
+    K_red = KH * KW * C_in
+    is_hopper = _HOPPER
+
+    @T.prim_func
+    def main(
+        data:     T.Tensor((TB, H, W, C_in), T.float16),
+        weight:   T.Tensor((KH, KW, C_in, F), T.float16),
+        state:    T.Tensor((B, OH, OW, F), T.float32),
+        bn_scale: T.Tensor((F,), T.float32),
+        bn_bias:  T.Tensor((F,), T.float32),
+        residual: T.Tensor((TB, OH, OW, F), T.float16),
+        output:   T.Tensor((TB, OH, OW, F), T.float16),
+    ):
+        with T.Kernel(
+            T.ceildiv(F, block_N), T.ceildiv(M, block_M),
+            threads=threads,
+        ) as (bx, by):
+            data_shared   = T.alloc_shared((block_M, block_K), T.float16)
+            weight_shared = T.alloc_shared((block_K, block_N), T.float16)
+            acc           = T.alloc_fragment((block_M, block_N), T.float32)
+
+            weight_flat   = T.Tensor((K_red, F), T.float16, weight.data)
+            output_flat   = T.Tensor((M, F), T.float16, output.data)
+            residual_flat = T.Tensor((M, F), T.float16, residual.data)
+            state_flat    = T.Tensor((B * OH * OW, F), T.float32, state.data)
+
+            T.clear(acc)
+
+            for k_iter in T.Pipelined(
+                T.ceildiv(K_red, block_K), num_stages=num_stages,
+            ):
+                if is_hopper:
+                    T.c2d_im2col(data, data_shared, by, k_iter, KH, S, D, P)
+                else:
+                    for i, j in T.Parallel(block_M, block_K):
+                        k = k_iter * block_K + j
+                        m = by * block_M + i
+                        n_idx = m // (OH * OW)
+                        hw_idx = m % (OH * OW)
+                        oh = hw_idx // OW
+                        ow = hw_idx % OW
+                        kh = k // (KW * C_in)
+                        kw = (k // C_in) % KW
+                        cin = k % C_in
+                        access_h = oh * S + kh * D - P
+                        access_w = ow * S + kw * D - P
+                        in_bound = (
+                            (access_h >= 0) and (access_w >= 0)
+                            and (access_h < H) and (access_w < W)
+                            and (m < M) and (k < K_red)
+                        )
+                        data_shared[i, j] = T.if_then_else(
+                            in_bound,
+                            data[n_idx, access_h, access_w, cin],
+                            T.float16(0),
+                        )
+
+                T.copy(weight_flat[k_iter * block_K, bx * block_N],
+                       weight_shared)
+                T.gemm(data_shared, weight_shared, acc)
+
+            # BN + IF + Residual Add epilogue
+            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            for i, j in T.Parallel(block_M, block_N):
+                m = by * block_M + i
+                f = bx * block_N + j
+                if m < M and f < F:
+                    bn_out = acc[i, j] * bn_scale[f] + bn_bias[f]
+                    s_idx = m % spatial
+                    v = state_flat[s_idx, f]
+                    h = v + bn_out
+                    spike = T.if_then_else(
+                        h >= v_threshold, T.float32(1), T.float32(0))
+                    v_new = (T.float32(1) - spike) * h + spike * T.float32(v_reset)
+                    state_flat[s_idx, f] = v_new
+                    # Fused residual add
+                    res_val = T.cast(residual_flat[m, f], T.float32)
+                    out_shared[i, j] = T.cast(spike + res_val, T.float16)
+
+            T.copy(out_shared, output_flat[by * block_M, bx * block_N])
+
+    return main

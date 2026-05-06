@@ -129,18 +129,28 @@ def _pick_config(M: int, K_red: int, F: int) -> dict:
     """Pick a reasonable default tile config for a GEMM problem.
 
     Returns dict with block_M, block_N, block_K, num_stages, threads.
+    Tuned for both large spatial (ResNet 56x56) and small spatial (transformer 14x14).
     """
     if M >= 100000:
         bm = 128
     elif M >= 10000:
         bm = 64
-    else:
+    elif M >= 1024:
         bm = 32
+    else:
+        bm = 16
 
-    bn = min(64, F) if F > 0 else 64
-    bk = min(32, K_red) if K_red > 0 else 32
-    ns = 2
-    thr = 128
+    # Wider N tiles for large output channels (expansion layers)
+    if F >= 512:
+        bn = 128
+    elif F >= 64:
+        bn = 64
+    else:
+        bn = min(32, F) if F > 0 else 64
+
+    bk = min(64, K_red) if K_red >= 64 else (min(32, K_red) if K_red > 0 else 32)
+    ns = 3 if M < 4096 else 2  # more pipeline stages for small M (hide latency)
+    thr = 256 if bm * bn >= 4096 else 128
 
     return dict(block_M=bm, block_N=bn, block_K=bk, num_stages=ns, threads=thr)
 
@@ -166,9 +176,9 @@ def _autotune_config(compile_fn, profile_args: tuple, M: int, K_red: int, F: int
         if smem > smem_limit:
             return False
         n_tiles = ((M + bm - 1) // bm) * ((F + bn - 1) // bn)
-        if n_tiles < sm_count // 4:
+        if n_tiles < sm_count // 8:  # relaxed from //4 for small-M with large-N
             return False
-        if thr < max(bm, bn) // 2:
+        if thr < max(bm, bn) // 4:  # relaxed for block_M=16 with large block_N
             return False
         return True
 
@@ -191,13 +201,20 @@ def _autotune_config(compile_fn, profile_args: tuple, M: int, K_red: int, F: int
         except Exception:
             return float('inf')
 
-    # Phase 1: Try 4 seed configs (covers common sweet spots)
+    # Phase 1: Seed configs — covers common sweet spots + small-M cases
     seeds = [
         dict(block_M=64, block_N=64, block_K=32, num_stages=2, threads=128),
         dict(block_M=128, block_N=64, block_K=32, num_stages=2, threads=128),
         dict(block_M=64, block_N=128, block_K=32, num_stages=2, threads=256),
         dict(block_M=128, block_N=128, block_K=32, num_stages=2, threads=256),
     ]
+    # Small-M seeds for transformer spatial dims (14x14, 7x7 etc.)
+    if M < 4096:
+        seeds.extend([
+            dict(block_M=16, block_N=128, block_K=32, num_stages=3, threads=128),
+            dict(block_M=16, block_N=64, block_K=64, num_stages=4, threads=128),
+            dict(block_M=32, block_N=128, block_K=64, num_stages=3, threads=256),
+        ])
     # Add heuristic default
     seeds.append(_pick_config(M, K_red, F))
 
@@ -210,8 +227,8 @@ def _autotune_config(compile_fn, profile_args: tuple, M: int, K_red: int, F: int
             best_cfg = dict(cfg)
 
     # Phase 2: Coordinate descent from best seed
-    # Sweep block_M
-    for bm in [32, 64, 128, 256]:
+    # Sweep block_M (include 16 for small-M transformers)
+    for bm in [16, 32, 64, 128, 256]:
         if bm == best_cfg['block_M']:
             continue
         cfg = dict(best_cfg, block_M=bm)
@@ -220,8 +237,8 @@ def _autotune_config(compile_fn, profile_args: tuple, M: int, K_red: int, F: int
             best_us = us
             best_cfg = cfg
 
-    # Sweep block_N
-    for bn in [32, 64, 128]:
+    # Sweep block_N (include 256 for large output channels)
+    for bn in [32, 64, 128, 256]:
         if bn == best_cfg['block_N']:
             continue
         cfg = dict(best_cfg, block_N=bn)
@@ -230,8 +247,9 @@ def _autotune_config(compile_fn, profile_args: tuple, M: int, K_red: int, F: int
             best_us = us
             best_cfg = cfg
 
-    # Sweep block_K
-    for bk in [32, 64]:
+    # Sweep block_K (include 128 for large reduction dims)
+    bk_range = [32, 64, 128] if K_red >= 128 else [32, 64]
+    for bk in bk_range:
         if bk == best_cfg['block_K']:
             continue
         cfg = dict(best_cfg, block_K=bk)
@@ -330,6 +348,10 @@ class TileLangCompiler:
             elif kv in (KernelVariant.TileLangFusedConvBNIF,
                         KernelVariant.TileLangFusedConv1x1BNIF):
                 kern, is_new = self._get_fused_conv_bn_if(node)
+                kernels[nid] = kern
+            elif kv in (KernelVariant.TileLangFusedConvBNIFAdd,
+                        KernelVariant.TileLangFusedConv1x1BNIFAdd):
+                kern, is_new = self._get_fused_conv_bn_if_add(node)
                 kernels[nid] = kern
             elif kv == KernelVariant.TileLangDWConvBN:
                 kern, is_new = self._get_dwconv_bn(node)
@@ -470,6 +492,61 @@ class TileLangCompiler:
         logger.debug("  Fused Conv+BN+IF %d→%d %dx%d B=%d M=%d cfg=%dx%dx%d",
                      cp.in_channels, cp.out_channels, H, W, self.B, M,
                      cfg['block_M'], cfg['block_N'], cfg['block_K'])
+
+        kern = _compile(cfg)
+
+        self._kernel_cache[key] = kern
+        self._config_cache[key] = cfg
+        node.tilelang_config = cfg
+        node.est_latency_us = cfg.get('latency_us', 0.0)
+        return kern, True
+
+    # ─── Fused Conv+BN+IF+Residual Add ───
+
+    def _get_fused_conv_bn_if_add(self, node: Node) -> tuple[object, bool]:
+        cp = node.conv_params
+        H, W = self._get_spatial(node)
+        key = f"fused_conv_if_add_{cp.in_channels}_{cp.out_channels}_{cp.kernel_h}x{cp.kernel_w}_{H}x{W}_s{cp.stride_h}_B{self.B}"
+
+        if key in self._kernel_cache:
+            node.tilelang_config = self._config_cache[key]
+            return self._kernel_cache[key], False
+
+        from sengine.kernels.conv2d_bn_if_t4 import (
+            conv2d_bn_if_add_t4_kernel, conv1x1_bn_if_add_t4_kernel,
+        )
+
+        OH = (H + 2 * cp.pad_h - cp.dilation_h * (cp.kernel_h - 1) - 1) // cp.stride_h + 1
+        OW = (W + 2 * cp.pad_w - cp.dilation_w * (cp.kernel_w - 1) - 1) // cp.stride_w + 1
+        M = self.B * OH * OW
+        K_red = cp.kernel_h * cp.kernel_w * cp.in_channels
+
+        is_1x1 = (cp.kernel_h == 1 and cp.kernel_w == 1)
+        def _compile(cfg):
+            if is_1x1:
+                return conv1x1_bn_if_add_t4_kernel(
+                    TB=self.B, C_in=cp.in_channels, H=H, W=W, F=cp.out_channels,
+                    S=cp.stride_h, T_steps=1,
+                    **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
+            return conv2d_bn_if_add_t4_kernel(
+                TB=self.B, C_in=cp.in_channels, H=H, W=W, F=cp.out_channels,
+                K=cp.kernel_h, S=cp.stride_h, D=cp.dilation_h, P=cp.pad_h,
+                T_steps=1,
+                **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
+        _profile_args = (
+            torch.empty(self.B, H, W, cp.in_channels, dtype=torch.float16, device='cuda'),
+            torch.empty(1, 1, cp.in_channels, cp.out_channels, dtype=torch.float16, device='cuda')
+                if is_1x1 else
+                torch.empty(cp.kernel_h, cp.kernel_w, cp.in_channels, cp.out_channels, dtype=torch.float16, device='cuda'),
+            torch.zeros(self.B * OH * OW, cp.out_channels, dtype=torch.float32, device='cuda'),  # membrane
+            torch.ones(cp.out_channels, dtype=torch.float32, device='cuda'),
+            torch.zeros(cp.out_channels, dtype=torch.float32, device='cuda'),
+            torch.empty(self.B, OH, OW, cp.out_channels, dtype=torch.float16, device='cuda'),  # residual
+        )
+        cfg = self._resolve_config(key, M, K_red, cp.out_channels,
+                                    compile_fn=_compile, profile_args=_profile_args)
+        logger.debug("  Fused Conv+BN+IF+Add %d→%d %dx%d B=%d",
+                     cp.in_channels, cp.out_channels, H, W, self.B)
 
         kern = _compile(cfg)
 
@@ -926,17 +1003,39 @@ class TileLangCompiler:
         key = f"dwconv_{cp.in_channels}_{cp.kernel_h}x{cp.kernel_w}_{H}x{W}_s{cp.stride_h}_TB{self.TB}"
 
         if key in self._kernel_cache:
+            node.tilelang_config = self._config_cache.get(key, {})
             return self._kernel_cache[key], False
 
         from sengine.kernels.dwconv_bn import dwconv_bn_kernel
         logger.debug("  DWConv+BN %d %dx%d s=%d",
                      cp.in_channels, H, W, cp.stride_h)
 
-        kern = dwconv_bn_kernel(
-            TB=self.TB, C=cp.in_channels, H=H, W=W,
-            K=cp.kernel_h, S=cp.stride_h, P=cp.pad_h)
+        OH = (H + 2 * cp.pad_h - cp.kernel_h) // cp.stride_h + 1
+        OW = (W + 2 * cp.pad_w - cp.kernel_w) // cp.stride_w + 1
+        M = self.TB * OH * OW
 
+        def _compile(cfg):
+            return dwconv_bn_kernel(
+                TB=self.TB, C=cp.in_channels, H=H, W=W,
+                K=cp.kernel_h, S=cp.stride_h, P=cp.pad_h,
+                block_C=cfg['block_N'], block_HW=cfg['block_M'],
+                threads=cfg['threads'])
+
+        _profile_args = (
+            torch.empty(self.TB, H, W, cp.in_channels, dtype=torch.float16, device='cuda'),
+            torch.empty(cp.in_channels, cp.kernel_h, cp.kernel_w, dtype=torch.float16, device='cuda'),
+            torch.ones(cp.in_channels, dtype=torch.float32, device='cuda'),
+            torch.zeros(cp.in_channels, dtype=torch.float32, device='cuda'),
+        )
+        # For DWConv: M=spatial, K_red=K*K (tiny), F=C (channels as "output")
+        cfg = self._resolve_config(key, M, cp.kernel_h * cp.kernel_w, cp.in_channels,
+                                    compile_fn=_compile, profile_args=_profile_args)
+
+        kern = _compile(cfg)
         self._kernel_cache[key] = kern
+        self._config_cache[key] = cfg
+        node.tilelang_config = cfg
+        node.est_latency_us = cfg.get('latency_us', 0.0)
         return kern, True
 
     def _get_dwconv_bn_if(self, node: Node) -> tuple[object, bool]:
@@ -945,18 +1044,40 @@ class TileLangCompiler:
         key = f"dwconv_if_{cp.in_channels}_{cp.kernel_h}x{cp.kernel_w}_{H}x{W}_s{cp.stride_h}_B{self.B}"
 
         if key in self._kernel_cache:
+            node.tilelang_config = self._config_cache.get(key, {})
             return self._kernel_cache[key], False
 
         from sengine.kernels.dwconv_bn import dwconv_bn_if_kernel
         logger.debug("  DWConv+BN+IF %d %dx%d s=%d",
                      cp.in_channels, H, W, cp.stride_h)
 
-        kern = dwconv_bn_if_kernel(
-            TB=self.B, C=cp.in_channels, H=H, W=W,
-            K=cp.kernel_h, S=cp.stride_h, P=cp.pad_h,
-            T_steps=1)
+        OH = (H + 2 * cp.pad_h - cp.kernel_h) // cp.stride_h + 1
+        OW = (W + 2 * cp.pad_w - cp.kernel_w) // cp.stride_w + 1
+        M = self.B * OH * OW
 
+        def _compile(cfg):
+            return dwconv_bn_if_kernel(
+                TB=self.B, C=cp.in_channels, H=H, W=W,
+                K=cp.kernel_h, S=cp.stride_h, P=cp.pad_h,
+                T_steps=1,
+                block_C=cfg['block_N'], block_HW=cfg['block_M'],
+                threads=cfg['threads'])
+
+        _profile_args = (
+            torch.empty(self.B, H, W, cp.in_channels, dtype=torch.float16, device='cuda'),
+            torch.empty(cp.in_channels, cp.kernel_h, cp.kernel_w, dtype=torch.float16, device='cuda'),
+            torch.empty(self.B, OH, OW, cp.in_channels, dtype=torch.float32, device='cuda'),
+            torch.ones(cp.in_channels, dtype=torch.float32, device='cuda'),
+            torch.zeros(cp.in_channels, dtype=torch.float32, device='cuda'),
+        )
+        cfg = self._resolve_config(key, M, cp.kernel_h * cp.kernel_w, cp.in_channels,
+                                    compile_fn=_compile, profile_args=_profile_args)
+
+        kern = _compile(cfg)
         self._kernel_cache[key] = kern
+        self._config_cache[key] = cfg
+        node.tilelang_config = cfg
+        node.est_latency_us = cfg.get('latency_us', 0.0)
         return kern, True
 
     # ─── Grouped Conv+BN ───

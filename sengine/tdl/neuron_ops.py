@@ -136,6 +136,40 @@ class FusedMSPluginOp(torch.autograd.Function):
         return g.op("FusedMSNeuron", x_seq, T_i=T, decay_f=decay, thresh_f=thresh)
 
 
+def _ilif_forward(ctx, x_seq, T, decay, max_level):
+    """I-LIF forward: multi-level spike output via round(clamp(mem, 0, max_level))."""
+    B = x_seq.shape[0] // T
+    spatial_shape = (B,) + tuple(x_seq.shape[1:])
+    mem = torch.zeros(spatial_shape, device=x_seq.device, dtype=x_seq.dtype)
+    spike = torch.zeros(spatial_shape, device=x_seq.device, dtype=x_seq.dtype)
+    spikes = []
+    for t in range(T):
+        x_t = x_seq[t * B:(t + 1) * B]
+        mem = decay * (mem - spike) + x_t
+        spike = torch.round(torch.clamp(mem, 0, max_level))
+        spikes.append(spike)
+    return torch.cat(spikes, dim=0)
+
+
+class FusedILIFOp(torch.autograd.Function):
+    """I-LIF neuron → native ONNX ops (Round + Clip)."""
+    forward = staticmethod(_ilif_forward)
+
+    @staticmethod
+    def symbolic(g, x_seq, T, decay, max_level):
+        return _ilif_native_symbolic(g, x_seq, T, decay, max_level)
+
+
+class FusedILIFPluginOp(torch.autograd.Function):
+    """I-LIF neuron → custom ONNX op (plugin)."""
+    forward = staticmethod(_ilif_forward)
+
+    @staticmethod
+    def symbolic(g, x_seq, T, decay, max_level):
+        return g.op("FusedILIFNeuron", x_seq,
+                    T_i=T, decay_f=decay, max_level_i=max_level)
+
+
 # ---------------------------------------------------------------------------
 # Native ONNX symbolic implementations
 # ---------------------------------------------------------------------------
@@ -283,6 +317,34 @@ def _ms_native_symbolic(g, x_seq, T, decay, thresh):
                    x_t)
         cmp = g.op("GreaterOrEqual", mem, c_thresh)
         spike = g.op("Cast", cmp, to_i=1)
+        spike_list.append(spike)
+
+    return g.op("Concat", *spike_list, axis_i=0)
+
+
+def _ilif_native_symbolic(g, x_seq, T, decay, max_level):
+    """Emit I-LIF neuron as unrolled standard ONNX ops (Round + Clip)."""
+    B_node, B_int = _get_B_node(g, x_seq, T)
+
+    c_decay = _const(g, decay)
+    c_zero = _const(g, 0.0)
+    c_max = _const(g, float(max_level))
+    axes = g.op("Constant", value_t=torch.tensor([0], dtype=torch.long))
+
+    x_0 = _slice_t(g, x_seq, 0, B_node, B_int, axes)
+    mem = g.op("Mul", x_0, c_zero)
+    spike = g.op("Mul", x_0, c_zero)
+
+    spike_list = []
+    for t in range(T):
+        x_t = _slice_t(g, x_seq, t, B_node, B_int, axes)
+        # mem = decay * (mem - spike) + x_t
+        mem = g.op("Add",
+                   g.op("Mul", c_decay, g.op("Sub", mem, spike)),
+                   x_t)
+        # spike = round(clamp(mem, 0, max_level))
+        clipped = g.op("Clip", mem, c_zero, c_max)
+        spike = g.op("Round", clipped)
         spike_list.append(spike)
 
     return g.op("Concat", *spike_list, axis_i=0)

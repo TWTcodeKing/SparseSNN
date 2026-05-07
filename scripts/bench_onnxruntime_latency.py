@@ -94,18 +94,22 @@ def export_onnx(model, input_shape, onnx_path, opset, device):
         return
 
     print(f"  [ort] Exporting ONNX (opset={opset}, shape={input_shape})...")
-    dummy_input = torch.randn(*input_shape, device=device)
-    reset_net(model)
+    # Export on CPU to avoid GPU OOM on large batch sizes.
+    # ONNX export only traces the graph — no GPU compute needed.
+    model_cpu = model.cpu()
+    dummy_input = torch.randn(*input_shape, device='cpu')
+    reset_net(model_cpu)
 
     # Force legacy TorchScript exporter (dynamo exporter has issues with
     # opset downgrade and dynamic_axes on internal reshape ops)
     torch.onnx.export(
-        model, dummy_input, onnx_path,
+        model_cpu, dummy_input, onnx_path,
         opset_version=opset,
         input_names=["input"],
         output_names=["output"],
         dynamo=False,
     )
+    model.to(device)  # move back to GPU
 
     # Simplify with onnxsim if available
     try:
@@ -125,20 +129,57 @@ def export_onnx(model, input_shape, onnx_path, opset, device):
 
 
 def convert_onnx_to_fp16(onnx_path):
-    """Convert ONNX model internal computation to FP16 (I/O stays fp32)."""
+    """Convert entire ONNX model to FP16 (weights, I/O, Cast ops).
+
+    Uses direct conversion instead of onnxconverter_common to avoid
+    mixed fp32/fp16 graphs that cause ORT allocator errors.
+    """
     fp16_path = onnx_path.replace(".onnx", "_fp16.onnx")
     if os.path.exists(fp16_path):
         print(f"  [ort] Reusing existing FP16 ONNX: {fp16_path}")
         return fp16_path
 
     import onnx
-    from onnxconverter_common import float16
-    print(f"  [ort] Converting model to FP16 (keep_io_types=True)...")
-    model = onnx.load(onnx_path)
-    model_fp16 = float16.convert_float_to_float16(
-        model, keep_io_types=True, op_block_list=['Cast']
-    )
-    onnx.save(model_fp16, fp16_path)
+    from onnx import numpy_helper, TensorProto
+
+    print(f"  [ort] Converting model to FP16 (full conversion)...")
+    model = onnx.load(onnx_path, load_external_data=True)
+
+    # Convert all float32 initializers to float16
+    for init in model.graph.initializer:
+        if init.data_type == TensorProto.FLOAT:
+            tensor = numpy_helper.to_array(init)
+            new_tensor = numpy_helper.from_array(
+                tensor.astype(np.float16), name=init.name
+            )
+            init.CopyFrom(new_tensor)
+
+    # Fix Cast ops: FLOAT -> FLOAT16
+    for node in model.graph.node:
+        if node.op_type == 'Cast':
+            for attr in node.attribute:
+                if attr.name == 'to' and attr.i == TensorProto.FLOAT:
+                    attr.i = TensorProto.FLOAT16
+        # Fix scalar tensor attributes in nodes (e.g. Constant ops)
+        for attr in node.attribute:
+            if attr.type == onnx.AttributeProto.TENSOR and attr.t.ByteSize() > 0:
+                if attr.t.data_type == TensorProto.FLOAT:
+                    tensor = numpy_helper.to_array(attr.t)
+                    new_tensor = numpy_helper.from_array(tensor.astype(np.float16))
+                    attr.t.CopyFrom(new_tensor)
+
+    # Convert graph I/O types
+    for inp in model.graph.input:
+        if inp.type.tensor_type.elem_type == TensorProto.FLOAT:
+            inp.type.tensor_type.elem_type = TensorProto.FLOAT16
+    for out in model.graph.output:
+        if out.type.tensor_type.elem_type == TensorProto.FLOAT:
+            out.type.tensor_type.elem_type = TensorProto.FLOAT16
+
+    # Strip stale value_info to avoid shape/type checker conflicts
+    del model.graph.value_info[:]
+
+    onnx.save(model, fp16_path)
     print(f"  [ort] FP16 model saved: {fp16_path}")
     return fp16_path
 
@@ -240,7 +281,7 @@ def main():
     torch.cuda.empty_cache()
 
     gpu_name = torch.cuda.get_device_name(device)
-    dtype = np.float32  # I/O is always fp32; --fp16 controls internal compute
+    dtype = np.float16 if args.fp16 else np.float32
 
     # Header
     print()

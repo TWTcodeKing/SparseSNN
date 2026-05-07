@@ -48,7 +48,9 @@ def parse_args():
                         help="Directory for ONNX model files")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version")
     parser.add_argument("--fp16", action="store_true",
-                        help="Use FP16 input for ORT inference")
+                        help="Use FP16 model for ORT inference "
+                        "(WARNING: ORT CUDA EP has limited fp16 support for SNN ops; "
+                        "use TensorRT for fp16 benchmarks instead)")
     parser.add_argument("--graph-opt", type=str, default="all",
                         choices=["disabled", "basic", "extended", "all"],
                         help="ORT graph optimization level")
@@ -223,30 +225,53 @@ def benchmark_ort(session, input_array, warmup, iters):
     import onnxruntime as ort
 
     input_name = session.get_inputs()[0].name
-    io_binding = session.io_binding()
+    output_name = session.get_outputs()[0].name
 
-    # Create ORT tensor on GPU
-    ort_input = ort.OrtValue.ortvalue_from_numpy(input_array, 'cuda', 0)
-
-    # Warmup
-    for _ in range(warmup):
+    # Try io_binding (fastest), fall back to session.run if allocator fails
+    try:
+        io_binding = session.io_binding()
+        ort_input = ort.OrtValue.ortvalue_from_numpy(input_array, 'cuda', 0)
         io_binding.bind_ortvalue_input(input_name, ort_input)
-        io_binding.bind_output(session.get_outputs()[0].name, 'cuda')
+        io_binding.bind_output(output_name, 'cuda')
         session.run_with_iobinding(io_binding)
-    io_binding.synchronize_outputs()
+        use_iobinding = True
+    except Exception:
+        use_iobinding = False
 
-    # Timed iterations
-    times = []
-    for _ in range(iters):
-        io_binding.bind_ortvalue_input(input_name, ort_input)
-        io_binding.bind_output(session.get_outputs()[0].name, 'cuda')
+    if use_iobinding:
+        # Warmup
+        for _ in range(warmup):
+            io_binding.bind_ortvalue_input(input_name, ort_input)
+            io_binding.bind_output(output_name, 'cuda')
+            session.run_with_iobinding(io_binding)
+        io_binding.synchronize_outputs()
 
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        session.run_with_iobinding(io_binding)
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        times.append((t1 - t0) * 1000)
+        # Timed iterations
+        times = []
+        for _ in range(iters):
+            io_binding.bind_ortvalue_input(input_name, ort_input)
+            io_binding.bind_output(output_name, 'cuda')
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            session.run_with_iobinding(io_binding)
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            times.append((t1 - t0) * 1000)
+    else:
+        # Fallback: session.run with numpy I/O (includes CPU<->GPU transfer)
+        run_opts = ort.RunOptions()
+
+        for _ in range(warmup):
+            session.run([output_name], {input_name: input_array})
+
+        times = []
+        for _ in range(iters):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            session.run([output_name], {input_name: input_array})
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            times.append((t1 - t0) * 1000)
 
     return np.array(times)
 

@@ -50,6 +50,8 @@ def parse_args():
                         help="torch.compile backend (default: inductor)")
     parser.add_argument("--no-compile", action="store_true",
                         help="Skip compilation, benchmark eager PyTorch")
+    parser.add_argument("--fp16", action="store_true",
+                        help="Run in FP16 precision (default: FP32)")
     return parser.parse_args()
 
 
@@ -115,7 +117,18 @@ def main():
     model_name = args.model or os.path.splitext(os.path.basename(args.config))[0]
 
     batch_sizes = [int(b) for b in args.batch_sizes.split(",")]
-    model.half()
+    if args.fp16:
+        model.half()
+
+    # Inductor/Triton crashes on aarch64 (Jetson) — fall back to safe settings
+    import platform
+    if platform.machine() == 'aarch64' and not args.no_compile:
+        if args.backend == 'inductor':
+            print("[inductor] WARNING: aarch64 detected (Jetson). "
+                  "Switching backend to 'cudagraphs' (Triton codegen unsupported on ARM)")
+            args.backend = 'cudagraphs'
+            args.mode = 'default'
+
     # Compile model
     if not args.no_compile:
         print(f"[inductor] Compiling with mode={args.mode}, backend={args.backend}...")
@@ -130,7 +143,7 @@ def main():
     print()
     print("=" * 80)
     print(f"  {mode_str} | {model_name} | {args.dataset} | T={args.T}")
-    print(f"  GPU: {gpu_name}")
+    print(f"  GPU: {gpu_name} | dtype: {'FP16' if args.fp16 else 'FP32'}")
     print("=" * 80)
     print(f"  {'Batch':<10} {'Latency (ms)':>14} {'Std (ms)':>10} {'Throughput':>12}")
     print(f"  {'--------':<10} {'--------------':>14} {'----------':>10} {'--------':>12}")
@@ -140,7 +153,8 @@ def main():
         try:
             input_tensor = torch.randn(
                 bs, ds_cfg['in_channels'], img_size, img_size,
-                dtype=torch.float16, device=device,
+                dtype=torch.float16 if args.fp16 else torch.float32,
+                device=device,
             )
 
             # Trigger compilation on first batch size (graph capture)

@@ -1,38 +1,42 @@
 #!/usr/bin/env python3
-"""Benchmark sengine inference latency (C++ executor) for SNN models.
+"""Benchmark sengine inference latency for SNN models.
 
-Exports plugin-mode ONNX (TDL + FusedIF/LIF custom ops), builds sengine
-with TileLang kernels and BA-MTTS scheduling, benchmarks via C++ CUDA
-Graph executor.
+Three-phase pipeline:
+  Phase 1: Export plugin-mode ONNX (TDL transforms)
+  Phase 2: Fusion validation pre-pass (profile fused vs decomposed per shape)
+  Phase 3: Build + benchmark (with validated fusion + roofline tuning)
 
 Usage:
-    # ResNet
-    python scripts/bench_sengine_latency.py --model sew_resnet18 --dataset cifar100
+    # Full pipeline with validation + autotuning
+    python scripts/bench_sengine_latency.py \
+        --config configs/maxformer/maxformer_10_512.yaml \
+        --dataset imagenet --T 4 --batch-sizes 4 \
+        --fusion slicer --autotune --gpu-ids 2
 
-    # Transformer
-    python scripts/bench_sengine_latency.py --config configs/spikformer/spikformer_8_384.yaml \
-        --dataset cifar100
+    # Compare decomposed vs validated fusion
+    python scripts/bench_sengine_latency.py \
+        --model sew_resnet18 --dataset imagenet \
+        --fusion none,slicer --autotune --batch-sizes 4
 
-    # With checkpoint + custom batch sizes
-    python scripts/bench_sengine_latency.py --model sew_resnet34 --dataset cifar100 \
-        --checkpoint obc_pt/sew_resnet34_cifar100_sbc_2_4_global.pth \
-        --batch-sizes 1,4,8,16,32
-
-    # Export plugin ONNX only (for cross-platform workflows)
-    python scripts/bench_sengine_latency.py --model sew_resnet34 --dataset imagenet \
-        --export-only
+    # Quick (no autotuning, no validation)
+    python scripts/bench_sengine_latency.py \
+        --model sew_resnet18 --dataset imagenet --batch-sizes 4
 """
 
 import argparse
+import gc
 import os
 import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-os.environ.setdefault('CUDA_HOME', '/usr/local/cuda-12.8')
-os.environ.setdefault('TORCH_CUDA_ARCH_LIST', '8.9')
-os.environ['PATH'] = '/usr/local/cuda-12.8/bin:' + os.environ.get('PATH', '')
+# Auto-detect CUDA home
+for cuda_path in ['/usr/local/cuda-12.8', '/usr/local/cuda', '/usr/local/cuda-12.6']:
+    if os.path.isdir(cuda_path):
+        os.environ.setdefault('CUDA_HOME', cuda_path)
+        os.environ['PATH'] = os.path.join(cuda_path, 'bin') + ':' + os.environ.get('PATH', '')
+        break
 
 import torch
 
@@ -40,189 +44,200 @@ import torch
 def export_plugin_onnx(args, ds_cfg, img_size, output_dir):
     """Export plugin-mode ONNX for sengine."""
     from sengine.scripts.export_onnx import export_model
-
     model_name = args.model or os.path.splitext(os.path.basename(args.config))[0]
-    plugin_path = os.path.join(output_dir,
-                               f"{model_name}_{args.dataset}_plugin.onnx")
-
+    plugin_path = os.path.join(output_dir, f"{model_name}_{args.dataset}_plugin.onnx")
     if os.path.exists(plugin_path):
         print(f"  Plugin ONNX exists: {plugin_path}")
         return plugin_path
-
     print(f"  Exporting plugin ONNX: {model_name}...")
     result = export_model(
-        model_name=args.model or model_name,
-        output_dir=output_dir,
-        T=args.T,
-        dataset=args.dataset,
-        img_size=img_size,
-        config=args.config,
-        checkpoint=args.checkpoint,
-    )
+        model_name=args.model or model_name, output_dir=output_dir,
+        T=args.T, dataset=args.dataset, img_size=img_size,
+        config=args.config, checkpoint=args.checkpoint)
     if result and os.path.exists(result):
-        # Consolidate external data into single/minimal file(s)
-        if args.single_file:
-            import onnx
-            onnx_dir = os.path.dirname(os.path.abspath(result)) or '.'
-            onnx_model = onnx.load(result, load_external_data=False)
-            # Collect external data file names
-            ext_files = set()
-            for tensor in onnx_model.graph.initializer:
-                for entry in tensor.external_data:
-                    if entry.key == 'location':
-                        ext_files.add(entry.value)
-            for node in onnx_model.graph.node:
-                for attr in node.attribute:
-                    if attr.type == 4 and attr.t.data_location == 1:
-                        for entry in attr.t.external_data:
-                            if entry.key == 'location':
-                                ext_files.add(entry.value)
-            # Reload with data
-            onnx_model = onnx.load(result)
-            # Try single file; fall back to one .data file if > 2GB
-            try:
-                onnx.save(onnx_model, result)
-                msg = "single file"
-            except Exception:
-                data_file = os.path.basename(result) + '.data'
-                onnx.save(onnx_model, result,
-                          save_as_external_data=True,
-                          all_tensors_to_one_file=True,
-                          location=data_file)
-                msg = f"onnx + {data_file} (model > 2GB)"
-            # Remove old external data files
-            for f in ext_files:
-                fpath = os.path.join(onnx_dir, f)
-                if os.path.isfile(fpath):
-                    os.remove(fpath)
-            print(f"  Saved ({msg}): {result}")
-        else:
-            print(f"  Saved: {result}")
+        print(f"  Saved: {result}")
     else:
         raise RuntimeError(f"ONNX export failed for {model_name}")
     return result
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Benchmark sengine inference latency (C++ executor)")
-
-    # Model
-    parser.add_argument('--model', type=str, default=None,
-                        help='ResNet model name (e.g. sew_resnet18)')
-    parser.add_argument('--config', type=str, default=None,
-                        help='Transformer YAML config path')
-    parser.add_argument('--dataset', type=str, required=True,
-                        help='Dataset name (cifar100, imagenet, etc.)')
-    parser.add_argument('--T', type=int, default=4,
-                        help='Temporal steps (default: 4)')
-    parser.add_argument('--img-size', type=int, default=None,
-                        help='Image size (auto-detected from dataset if omitted)')
-
-    # Checkpoint
-    parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Model checkpoint path (random weights if omitted)')
-
-    # Benchmark
-    parser.add_argument('--batch-sizes', type=str, default='1,4,8,16',
-                        help='Comma-separated batch sizes (default: 1,4,8,16)')
-    parser.add_argument('--warmup', type=int, default=200,
-                        help='Warmup iterations (default: 200)')
-    parser.add_argument('--iters', type=int, default=1000,
-                        help='Measurement iterations (default: 1000)')
-
-    # Output
-    parser.add_argument('--export-dir', type=str, default='sengine/exports',
-                        help='Directory for ONNX and .sengine files')
-    parser.add_argument('--export-only', action='store_true',
-                        help='Export plugin ONNX only, skip build and benchmark')
-    parser.add_argument('--single-file', action='store_true',
-                        help='Consolidate ONNX external data into a single .onnx file')
-
+    parser = argparse.ArgumentParser(description="Benchmark sengine inference latency")
+    parser.add_argument('--model', type=str, default=None)
+    parser.add_argument('--config', type=str, default=None)
+    parser.add_argument('--dataset', type=str, required=True)
+    parser.add_argument('--T', type=int, default=4)
+    parser.add_argument('--img-size', type=int, default=None)
+    parser.add_argument('--checkpoint', type=str, default=None)
+    parser.add_argument('--fusion', type=str, default='none',
+                        help='none, slicer, or none,slicer for comparison')
+    parser.add_argument('--autotune', action='store_true',
+                        help='Enable roofline-guided autotuning')
+    parser.add_argument('--batch-sizes', type=str, default='1,4')
+    parser.add_argument('--warmup', type=int, default=200)
+    parser.add_argument('--iters', type=int, default=1000)
+    parser.add_argument('--export-dir', type=str, default='sengine/exports')
+    parser.add_argument('--export-only', action='store_true')
+    parser.add_argument('--gpu-ids', type=str, default='0')
     args = parser.parse_args()
 
     if not args.model and not args.config:
         parser.error("Provide --model or --config")
 
+    device_id = int(args.gpu_ids.split(',')[0])
+    torch.cuda.set_device(device_id)
+
     from tengine.utils import get_dataset_config
     batch_sizes = [int(x) for x in args.batch_sizes.split(',')]
+    fusion_modes = [s.strip() for s in args.fusion.split(',')]
     ds_cfg = get_dataset_config(args.dataset)
     img_size = args.img_size or ds_cfg['img_size']
     tag = args.model or os.path.splitext(os.path.basename(args.config))[0]
 
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    props = torch.cuda.get_device_properties(device_id)
+    gpu_name = props.name
+    gpu_arch = f"sm_{props.major}{props.minor}"
+    gpu_sms = props.multi_processor_count
+    gpu_mem = props.total_memory / 1e9
+    print(f"GPU {device_id}: {gpu_name} ({gpu_arch}, {gpu_sms} SMs, {gpu_mem:.1f} GB)")
+    print(f"Model: {tag} | Dataset: {args.dataset} | T={args.T}")
+    print(f"Fusion: {fusion_modes} | Autotune: {args.autotune}")
 
     os.makedirs(args.export_dir, exist_ok=True)
 
-    # Step 1: Export plugin ONNX (once, shared across batch sizes)
-    print(f"\n{'='*60}")
+    # ── Phase 1: Export plugin ONNX ──
+    print(f"\n{'='*70}")
     print(f"  Phase 1: Export plugin-mode ONNX")
-    print(f"{'='*60}")
+    print(f"{'='*70}")
     plugin_onnx = export_plugin_onnx(args, ds_cfg, img_size, args.export_dir)
 
     if args.export_only:
-        print(f"\n  Export complete. Plugin ONNX: {plugin_onnx}")
+        print(f"\n  Export complete: {plugin_onnx}")
         return
 
-    # Step 2: Build/load + benchmark for each batch size
-    print(f"\n{'='*60}")
-    print(f"  Phase 2: Build + benchmark sengine (C++ executor)")
-    print(f"{'='*60}")
+    # ── Phase 2: Fusion validation (per batch size) ──
+    # For each (fusion=slicer, batch_size), run the validator pre-pass
+    # to determine which shapes benefit from fusion.
+    rec_files = {}  # (fusion, B) → rec_path or None
+    if 'slicer' in fusion_modes and args.autotune:
+        print(f"\n{'='*70}")
+        print(f"  Phase 2: Fusion validation pre-pass")
+        print(f"{'='*70}")
 
-    import sengine
+        from sengine.build.fusion_validator import generate_recommendations
 
-    results = {}
-    for B in batch_sizes:
-        sengine_path = os.path.join(args.export_dir,
-                                     f"{tag}_{args.dataset}_B{B}.sengine")
-        try:
-            if os.path.exists(sengine_path):
-                print(f"\n  [B={B}] Loading cached: {sengine_path}")
-                t0 = time.time()
-                engine = sengine.load(sengine_path)
-                print(f"          Loaded in {time.time()-t0:.1f}s")
-            else:
-                print(f"\n  [B={B}] Building sengine from ONNX...")
-                t0 = time.time()
-                engine = sengine.build(plugin_onnx, T=args.T, batch_size=B, autotune=True)
-                build_s = time.time() - t0
-                print(f"          Built in {build_s:.1f}s")
-                engine.save(sengine_path)
-                size_mb = os.path.getsize(sengine_path) / 1e6
-                print(f"          Saved: {sengine_path} ({size_mb:.1f} MB)")
+        for B in batch_sizes:
+            rec_path = os.path.join('.cache', f'fusion_rec_{tag}_{args.dataset}_T{args.T}_B{B}.json')
+            if os.path.exists(rec_path):
+                print(f"\n  [B={B}] Recommendations exist: {rec_path}")
+                rec_files[('slicer', B)] = rec_path
+                continue
+            print(f"\n  [B={B}] Validating fused shapes...")
+            t0 = time.time()
+            generate_recommendations(plugin_onnx, args.T, B, rec_path)
+            print(f"  Done in {time.time()-t0:.0f}s")
+            rec_files[('slicer', B)] = rec_path
+    else:
+        print(f"\n  Phase 2: Skipped (no slicer+autotune)")
 
-            # Verify C++ executor is active
-            if engine._use_python_runtime:
-                print(f"  WARNING: B={B} using Python runtime (C++ executor unavailable)")
-
-            # Benchmark
-            ms = engine.benchmark(warmup=args.warmup, iters=args.iters)
-            fps = 1000.0 / ms * B if ms > 0 else 0
-            runtime = "C++" if not engine._use_python_runtime else "Python"
-            results[B] = {'mean_ms': ms, 'throughput': fps, 'runtime': runtime}
-            print(f"  [B={B}] Latency: {ms:.3f} ms ({fps:.0f} img/s) [{runtime}]")
-
-            engine.destroy()
-            torch.cuda.empty_cache()
-
-        except Exception as e:
-            print(f"  [B={B}] FAILED: {e}")
-
-    # Results table
+    # ── Phase 3: Build + benchmark ──
     print(f"\n{'='*70}")
-    print(f"  sengine (C++ CUDA Graph) | {tag} | {args.dataset} | T={args.T}")
-    print(f"  GPU: {torch.cuda.get_device_name(0)}")
+    print(f"  Phase 3: Build + benchmark")
     print(f"{'='*70}")
-    print(f"  {'Batch':<8} {'Latency (ms)':>14} {'Throughput':>14} {'Runtime':>10}")
-    print(f"  {'-'*8} {'-'*14} {'-'*14} {'-'*10}")
-    for B in batch_sizes:
-        r = results.get(B)
-        if r:
-            print(f"  B={B:<5} {r['mean_ms']:>12.3f}ms "
-                  f"{r['throughput']:>12.0f}/s {r['runtime']:>10}")
-        else:
-            print(f"  B={B:<5} {'FAIL':>14}")
-    print(f"{'='*70}")
+
+    all_results = {}
+
+    for fusion in fusion_modes:
+        for B in batch_sizes:
+            label = f"fusion={fusion}, B={B}"
+            rec_path = rec_files.get((fusion, B))
+
+            # Run each build in a SUBPROCESS to guarantee clean CUDA state.
+            # The validator pre-pass and previous builds may leave stale
+            # CUDA errors that corrupt graph capture in the same process.
+            import subprocess, json as json_mod
+            cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                      '.cache', f'sengine_B{B}')
+            result_file = f'/tmp/sengine_bench_{tag}_{fusion}_B{B}.json'
+
+            sub_cmd = f"""
+import os, sys, time, json; sys.path.insert(0, '{os.path.dirname(os.path.dirname(__file__))}')
+os.environ['CUDA_HOME']='{os.environ.get("CUDA_HOME","")}'
+os.environ['PATH']='{os.environ.get("PATH","")}'
+import shutil
+cache = '{cache_dir}'
+if os.path.exists(cache): shutil.rmtree(cache)
+import sengine
+from sengine.ir import KernelVariant
+try:
+    t0 = time.time()
+    e = sengine.build('{plugin_onnx}', T={args.T}, batch_size={B},
+                       fusion='{fusion}', autotune={args.autotune},
+                       fusion_rec={repr(rec_path)})
+    build_s = time.time() - t0
+    mode = 'C++' if not e._use_python_runtime else 'Python'
+    n_fused = sum(1 for n in e._ir.nodes.values()
+                  if n.assigned_kernel in (KernelVariant.TileLangFusedConv1x1BNIF,
+                                            KernelVariant.TileLangFusedConvBNIF))
+    ms = e.benchmark(warmup={args.warmup}, iters={args.iters})
+    fps = 1000.0 / ms * {B} if ms > 0 else 0
+    json.dump({{'ms': ms, 'fps': fps, 'mode': mode, 'fused': n_fused,
+                'build_s': build_s, 'validated': {rec_path is not None}}},
+              open('{result_file}', 'w'))
+except Exception as ex:
+    json.dump({{'error': str(ex)}}, open('{result_file}', 'w'))
+"""
+            print(f"\n  [{label}] Building (subprocess)...")
+            env = os.environ.copy()
+            env['CUDA_VISIBLE_DEVICES'] = str(device_id)
+            proc = subprocess.run(
+                [sys.executable, '-c', sub_cmd],
+                env=env, timeout=1800,
+                capture_output=True, text=True)
+
+            if os.path.exists(result_file):
+                with open(result_file) as f:
+                    r = json_mod.load(f)
+                if 'error' in r:
+                    print(f"  [{label}] FAILED: {r['error']}")
+                    all_results[(fusion, B)] = None
+                else:
+                    all_results[(fusion, B)] = r
+                    v = 'yes' if r.get('validated') else 'no'
+                    print(f"  [{label}] {r['ms']:.3f} ms | {r['fps']:.0f} img/s | "
+                          f"fused={r['fused']} | {r['mode']} | build={r['build_s']:.0f}s"
+                          + (" | validated" if r.get('validated') else ""))
+                os.remove(result_file)
+            else:
+                print(f"  [{label}] FAILED: subprocess crashed")
+                if proc.stderr:
+                    # Show last few lines of error
+                    err_lines = proc.stderr.strip().split('\n')
+                    for line in err_lines[-3:]:
+                        if 'Error' in line or 'FAILED' in line:
+                            print(f"    {line}")
+                all_results[(fusion, B)] = None
+
+    # ── Results table ──
+    print(f"\n{'='*80}")
+    print(f"  {tag} | {args.dataset} | T={args.T}")
+    print(f"  GPU {device_id}: {gpu_name} ({gpu_arch}, {gpu_sms} SMs)")
+    print(f"  Autotune: {args.autotune}")
+    print(f"{'='*80}")
+    print(f"  {'Fusion':<10} {'Batch':<6} {'Latency':>10} {'Throughput':>12} "
+          f"{'Fused':>6} {'Runtime':>8} {'Build':>8} {'Valid':>6}")
+    print(f"  {'-'*10} {'-'*6} {'-'*10} {'-'*12} {'-'*6} {'-'*8} {'-'*8} {'-'*6}")
+    for fusion in fusion_modes:
+        for B in batch_sizes:
+            r = all_results.get((fusion, B))
+            if r:
+                v = 'yes' if r.get('validated') else 'no'
+                print(f"  {fusion:<10} B={B:<4} {r['ms']:>8.3f}ms "
+                      f"{r['fps']:>10.0f}/s {r['fused']:>6} "
+                      f"{r['mode']:>8} {r['build_s']:>6.0f}s {v:>6}")
+            else:
+                print(f"  {fusion:<10} B={B:<4} {'FAIL':>10}")
+    print(f"{'='*80}")
 
 
 if __name__ == '__main__':

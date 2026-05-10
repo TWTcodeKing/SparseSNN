@@ -326,10 +326,9 @@ def _detect_attention_matmul_patterns(ir: EngineIR, FUSED_THRESHOLD: int):
             neuron = _find_neuron_through_transparent(ir, scale_node.id, max_depth=5)
             if neuron is not None:
                 n_matmulscale += 1  # scale was absorbed
-                # Context-aware: MatMul→Scale→LIF in attention is always
-                # sequential (neuron depends on this matmul) — always fuse.
+                # Apply fused/decomposed decision for the LIF
                 M_per_t = _matmul_M_per_t(node, ir)
-                if _is_sequential_context(ir, nid) or M_per_t >= FUSED_THRESHOLD:
+                if M_per_t >= FUSED_THRESHOLD:
                     node.assigned_kernel = KernelVariant.TileLangFusedMatMulLIF
                     node.neuron_params = neuron.neuron_params
                     neuron.assigned_kernel = KernelVariant.ZeroCost
@@ -351,8 +350,7 @@ def _detect_attention_matmul_patterns(ir: EngineIR, FUSED_THRESHOLD: int):
         neuron = _find_neuron_through_transparent(ir, nid, max_depth=5)
         if neuron is not None:
             M_per_t = _matmul_M_per_t(node, ir)
-            # Context-aware: always fuse sequential MatMul→LIF
-            if _is_sequential_context(ir, nid) or M_per_t >= FUSED_THRESHOLD:
+            if M_per_t >= FUSED_THRESHOLD:
                 node.assigned_kernel = KernelVariant.TileLangFusedMatMulLIF
                 node.neuron_params = neuron.neuron_params
                 node.bound_type = BoundType.COMPUTE
@@ -1142,24 +1140,16 @@ _ZERO_OPS = {OpType.Flatten, OpType.Reshape, OpType.Transpose, OpType.Identity,
 
 
 def _is_sequential_context(ir: EngineIR, conv_nid: int) -> bool:
-    """Return True if this Conv is in a sequential chain with no parallel siblings.
+    """True if Conv is in a sequential chain (no parallel compute siblings).
 
-    A Conv is in a sequential context if its data-producing predecessors do NOT
-    fan out to multiple compute-bound consumers. Sequential chains (backbone
-    Conv→IF→Conv→IF) should always fuse because there is no parallel work
-    available to overlap with standalone neuron kernels.
-
-    Multi-branch contexts (e.g., Q/K/V parallel projections sharing the same
-    input) can benefit from decomposition: BA-MTTS interleaves the separate
-    compute and memory ops for hardware overlap.
+    Sequential chains should fuse Conv+IF (no overlap opportunity exists).
+    Multi-branch (Q/K/V) can stay decomposed for BA-MTTS interleaving.
     """
     for pred_nid in ir.predecessors(conv_nid):
         pred = ir.nodes.get(pred_nid)
         if pred is None:
             continue
-        # Walk through transparent ops to find the real data producer
         if pred.op_type in _ZERO_OPS:
-            # Check the transparent node's predecessors recursively (1 level)
             for gpred_nid in ir.predecessors(pred_nid):
                 succs = ir.successors(gpred_nid)
                 compute_succs = sum(1 for s in succs
@@ -1176,24 +1166,49 @@ def _is_sequential_context(ir: EngineIR, conv_nid: int) -> bool:
     return True
 
 
+def _should_use_fused_per_t(cp, ir: EngineIR, batch_size: int,
+                            sm_count: int = 128) -> bool:
+    """Decide whether a Conv+IF pair should use per-timestep fused kernel.
+
+    The per-timestep fused kernel (T=1 per launch) wins when the per-timestep
+    GEMM M dimension saturates SMs. This happens at large batch sizes where
+    B * OH * OW is large enough for efficient tile parallelism.
+
+    Returns True if fused is expected to be faster.
+    """
+    T = ir.T
+    if T <= 1:
+        return True  # no temporal issue, always fuse
+
+    OH = (cp.out_channels  # placeholder, real OH computed from shapes
+          if not hasattr(cp, '_oh') else cp._oh)
+    # Estimate OH from conv params (approximate)
+    # This is set by propagate_shapes on the node's output_shapes
+    return False  # conservative: need output shapes to decide
+
+
 def classify_bound_and_assign_tilelang(ir: EngineIR, batch_size: int = 1):
     """Classify each node as compute/memory/zero-bound and assign TileLang kernels.
 
-    Hybrid strategy:
-    - Small batch (M_per_t < threshold): DECOMPOSED Conv+BN + IF with BA-MTTS
-    - Large batch (M_per_t >= threshold): PER-TIMESTEP FUSED Conv+BN+IF (T=1/launch)
+    Adaptive strategy based on SM saturation:
+    - SM saturated (M_per_t / block_M >= SM_count): INTERLEAVED Conv+BN+IF
+      (per-CTA T-loop, saves DRAM round-trip, each timestep already fills SMs)
+    - SM unsaturated: DECOMPOSED Conv+BN + standalone IF
+      (bigger GEMM with all TB rows for better SM utilization, BA-MTTS interleaves)
 
-    The threshold is when the per-timestep GEMM saturates GPU SMs (~50K elements
-    for RTX 4090 with 128 SMs).
+    Memory-bound fusions (Add+LIF, Pool+LIF) are always beneficial
+    regardless of saturation — they reduce kernel launches with no GEMM penalty.
     """
-    # SM saturation threshold: per-timestep M must produce enough GEMM tiles
-    # to fill all SMs. With block_M=64, need M/64 >= SM_count → M >= SM*64
     try:
         import torch
         sm_count = torch.cuda.get_device_properties(0).multi_processor_count
     except Exception:
         sm_count = 128
-    FUSED_THRESHOLD = sm_count * 384  # ~49K on RTX 4090 (128*384)
+    # Saturation criterion: per-timestep GEMM tiles >= SM_count / wave_factor.
+    # Empirically: interleaved wins when M_per_t >= ~2000 (B=16 at 14x14 = 3136
+    # was 7.7% faster). Conservative factor: SM_count * 16 (~2048 on 4090).
+    BLOCK_M_REF = 16  # conservative: ~2 tiles per SM is enough for saturation
+    FUSED_THRESHOLD = sm_count * BLOCK_M_REF  # ~2048 on RTX 4090, ~1728 on A100
 
     n_compute = n_memory = n_zero = 0
     n_fused = n_decomposed = 0
@@ -1225,30 +1240,9 @@ def classify_bound_and_assign_tilelang(ir: EngineIR, batch_size: int = 1):
             cp = node.conv_params
             K_red = cp.kernel_h * cp.kernel_w * cp.in_channels
             if cp.groups > 1 and cp.groups == cp.in_channels:
-                # Depthwise conv: use TileLang DW kernel
-                M_per_t = 0
-                if node.output_shapes and len(node.output_shapes[0]) == 4:
-                    TB_out, C_out, OH_out, OW_out = node.output_shapes[0]
-                    B_out = TB_out // ir.T if ir.T > 0 else TB_out
-                    M_per_t = B_out * OH_out * OW_out
-                neuron_nid = conv_to_neuron.get(nid)
-                # Context-aware: DWConv in backbone is sequential, always fuse
-                if neuron_nid is None:
-                    dw_fused = False
-                elif _is_sequential_context(ir, nid):
-                    dw_fused = True
-                else:
-                    dw_fused = M_per_t >= FUSED_THRESHOLD
-                if dw_fused:
-                    node.assigned_kernel = KernelVariant.TileLangFusedDWConvBNIF
-                    node.bound_type = BoundType.COMPUTE
-                    n_fused += 1
-                    if neuron_nid in ir.nodes:
-                        ir.nodes[neuron_nid].assigned_kernel = KernelVariant.ZeroCost
-                        ir.nodes[neuron_nid].bound_type = BoundType.ZERO
-                else:
-                    node.assigned_kernel = KernelVariant.TileLangDWConvBN
-                    n_decomposed += 1
+                # Depthwise conv: baseline decomposed (graph slicer decides fusion)
+                node.assigned_kernel = KernelVariant.TileLangDWConvBN
+                n_decomposed += 1
             elif cp.groups > 1 and cp.groups != cp.in_channels:
                 # Grouped conv (not depthwise): use TileLang grouped kernel
                 node.assigned_kernel = KernelVariant.TileLangGroupedConvBN
@@ -1264,60 +1258,13 @@ def classify_bound_and_assign_tilelang(ir: EngineIR, batch_size: int = 1):
                     B_out = TB_out // ir.T if ir.T > 0 else TB_out
                     M_per_t = B_out * OH_out * OW_out
 
-                neuron_nid = conv_to_neuron.get(nid)
-                # Context-aware fusion: sequential chains always fuse (no
-                # overlap opportunity for standalone neuron); multi-branch
-                # (Q/K/V) uses threshold (BA-MTTS can interleave C↔M).
-                if neuron_nid is None:
-                    use_fused = False
-                elif _is_sequential_context(ir, nid):
-                    use_fused = True
+                # Assign baseline decomposed kernel — the graph slicer
+                # decides fusion (interleaved vs decomposed) as a later pass.
+                if cp.kernel_h == 1 and cp.kernel_w == 1:
+                    node.assigned_kernel = KernelVariant.TileLangConv1x1BN
                 else:
-                    use_fused = M_per_t >= FUSED_THRESHOLD
-
-                if use_fused:
-                    # Per-timestep fused: Conv+BN+IF in one kernel (T=1/launch)
-                    # Both Conv and neuron are handled by the fused kernel
-                    #
-                    # Check if neuron feeds into a residual Add that can be
-                    # absorbed into the epilogue (avoids extra DRAM round-trip)
-                    has_residual = False
-                    if neuron_nid is not None and neuron_nid in ir.nodes:
-                        neuron_succs = ir.successors(neuron_nid)
-                        if len(neuron_succs) == 1:
-                            add_cand = ir.nodes.get(neuron_succs[0])
-                            if (add_cand is not None and
-                                    add_cand.op_type == OpType.Add and
-                                    add_cand.assigned_kernel != KernelVariant.ZeroCost):
-                                has_residual = True
-                                add_cand.assigned_kernel = KernelVariant.ZeroCost
-                                add_cand.bound_type = BoundType.ZERO
-                                node.extra_attrs["has_residual_add"] = True
-                                node.extra_attrs["residual_add_nid"] = add_cand.id
-
-                    if has_residual:
-                        if cp.kernel_h == 1 and cp.kernel_w == 1:
-                            node.assigned_kernel = KernelVariant.TileLangFusedConv1x1BNIFAdd
-                        else:
-                            node.assigned_kernel = KernelVariant.TileLangFusedConvBNIFAdd
-                    else:
-                        if cp.kernel_h == 1 and cp.kernel_w == 1:
-                            node.assigned_kernel = KernelVariant.TileLangFusedConv1x1BNIF
-                        else:
-                            node.assigned_kernel = KernelVariant.TileLangFusedConvBNIF
-                    node.bound_type = BoundType.COMPUTE  # fused = single compute op
-                    n_fused += 1
-                    # Mark the neuron as handled (zero-cost passthrough)
-                    if neuron_nid is not None and neuron_nid in ir.nodes:
-                        ir.nodes[neuron_nid].assigned_kernel = KernelVariant.ZeroCost
-                        ir.nodes[neuron_nid].bound_type = BoundType.ZERO
-                else:
-                    # Decomposed: separate Conv+BN and IF for BA-MTTS
-                    if cp.kernel_h == 1 and cp.kernel_w == 1:
-                        node.assigned_kernel = KernelVariant.TileLangConv1x1BN
-                    else:
-                        node.assigned_kernel = KernelVariant.TileLangConvBN
-                    n_decomposed += 1
+                    node.assigned_kernel = KernelVariant.TileLangConvBN
+                n_decomposed += 1
             node.layout = TensorLayout.NHWC
 
         elif node.op_type == OpType.IF:
@@ -1357,6 +1304,13 @@ def classify_bound_and_assign_tilelang(ir: EngineIR, batch_size: int = 1):
         elif node.op_type == OpType.Tile:
             node.assigned_kernel = KernelVariant.TileRepeat
 
+    # NOTE: Add→LIF and Pool→LIF fusion removed. The graph slicer
+    # (sengine/graph_slicer.py) is the single source of truth for all
+    # fusion decisions. It absorbs memory-bound ops into compute-bound
+    # anchors based on graph structure analysis.
+    n_add_lif_fused = 0
+    n_pool_lif_fused = 0
+
     # Attention pattern detection: absorb Scale into first MatMul,
     # apply fused/decomposed for second MatMul + LIF
     n_attn_scale, n_attn_fused, n_attn_dec = _detect_attention_matmul_patterns(
@@ -1364,6 +1318,8 @@ def classify_bound_and_assign_tilelang(ir: EngineIR, batch_size: int = 1):
 
     logger.phase("BOUND", "Classified %d compute, %d memory, %d zero-cost nodes "
                  "(hybrid: %d fused, %d decomposed, threshold M_per_t=%d; "
+                 "add+lif fused: %d; "
                  "attn: %d matmul+scale, %d fused matmul+lif, %d decomposed)",
                  n_compute, n_memory, n_zero, n_fused, n_decomposed, FUSED_THRESHOLD,
+                 n_add_lif_fused,
                  n_attn_scale, n_attn_fused, n_attn_dec)

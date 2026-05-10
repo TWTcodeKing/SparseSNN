@@ -105,11 +105,16 @@ def save_sengine(path: str, ir: EngineIR, schedule: list[int],
         # Gemm params
         if node.gemm_params:
             nd["gemm_params"] = node.gemm_params
-        # BN params
+        # BN params: store as named weight blobs (not inline JSON)
+        # to keep the header small for C++ parsing.
         if node.bn_scale is not None:
-            nd["bn_scale"] = node.bn_scale
+            bn_s_name = f"__bn_scale_{nid}"
+            ir.weights[bn_s_name] = np.array(node.bn_scale, dtype=np.float32)
+            nd["bn_scale_name"] = bn_s_name
         if node.bn_bias is not None:
-            nd["bn_bias"] = node.bn_bias
+            bn_b_name = f"__bn_bias_{nid}"
+            ir.weights[bn_b_name] = np.array(node.bn_bias, dtype=np.float32)
+            nd["bn_bias_name"] = bn_b_name
         # Weight reference
         if node.weight_info:
             nd["weight_name"] = node.weight_info.name
@@ -159,8 +164,40 @@ def save_sengine(path: str, ir: EngineIR, schedule: list[int],
         for name, blob in zip(weight_names, weight_blobs)
     ]
 
+    # ─── Serialize execution plan (if provided) ───
+    # The execution plan is computed by buffer_planner.plan_buffers()
+    # and contains all buffer allocations + kernel-to-buffer bindings.
+    # This is what the C++ executor reads at load time — no Python dispatch needed.
+    if hasattr(ir, '_exec_plan') and ir._exec_plan is not None:
+        plan = ir._exec_plan
+        header["exec_plan"] = {
+            "buffers": [
+                {"buf_id": b.buf_id, "shape": list(b.shape), "dtype": b.dtype,
+                 "layout": b.layout, "category": b.category,
+                 "source_nid": b.source_nid, "weight_key": b.weight_key}
+                for b in plan.buffers
+            ],
+            "nodes": [
+                {"nid": n.nid, "kernel_type": n.kernel_type, "so_key": n.so_key,
+                 "input_bufs": n.input_bufs, "output_buf": n.output_buf,
+                 "weight_buf": n.weight_buf, "scale_buf": n.scale_buf,
+                 "bias_buf": n.bias_buf, "membrane_buf": n.membrane_buf,
+                 "residual_buf": n.residual_buf, "params": n.params}
+                for n in plan.nodes
+            ],
+        }
+
     # ─── Write file ───
-    header_bytes = json.dumps(header, separators=(',', ':')).encode('utf-8')
+    # Replace Infinity/NaN before serialization (not valid JSON)
+    def _sanitize(obj):
+        if isinstance(obj, float):
+            if obj != obj: return 0.0  # NaN
+            if obj == float('inf'): return 1e30
+            if obj == float('-inf'): return -1e30
+        if isinstance(obj, dict): return {k: _sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, list): return [_sanitize(v) for v in obj]
+        return obj
+    header_bytes = json.dumps(_sanitize(header), separators=(',', ':')).encode('utf-8')
     header_len = len(header_bytes)
 
     with open(path, 'wb') as f:
@@ -174,8 +211,10 @@ def save_sengine(path: str, ir: EngineIR, schedule: list[int],
             f.write(blob)
 
     total_bytes = 12 + header_len + sum(len(b) for b in weight_blobs)
-    logger.phase("SAVE", "Saved .sengine: %d nodes, %d weights, %.1f MB → %s",
-                 len(nodes_json), len(weight_names), total_bytes / 1e6, path)
+    has_plan = hasattr(ir, '_exec_plan') and ir._exec_plan is not None
+    logger.phase("SAVE", "Saved .sengine: %d nodes, %d weights, %.1f MB, exec_plan=%s → %s",
+                 len(nodes_json), len(weight_names), total_bytes / 1e6,
+                 "yes" if has_plan else "no", path)
 
 
 def load_sengine(path: str) -> tuple[EngineIR, list[int], int, int]:
@@ -331,7 +370,31 @@ def load_sengine(path: str) -> tuple[EngineIR, list[int], int, int]:
     T = header["T"]
     batch_size = header["batch_size"]
 
-    logger.phase("LOAD", "Loaded .sengine: %d nodes, %d edges, %d weights from %s",
-                 len(ir.nodes), len(ir.edges), len(ir.weights), path)
+    # Deserialize execution plan (if present)
+    exec_plan = None
+    if "exec_plan" in header:
+        from sengine.build.buffer_planner import BufferDesc, NodeExecPlan, ExecutionPlan
+        ep = header["exec_plan"]
+        buffers = [BufferDesc(buf_id=b["buf_id"], shape=tuple(b["shape"]),
+                              dtype=b["dtype"], layout=b["layout"],
+                              category=b["category"], source_nid=b["source_nid"],
+                              weight_key=b.get("weight_key"))
+                   for b in ep["buffers"]]
+        nodes = [NodeExecPlan(nid=n["nid"], kernel_type=n["kernel_type"],
+                              so_key=n.get("so_key"),
+                              input_bufs=n["input_bufs"], output_buf=n["output_buf"],
+                              weight_buf=n["weight_buf"], scale_buf=n["scale_buf"],
+                              bias_buf=n["bias_buf"], membrane_buf=n["membrane_buf"],
+                              residual_buf=n.get("residual_buf", -1),
+                              params=n.get("params", {}))
+                 for n in ep["nodes"]]
+        exec_plan = ExecutionPlan(buffers=buffers, nodes=nodes,
+                                  schedule=schedule, T=T, batch_size=batch_size)
+        ir._exec_plan = exec_plan
+
+    has_plan = exec_plan is not None
+    logger.phase("LOAD", "Loaded .sengine: %d nodes, %d edges, %d weights, exec_plan=%s from %s",
+                 len(ir.nodes), len(ir.edges), len(ir.weights),
+                 "yes" if has_plan else "no", path)
 
     return ir, schedule, T, batch_size

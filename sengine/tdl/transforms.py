@@ -749,6 +749,150 @@ class TDLTransform:
 
 
 # ---------------------------------------------------------------------------
+# Pre-processing: wrap bare Conv+BN for TDL compatibility
+# ---------------------------------------------------------------------------
+
+def _wrap_bare_convs_for_tdl(model: nn.Module, T: int, verbose: bool = False):
+    """Patch DVS model blocks that do manual 5D→4D reshaping.
+
+    DVS model variants (MaxFormerDVS, etc.) don't use SeqToANNContainer.
+    Their blocks manually reshape: x.flatten(0,1) → Conv → reshape(T,B,...).
+
+    For ONNX export with TDL, the model's forward() must accept 4D input
+    (T already absorbed into batch). This function patches the model's
+    top-level forward to:
+      1. NOT do x.unsqueeze(0).repeat(T,...) (the 5D expansion)
+      2. Pass 4D (T*B, C, H, W) input directly
+
+    The blocks' manual flatten(0,1) becomes a no-op on already-4D input
+    (flatten(0,1) on 4D (TB,C,H,W) is still (TB,C,H,W)).
+    The reshape(T,B,...) after Conv still works if T and B are tracked.
+
+    The key issue: reshape(T, B, C, H, W) with hardcoded T fails on 4D.
+    We patch blocks to use reshape(-1, B, C, H, W) which infers T.
+    """
+    import types
+
+    n_patched = 0
+
+    # Patch the model's top-level forward to skip 5D expansion
+    orig_forward = model.forward
+
+    def _patched_forward(self, x):
+        # Skip the 5D expansion: input is already (B, C, H, W) from ONNX
+        # We need to tile it T times: (B,C,H,W) → (T*B,C,H,W)
+        if len(x.shape) == 4:
+            x = x.repeat(self.T, 1, 1, 1)  # (T*B, C, H, W)
+        return self.forward_features(x)
+
+    # Only patch if the model has the 5D-expansion pattern in forward
+    import inspect
+    try:
+        src = inspect.getsource(model.forward)
+    except (TypeError, OSError):
+        return
+
+    if '.repeat(self.T,' not in src and 'unsqueeze(0)' not in src:
+        return
+
+    # This model expands 4D input to 5D in forward. We need to patch
+    # forward to accept 4D (T already absorbed by TDL-1).
+
+    # Case 1: Model has forward_features (MaxFormer-DVS style)
+    # Case 2: Model passes directly to self.features (VGG style)
+    # General approach: patch forward to tile input T times as 4D,
+    # and handle temporal mean at the end.
+
+    # Patch blocks that do manual T,B,C,H,W = x.shape reshaping
+    for name, module in model.named_modules():
+        try:
+            msrc = inspect.getsource(module.forward)
+        except (TypeError, OSError):
+            continue
+
+        if 'T, B, C, H, W = x.shape' not in msrc:
+            continue
+
+        orig_fwd = module.forward
+
+        def _make_patched_block_fwd(orig, t_val):
+            def _patched(x):
+                if len(x.shape) == 4:
+                    TB, C, H, W = x.shape
+                    B = TB // t_val
+                    x = x.reshape(t_val, B, C, H, W)
+                result = orig(x)
+                if len(result.shape) == 5:
+                    T2, B2 = result.shape[0], result.shape[1]
+                    result = result.reshape(T2 * B2, *result.shape[2:])
+                return result
+            return _patched
+
+        module.forward = _make_patched_block_fwd(orig_fwd, T)
+        n_patched += 1
+
+    # Patch the top-level forward to accept 4D input
+    orig_forward = model.forward
+
+    if hasattr(model, 'forward_features'):
+        # MaxFormer-DVS style: forward → forward_features → stages
+        orig_ff = model.forward_features
+
+        def _new_forward_features(x):
+            x = model.patch_embed1(x)
+            for blk in model.stage1:
+                x = blk(x)
+            x = model.patch_embed2(x)
+            for blk in model.stage2:
+                x = blk(x)
+            if len(x.shape) == 4:
+                x = x.mean(dim=[2, 3])
+            elif len(x.shape) == 5:
+                x = x.flatten(3).mean(3)
+            return x
+
+        model.forward_features = _new_forward_features
+
+        def _new_forward(x):
+            if len(x.shape) == 4:
+                x = x.repeat(T, 1, 1, 1)
+            x = model.forward_features(x)
+            x = model.head_lif(x)
+            if hasattr(model, 'head'):
+                x = model.head(x)
+            TB_val = x.shape[0]; B_val = TB_val // T
+            x = x.reshape(T, B_val, *x.shape[1:]).mean(0)
+            return x
+
+        model.forward = _new_forward
+
+    elif hasattr(model, 'features') and hasattr(model, 'classifier'):
+        # VGG style: forward → features → temporal_mean → pool → classifier
+        def _new_forward(x):
+            if len(x.shape) == 4:
+                x = x.repeat(T, 1, 1, 1)  # (B,C,H,W) → (T*B,C,H,W)
+            # features: SeqToANNContainer handles T-merged batch via TDL-1
+            x = model.features(x)
+            # Temporal mean: (T*B, C, H, W) → (B, C, H, W)
+            if len(x.shape) == 5:
+                x = x.mean(dim=0)
+            else:
+                TB_val = x.shape[0]; B_val = TB_val // T
+                x = x.reshape(T, B_val, *x.shape[1:]).mean(0)
+            import torch.nn.functional as F
+            x = F.adaptive_avg_pool2d(x, 1)
+            x = x.flatten(1)
+            x = model.classifier(x)
+            return x
+
+        model.forward = _new_forward
+        n_patched += 1  # count top-level forward as patched
+
+    if n_patched > 0 and verbose:
+        print(f"  Patched {n_patched} blocks/forward for 4D TDL-compatible export")
+
+
+# ---------------------------------------------------------------------------
 # High-level export API
 # ---------------------------------------------------------------------------
 
@@ -795,6 +939,9 @@ def export_with_fused_neurons(
         print(f"  Found {' + '.join(parts)} neurons")
 
     if flatten_temporal:
+        # Pre-process: wrap bare Conv+BN in SeqToANNContainer for models
+        # that do manual T*B reshaping (DVS variants).
+        _wrap_bare_convs_for_tdl(model, T, verbose=verbose)
         if verbose:
             print(f"  Applying TDL-1/2/3 batched mode (T={T})")
         tdl.apply()

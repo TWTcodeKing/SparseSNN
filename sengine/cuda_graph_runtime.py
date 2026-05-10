@@ -59,7 +59,8 @@ class CUDAGraphEngine:
         self._ext_if = None
 
     def build(self, ir: EngineIR, kernels: dict[int, object],
-              schedule: list[int], T: int, batch_size: int):
+              schedule: list[int], T: int, batch_size: int,
+              precision: str = "fp16"):
         """Initialize the engine from build artifacts.
 
         Args:
@@ -68,6 +69,7 @@ class CUDAGraphEngine:
             schedule: BA-MTTS execution order (list of node IDs)
             T: temporal steps
             batch_size: batch size
+            precision: Global precision — 'fp16' or 'fp32'
         """
         self.ir = ir
         self.kernels = kernels
@@ -75,6 +77,9 @@ class CUDAGraphEngine:
         self.T = T
         self.B = batch_size
         self.TB = T * batch_size
+        self.precision = precision
+        self.io_torch_dtype = torch.float32 if precision == "fp32" else torch.float16
+        self.io_np_dtype = np.float32 if precision == "fp32" else np.float16
 
         self._allocate_weights()
         self._allocate_membranes()
@@ -128,9 +133,9 @@ class CUDAGraphEngine:
             logger.phase("ENGINE", "CUDA Graph not available, using raw dispatch (%d nodes)", len(self.schedule))
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        """Run inference. Input shape: (B, C, H, W) NCHW FP16 or FP32."""
-        if x.dtype != torch.float16:
-            x = x.half()
+        """Run inference. Input shape: (B, C, H, W) NCHW."""
+        if x.dtype != self.io_torch_dtype:
+            x = x.to(self.io_torch_dtype)
 
         # Convert NCHW → NHWC, replicate T times
         if x.ndim == 4:
@@ -193,7 +198,8 @@ class CUDAGraphEngine:
     # ─── Internal ───
 
     def _allocate_weights(self):
-        """Convert ONNX weights to NHWC FP16 tensors on GPU."""
+        """Convert ONNX weights to NHWC tensors on GPU (precision-aware)."""
+        w_dtype = self.io_np_dtype
         for nid in self.ir.topo_order:
             node = self.ir.nodes[nid]
             if node.weight_info is None or node.weight_info.name not in self.ir.weights:
@@ -205,24 +211,24 @@ class CUDAGraphEngine:
             if node.op_type == OpType.Conv2d and cp:
                 if cp.groups > 1 and cp.groups == cp.in_channels:
                     # Depthwise Conv: (C, 1, K, K) → (C, K, K)
-                    w = w_np.reshape(cp.out_channels, cp.kernel_h, cp.kernel_w).astype(np.float16)
+                    w = w_np.reshape(cp.out_channels, cp.kernel_h, cp.kernel_w).astype(w_dtype)
                     self.weights[nid] = torch.from_numpy(w.copy()).cuda()
                 elif cp.kernel_h == 1 and cp.kernel_w == 1 and cp.groups == 1:
                     # Standard 1x1 Conv: (C_out, C_in, 1, 1) → (C_in, C_out)
-                    w = torch.from_numpy(w_np.astype(np.float16)).cuda()
+                    w = torch.from_numpy(w_np.astype(w_dtype)).cuda()
                     self.weights_1x1[nid] = w.reshape(cp.out_channels, cp.in_channels).t().contiguous()
                 else:
                     # General Conv: (C_out, C_in/groups, K, K) → (K, K, C_in/groups, C_out)
-                    w_nhwc = w_np.transpose(2, 3, 1, 0).astype(np.float16)
+                    w_nhwc = w_np.transpose(2, 3, 1, 0).astype(w_dtype)
                     self.weights[nid] = torch.from_numpy(w_nhwc.copy()).cuda()
 
             elif node.op_type == OpType.Gemm:
                 # FC: (out, in) — keep as-is for cuBLAS
-                self.weights[nid] = torch.from_numpy(w_np.astype(np.float16)).cuda()
+                self.weights[nid] = torch.from_numpy(w_np.astype(w_dtype)).cuda()
 
             elif node.op_type == OpType.Linear:
                 # Linear weight: (K, N) for matmul — keep as-is
-                self.weights[nid] = torch.from_numpy(w_np.astype(np.float16)).cuda()
+                self.weights[nid] = torch.from_numpy(w_np.astype(w_dtype)).cuda()
 
             # BN scale/bias
             if node.bn_scale is not None:
@@ -303,7 +309,7 @@ class CUDAGraphEngine:
         if scale is not None and bias is not None:
             result = result * scale.view(1, -1, 1, 1) + bias.view(1, -1, 1, 1)
 
-        return result.half()
+        return result.to(self.io_torch_dtype)
 
     def _allocate_membranes(self):
         """Allocate FP32 membrane state tensors for neuron and fused attention nodes."""
@@ -405,7 +411,7 @@ class CUDAGraphEngine:
                 if len(shape) == 4 and node.op_type in _NHWC_OPS:
                     N, C, H, W = shape
                     self.activations[nid] = torch.zeros(N, H, W, C,
-                                                        dtype=torch.float16, device='cuda')
+                                                        dtype=self.io_torch_dtype, device='cuda')
                 elif (len(shape) == 4
                       and node.assigned_kernel == KernelVariant.LayoutTranspose):
                     # LayoutTranspose: allocate buffer in the TARGET layout.
@@ -419,10 +425,10 @@ class CUDAGraphEngine:
                         # NHWC→NCHW: output is physically (N, C, H, W)
                         N, C, H, W = shape
                         self.activations[nid] = torch.zeros(N, C, H, W,
-                                                            dtype=torch.float16, device='cuda')
+                                                            dtype=self.io_torch_dtype, device='cuda')
                     else:
                         self.activations[nid] = torch.zeros(*shape,
-                                                            dtype=torch.float16, device='cuda')
+                                                            dtype=self.io_torch_dtype, device='cuda')
                 elif node.op_type in _GEMM_OPS:
                     # Flatten to 2D for GEMM kernel: total_elements = M * N_out
                     total = 1
@@ -431,7 +437,7 @@ class CUDAGraphEngine:
                     N_out = shape[-1] if len(shape) >= 1 else 1
                     M = total // N_out if N_out > 0 else total
                     self.activations[nid] = torch.zeros(M, N_out,
-                                                        dtype=torch.float16, device='cuda')
+                                                        dtype=self.io_torch_dtype, device='cuda')
                 elif len(shape) >= 1:
                     self.activations[nid] = torch.zeros(*shape,
                                                         dtype=torch.float16, device='cuda')
@@ -451,7 +457,7 @@ class CUDAGraphEngine:
                     if len(shape) == 4:
                         N, C, H, W = shape
                         self.activations[nid] = torch.zeros(N, H, W, C,
-                                                            dtype=torch.float16, device='cuda')
+                                                            dtype=self.io_torch_dtype, device='cuda')
                     break
 
         # Neuron buffers: derive shape from predecessor
@@ -523,10 +529,7 @@ class CUDAGraphEngine:
             KernelVariant.TileLangGroupedConvBN,
             KernelVariant.TileLangFusedConvBNIF,
             KernelVariant.TileLangFusedConv1x1BNIF,
-            KernelVariant.TileLangFusedConvBNIFAdd,
-            KernelVariant.TileLangFusedConv1x1BNIFAdd,
             KernelVariant.TileLangFusedDWConvBNIF,
-            KernelVariant.TileLangFusedDWConvBNIFAdd,
             KernelVariant.CuDNNConv, KernelVariant.CuDNNPool,
         }
         inputs = []
@@ -577,19 +580,14 @@ class CUDAGraphEngine:
                     self.activations[nid] = result
 
         elif kv in (KernelVariant.TileLangFusedConvBNIF,
-                    KernelVariant.TileLangFusedConv1x1BNIF,
-                    KernelVariant.TileLangFusedConvBNIFAdd,
-                    KernelVariant.TileLangFusedConv1x1BNIFAdd):
-            # Per-timestep fused Conv+BN+IF (±Add): call T times, once per timestep
+                    KernelVariant.TileLangFusedConv1x1BNIF):
+            # Per-timestep fused Conv+BN+IF: call T times, once per timestep
             kern = self.kernels.get(nid)
             w = self.weights.get(nid)
-            if kv in (KernelVariant.TileLangFusedConv1x1BNIF,
-                      KernelVariant.TileLangFusedConv1x1BNIFAdd):
+            if kv == KernelVariant.TileLangFusedConv1x1BNIF:
                 w = self.weights_1x1.get(nid)
             sc = self.bn_scales.get(nid)
             bi = self.bn_biases.get(nid)
-            has_residual = kv in (KernelVariant.TileLangFusedConvBNIFAdd,
-                                  KernelVariant.TileLangFusedConv1x1BNIFAdd)
             # Find successor neuron's membrane
             succs = self.ir.successors(nid)
             mem = None
@@ -605,39 +603,14 @@ class CUDAGraphEngine:
                         TB_out, C_out, OH_out, OW_out = node.output_shapes[0]
                         B_out = TB_out // self.T
                         mem_4d = mem.reshape(B_out, OH_out, OW_out, C_out)
-                        # Get residual tensor if this is a *Add variant
-                        residual_buf = None
-                        if has_residual:
-                            add_nid = node.extra_attrs.get("residual_add_nid")
-                            if add_nid is not None:
-                                # Find the Add's other input (the skip connection)
-                                add_node = self.ir.nodes.get(add_nid)
-                                if add_node:
-                                    for in_name in add_node.input_names:
-                                        # The residual is the input NOT produced by this conv's neuron
-                                        for pred_nid in self.ir.predecessors(add_nid):
-                                            if pred_nid != nid and pred_nid in self.activations:
-                                                residual_buf = self.activations[pred_nid]
-                                                break
-                                        if residual_buf is not None:
-                                            break
                         # Call T times — each processes one timestep
                         spk_frames = []
                         for t in range(self.T):
                             frame = x[t*B_out:(t+1)*B_out]
-                            if has_residual and residual_buf is not None:
-                                res_frame = residual_buf[t*B_out:(t+1)*B_out]
-                                spk_t = kern(frame, w, mem_4d, sc, bi, res_frame)
-                            else:
-                                spk_t = kern(frame, w, mem_4d, sc, bi)
+                            spk_t = kern(frame, w, mem_4d, sc, bi)
                             spk_frames.append(spk_t)
                         result = torch.cat(spk_frames, dim=0)  # (TB, OH, OW, C)
                         self.activations[nid] = result
-                        # If *Add variant, also store result under the Add node
-                        if has_residual:
-                            add_nid = node.extra_attrs.get("residual_add_nid")
-                            if add_nid is not None:
-                                self.activations[add_nid] = result
                     else:
                         # No membrane — just run as Conv+BN
                         result = kern(x, w, sc, bi)
@@ -702,7 +675,7 @@ class CUDAGraphEngine:
                 if sc is not None and bi is not None:
                     conv_out = conv_out * sc.view(1, -1, 1, 1) + bi.view(1, -1, 1, 1)
                 # Output NHWC (contract says NHWC)
-                result = conv_out.half().permute(0, 2, 3, 1).contiguous()
+                result = conv_out.to(self.io_torch_dtype).permute(0, 2, 3, 1).contiguous()
                 self.activations[nid] = result
 
         elif kv in (KernelVariant.CUDAVec4IF, KernelVariant.CUDAVec4LIF):
@@ -752,7 +725,7 @@ class CUDAGraphEngine:
                                 w = self.ir.weights.get(in_name)
                                 if w is not None:
                                     import numpy as np
-                                    wt = torch.from_numpy(w.copy()).half().cuda() if isinstance(w, np.ndarray) else w.half().cuda()
+                                    wt = torch.from_numpy(w.copy()).to(self.io_torch_dtype).cuda() if isinstance(w, np.ndarray) else w.to(self.io_torch_dtype).cuda()
                                     if perm and len(perm) == wt.ndim:
                                         wt = wt.permute(*perm).contiguous()
                                     inputs.append(wt)
@@ -881,9 +854,9 @@ class CUDAGraphEngine:
                         if w is not None:
                             import numpy as np
                             if isinstance(w, np.ndarray):
-                                wt = torch.from_numpy(w.copy()).half().cuda()
+                                wt = torch.from_numpy(w.copy()).to(self.io_torch_dtype).cuda()
                             elif isinstance(w, torch.Tensor):
-                                wt = w.half().cuda()
+                                wt = w.to(self.io_torch_dtype).cuda()
                             else:
                                 continue
                             inputs = [wt]
@@ -1125,6 +1098,6 @@ class CUDAGraphEngine:
         if w is None:
             return 1.0
         if isinstance(w, torch.Tensor):
-            return w.half().cuda()
+            return w.to(self.io_torch_dtype).cuda()
         import numpy as np
-        return torch.from_numpy(np.array(w)).half().cuda()
+        return torch.from_numpy(np.array(w)).to(self.io_torch_dtype).cuda()

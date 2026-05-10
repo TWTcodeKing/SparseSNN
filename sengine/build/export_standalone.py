@@ -138,8 +138,12 @@ def export_all_kernels(kernels: dict, ir, build_dir: str,
         KernelVariant.TileLangDWConvBN,
         KernelVariant.TileLangFusedDWConvBNIF,
         KernelVariant.TileLangGroupedConvBN,
+        KernelVariant.TileLangMatMul,
         KernelVariant.TileLangMatMulScale,
         KernelVariant.TileLangFusedMatMulLIF,
+        # Custom dispatch variants (different arg patterns, still need .so export)
+        KernelVariant.TileLangFusedAddLIF,
+        KernelVariant.TileLangFusedPoolLIF,
     }
 
     fused_attn_variants = {

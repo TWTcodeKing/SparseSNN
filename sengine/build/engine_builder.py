@@ -41,13 +41,18 @@ class EngineBuilder:
         self._schedule: Optional[list[int]] = None
         self._engine: Optional[CUDAGraphEngine] = None
 
-    def build(self, autotune: bool = False, capture_graph: bool = True) -> CUDAGraphEngine:
+    def build(self, autotune: bool = False, capture_graph: bool = True,
+              fusion: str = "none", fusion_rec: str = None,
+              precision: str = "fp16") -> CUDAGraphEngine:
         """Full build pipeline.
 
         Args:
             autotune: If True, run autotuning sweep for tile configs.
                       If False, use heuristic defaults (fast, ~5% slower).
             capture_graph: If True, capture CUDA Graph after building.
+            fusion: Fusion strategy — 'none' or 'slicer'.
+            fusion_rec: Path to fusion recommendation JSON from validator pre-pass.
+            precision: Global precision — 'fp16' or 'fp32'.
 
         Returns:
             Ready-to-execute CUDAGraphEngine.
@@ -58,18 +63,25 @@ class EngineBuilder:
         logger.phase("BUILD", "Parsing ONNX: %s", self.onnx_path)
         parser = ONNXParser(self.onnx_path)
         self._ir = parser.parse()
+        self._ir.precision = precision
         logger.phase("BUILD", "Parsed: %d nodes, T=%d", len(self._ir.nodes), self._ir.T)
 
-        # 2. Optimize IR (BN fold + fusion + sparsity + shapes + bound classification)
+        # 2. Optimize IR (structural: BN fold, DCE, shapes, bound classification)
         logger.phase("BUILD", "Optimizing IR (TileLang mode)")
         optimize_ir(self._ir, tilelang=True, batch_size=self.batch_size)
 
-        # 3. Compile TileLang kernels
+        # 3. Apply fusion strategy (decoupled from optimizer)
+        from sengine.fusion_strategy import apply_fusion
+        apply_fusion(self._ir, strategy=fusion, batch_size=self.batch_size,
+                     fusion_rec=fusion_rec)
+
+        # 4. Compile TileLang kernels on the final IR
         logger.phase("BUILD", "Compiling TileLang kernels (TB=%d)", self.T * self.batch_size)
         tuning_cache = TuningCache() if autotune else None
         compiler = TileLangCompiler(
             self._ir, T=self.T, batch_size=self.batch_size,
             autotune=autotune, tuning_cache=tuning_cache,
+            precision=precision,
         )
         kernels = compiler.compile_all()
 
@@ -88,7 +100,8 @@ class EngineBuilder:
         logger.phase("BUILD", "Building CUDA Graph engine")
         self._engine = CUDAGraphEngine()
         self._engine.build(self._ir, kernels, self._schedule,
-                          T=self.T, batch_size=self.batch_size)
+                          T=self.T, batch_size=self.batch_size,
+                          precision=precision)
 
         # 7. Capture CUDA Graph
         if capture_graph:

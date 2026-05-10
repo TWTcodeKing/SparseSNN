@@ -28,6 +28,7 @@ from sengine.runtime.cpp_executor import CppExecutor
 from sengine.logger import logger
 
 
+# Variants dispatched through the generic TileLang .so path (weight+BN or matmul)
 TILELANG_VARIANTS = frozenset({
     KernelVariant.TileLangConvBN,
     KernelVariant.TileLangConv1x1BN,
@@ -39,8 +40,14 @@ TILELANG_VARIANTS = frozenset({
     KernelVariant.TileLangDWConvBN,
     KernelVariant.TileLangFusedDWConvBNIF,
     KernelVariant.TileLangGroupedConvBN,
+    KernelVariant.TileLangMatMul,
     KernelVariant.TileLangMatMulScale,
     KernelVariant.TileLangFusedMatMulLIF,
+})
+# Variants with custom dispatch (different arg patterns) but still need .so export
+TILELANG_CUSTOM_VARIANTS = frozenset({
+    KernelVariant.TileLangFusedAddLIF,
+    KernelVariant.TileLangFusedPoolLIF,
 })
 
 
@@ -83,7 +90,9 @@ class SEngine:
 
     @staticmethod
     def build(onnx_path: str, T: int = 4, batch_size: int = 1,
-              autotune: bool = False, build_dir: str | None = None) -> SEngine:
+              autotune: bool = False, build_dir: str | None = None,
+              fusion: str = "none", fusion_rec: str = None,
+              precision: str = "fp16") -> SEngine:
         """Build an engine from an ONNX file.
 
         Args:
@@ -92,6 +101,9 @@ class SEngine:
             batch_size: Inference batch size.
             autotune: Run autotuning sweep for tile configs.
             build_dir: Directory for compiled .so files (default: /tmp/sengine_B{batch}).
+            fusion: Fusion strategy — 'none' or 'slicer'.
+            fusion_rec: Path to fusion recommendation JSON from validator pre-pass.
+            precision: Global precision — 'fp16' or 'fp32'.
 
         Returns:
             Ready-to-run SEngine instance.
@@ -99,15 +111,18 @@ class SEngine:
         eng = SEngine()
         eng.T = T
         eng.batch_size = batch_size
+        eng._precision = precision
 
         t0 = time.time()
         arch = _detect_arch()
         nvcc = _detect_nvcc()
-        logger.phase("BUILD", "Target: %s, T=%d, B=%d", arch, T, batch_size)
+        logger.phase("BUILD", "Target: %s, T=%d, B=%d, fusion=%s", arch, T, batch_size, fusion)
 
         # 1. Build Python engine (parse → optimize → compile → schedule)
         builder = EngineBuilder(onnx_path, T=T, batch_size=batch_size)
-        eng._py_engine = builder.build(autotune=autotune, capture_graph=False)
+        eng._py_engine = builder.build(autotune=autotune, capture_graph=False,
+                                       fusion=fusion, fusion_rec=fusion_rec,
+                                       precision=precision)
         eng._ir = builder._ir
         eng._schedule = builder._schedule
         eng._kernels = eng._py_engine.kernels
@@ -119,22 +134,33 @@ class SEngine:
         eng._kernel_so_map = export_all_kernels(
             eng._kernels, eng._ir, build_dir, nvcc=nvcc, arch=arch)
 
-        # 3. Wire up C++ executor (if all attention kernels are compiled)
+        # 3. Compute execution plan (buffer bindings resolved at build time)
+        from sengine.build.buffer_planner import plan_buffers
+        eng._exec_plan = plan_buffers(eng._ir, eng._schedule, T, batch_size,
+                                       kernel_so_map=eng._kernel_so_map,
+                                       precision=precision)
+        eng._ir._exec_plan = eng._exec_plan  # attach for serialization
+
+        # 3b. Inject buffer aliases for absorbed (ZeroCost) nodes.
+        # The CUDAGraphEngine doesn't allocate buffers for ZeroCost nodes,
+        # but the plan executor needs them for downstream pointer resolution.
+        for nid, node in eng._ir.nodes.items():
+            absorbed = node.extra_attrs.get("absorbed_nids", [])
+            if not absorbed:
+                continue
+            anchor_buf = eng._py_engine.activations.get(nid)
+            if anchor_buf is None:
+                continue
+            for ab_nid in absorbed:
+                if ab_nid not in eng._py_engine.activations:
+                    eng._py_engine.activations[ab_nid] = anchor_buf
+
+        # 4. Wire up C++ executor (if all attention kernels are compiled)
         has_uncompiled_attn = any(
             eng._kernel_so_map.get(nid) is None
             for nid in eng._schedule
             if eng._ir.nodes.get(nid) and eng._ir.nodes[nid].op_type == OpType.FusedAttention
         )
-        # DSSA multi-head has a known C++ dispatch bug — fall back to Python
-        has_dssa_multihead = any(
-            eng._ir.nodes[nid].attention_params.variant == 'dssa'
-            and eng._ir.nodes[nid].attention_params.num_heads > 1
-            for nid in eng._schedule
-            if eng._ir.nodes.get(nid) and eng._ir.nodes[nid].op_type == OpType.FusedAttention
-            and eng._ir.nodes[nid].attention_params
-        )
-        if has_dssa_multihead:
-            has_uncompiled_attn = True
         if eng._py_engine._lazy_mode:
             logger.phase("BUILD", "Lazy mode: using Python runtime (OOM during pre-allocation)")
             eng._graph_captured = True
@@ -144,7 +170,14 @@ class SEngine:
             eng._graph_captured = True
             eng._use_python_runtime = True
         else:
-            eng._setup_cpp_executor()
+            # Plan-driven C++ executor setup (replaces _setup_cpp_executor)
+            from sengine.runtime.plan_executor import setup_executor_from_plan
+            # Wrap attention handler to match plan_executor's expected signature
+            def _attn_handler(exe, nid, nid_tl_idx, buf_ptrs, plan):
+                eng._setup_attn_node(exe, nid, nid_tl_idx, buf_ptrs, plan)
+            eng._cpp_exec = setup_executor_from_plan(
+                eng._exec_plan, eng._py_engine, eng._kernel_so_map, eng._ir,
+                attn_setup_fn=_attn_handler)
             eng._cpp_exec.capture_graph()
             eng._cpp_exec.sync()
             torch.cuda.synchronize()
@@ -257,13 +290,14 @@ class SEngine:
         else:
             x_nhwc = np.ascontiguousarray(x)
 
-        x_fp16 = x_nhwc.astype(np.float16)
+        io_np_dtype = np.float32 if getattr(self, '_precision', 'fp16') == 'fp32' else np.float16
+        x_typed = x_nhwc.astype(io_np_dtype)
 
         # Copy to graph input buffer via cudaMemcpy
         cuda_rt = ct.CDLL('libcudart.so')
-        src_ptr = x_fp16.ctypes.data_as(ct.c_void_p)
+        src_ptr = x_typed.ctypes.data_as(ct.c_void_p)
         dst_ptr = ct.c_void_p(graph_input.data_ptr())
-        nbytes = x_fp16.nbytes
+        nbytes = x_typed.nbytes
         cuda_rt.cudaMemcpy(dst_ptr, src_ptr, ct.c_size_t(nbytes), ct.c_int(1))  # H2D
 
         # Reset membranes + replay graph (all on C++ stream)
@@ -277,7 +311,7 @@ class SEngine:
         if out_buf is None:
             return np.zeros(1)
 
-        out_np = np.empty(out_buf.shape, dtype=np.float16)
+        out_np = np.empty(out_buf.shape, dtype=io_np_dtype)
         cuda_rt.cudaMemcpy(
             out_np.ctypes.data_as(ct.c_void_p),
             ct.c_void_p(out_buf.data_ptr()),
@@ -310,6 +344,117 @@ class SEngine:
 
     def __del__(self):
         self.destroy()
+
+    def _setup_attn_node(self, exe, nid, nid_tl_idx, buf_ptrs, plan):
+        """Setup a fused attention node in the C++ executor.
+
+        Extracted from the old _setup_cpp_executor for reuse by plan_executor.
+        """
+        node = self._ir.nodes.get(nid)
+        if node is None:
+            exe.set_skip_node(nid); return
+        ap = node.attention_params
+        so_paths = self._kernel_so_map.get(nid)
+        if ap is None or so_paths is None or not isinstance(so_paths, tuple) or len(so_paths) < 2:
+            exe.set_skip_node(nid); return
+
+        gemm1_idx = exe.load_tilelang(so_paths[0])
+        gemm2_idx = exe.load_tilelang(so_paths[1])
+
+        variant_map = {"spikformer": 0, "maxformer": 1, "dssa": 2, "token_qk": 3}
+        variant = variant_map.get(ap.variant, 0)
+        C = ap.num_heads * ap.head_dim
+        heads = ap.num_heads
+        hd = ap.head_dim
+
+        act = self._py_engine.activations
+        preds = self._ir.predecessors(nid)
+        pred_bufs = [act.get(pid) for pid in preds if act.get(pid) is not None]
+        output_buf = act.get(nid)
+
+        if variant == 2 and len(pred_bufs) >= 2:
+            if pred_bufs[0].shape[-1] == 2 * C:
+                q_buf, k_buf = pred_bufs[0], pred_bufs[1]
+            else:
+                q_buf, k_buf = pred_bufs[1], pred_bufs[0]
+            v_buf = None
+        else:
+            q_buf = pred_bufs[0] if len(pred_bufs) > 0 else None
+            k_buf = pred_bufs[1] if len(pred_bufs) > 1 else None
+            v_buf = pred_bufs[2] if len(pred_bufs) > 2 else None
+
+        if q_buf is None or output_buf is None:
+            exe.set_skip_node(nid); return
+
+        p = lambda t: t.data_ptr()
+        mem = self._py_engine.membranes.get(nid)
+        TB = q_buf.shape[0]
+        N = ap.H * ap.W if ap.H > 0 else (q_buf.numel() // (TB * C))
+        batch = TB * heads
+
+        if variant == 0:
+            perm_size = TB * N * C
+            gemm1_size = batch * N * N
+            needs_permute = 0
+            ws_perm_q, ws_perm_k, ws_perm_v = 0, perm_size, perm_size * 2
+            ws_gemm1 = perm_size * 3
+            ws_total = perm_size * 3 + gemm1_size
+        elif variant == 1:
+            gemm1_size = batch * hd * hd
+            needs_permute = 0
+            ws_perm_q = ws_perm_k = ws_perm_v = ws_gemm1 = 0
+            ws_total = gemm1_size
+        elif variant == 2:
+            spatial_q = N
+            spatial_kv = q_buf.numel() // (TB * 2 * C) if (TB * 2 * C) > 0 else 0
+            if spatial_kv <= 0:
+                exe.set_skip_node(nid); return
+            gemm1_size = batch * spatial_kv * spatial_q
+            needs_permute = 0
+            ws_perm_q = spatial_kv
+            ws_perm_k = ws_perm_v = ws_gemm1 = 0
+            ws_total = gemm1_size
+        else:
+            exe.set_skip_node(nid); return
+
+        if ws_total <= 0:
+            exe.set_skip_node(nid); return
+
+        workspace = torch.empty(ws_total, dtype=torch.float16, device='cuda')
+        self._attn_workspaces = getattr(self, '_attn_workspaces', [])
+        self._attn_workspaces.append(workspace)
+
+        lif_total = q_buf.numel()
+        lif_spatial = mem.numel() if mem is not None else 0
+        recip_tau = 1.0 / ap.attn_lif_tau if ap.attn_lif_tau > 0 else 0.5
+
+        s1_ptr = s2_ptr = 0
+        if variant == 2:
+            import numpy as np
+            for sname, attr in [(node.extra_attrs.get("scale1_name"), '_dssa_s1'),
+                                (node.extra_attrs.get("scale2_name"), '_dssa_s2')]:
+                if sname:
+                    sw = self._ir.weights.get(sname)
+                    if sw is not None:
+                        _scale_dtype = torch.float32 if getattr(self, '_precision', 'fp16') == 'fp32' else torch.float16
+                        st = torch.from_numpy(sw.copy()).to(_scale_dtype).cuda() if isinstance(sw, np.ndarray) else sw.to(_scale_dtype).cuda()
+                        setattr(self, f'{attr}_{nid}', st)
+                        if attr == '_dssa_s1': s1_ptr = st.data_ptr()
+                        else: s2_ptr = st.data_ptr()
+            lif_total = gemm1_size
+            lif_spatial = gemm1_size // 4
+
+        exe.set_fused_attn_node(
+            nid, variant, gemm1_idx, gemm2_idx,
+            p(q_buf), p(k_buf) if k_buf is not None else 0,
+            p(v_buf) if v_buf is not None else 0,
+            p(output_buf),
+            p(workspace), p(mem) if mem is not None else 0,
+            TB, heads, hd, N, ap.H, ap.W,
+            lif_total, lif_spatial,
+            ap.attn_lif_v_threshold, recip_tau,
+            needs_permute, s1_ptr, s2_ptr,
+            ws_gemm1, ws_perm_q, ws_perm_k, ws_perm_v)
 
     # ─── Internals ───
 
@@ -458,6 +603,39 @@ class SEngine:
                 else:
                     exe.set_if_node(nid, p(input_buf), p(output_buf), p(mem),
                                     total, spatial, v_thresh)
+
+            elif kv == KernelVariant.TileLangFusedAddLIF:
+                # Fused Add+LIF: single TileLang kernel (input_a, input_b, membrane, dummy, output)
+                if len(preds) >= 2 and nid in nid_tl_idx:
+                    tl_idx = nid_tl_idx[nid]
+                    a = self._resolve_buf(act, ir, preds[0])
+                    b = self._resolve_buf(act, ir, preds[1])
+                    lif_nid = node.extra_attrs.get("fused_lif_nid")
+                    mem = engine.membranes.get(lif_nid) if lif_nid else None
+                    if a is not None and b is not None and mem is not None and output_buf is not None:
+                        dummy = torch.zeros(1, dtype=torch.float32, device='cuda')
+                        exe.set_tilelang_5(nid, tl_idx,
+                                           p(a), p(b), p(mem), p(dummy), p(output_buf))
+                    else:
+                        exe.set_skip_node(nid)
+                else:
+                    exe.set_skip_node(nid)
+
+            elif kv == KernelVariant.TileLangFusedPoolLIF:
+                # Fused MaxPool+LIF: (input, membrane, dummy1, dummy2, output)
+                if nid in nid_tl_idx and input_buf is not None and output_buf is not None:
+                    tl_idx = nid_tl_idx[nid]
+                    lif_nid = node.extra_attrs.get("fused_lif_nid")
+                    mem = engine.membranes.get(lif_nid) if lif_nid else None
+                    if mem is not None:
+                        dummy1 = torch.zeros(1, dtype=torch.float32, device='cuda')
+                        dummy2 = torch.zeros(1, dtype=torch.float32, device='cuda')
+                        exe.set_tilelang_5(nid, tl_idx,
+                                           p(input_buf), p(mem), p(dummy1), p(dummy2), p(output_buf))
+                    else:
+                        exe.set_skip_node(nid)
+                else:
+                    exe.set_skip_node(nid)
 
             elif kv == KernelVariant.Elementwise:
                 if node.op_type == OpType.Add and len(preds) >= 2:
@@ -638,7 +816,8 @@ class SEngine:
                 if ws_total <= 0:
                     exe.set_skip_node(nid)
                     continue
-                workspace = torch.empty(ws_total, dtype=torch.float16, device='cuda')
+                _ws_dtype = torch.float32 if getattr(self, '_precision', 'fp16') == 'fp32' else torch.float16
+                workspace = torch.empty(ws_total, dtype=_ws_dtype, device='cuda')
                 self._attn_workspaces = getattr(self, '_attn_workspaces', [])
                 self._attn_workspaces.append(workspace)
 
@@ -656,7 +835,8 @@ class SEngine:
                         if sname:
                             sw = ir.weights.get(sname)
                             if sw is not None:
-                                st = torch.from_numpy(sw.copy()).half().cuda() if isinstance(sw, np.ndarray) else sw.half().cuda()
+                                _scale_dtype = torch.float32 if getattr(self, '_precision', 'fp16') == 'fp32' else torch.float16
+                                st = torch.from_numpy(sw.copy()).to(_scale_dtype).cuda() if isinstance(sw, np.ndarray) else sw.to(_scale_dtype).cuda()
                                 setattr(self, f'{attr}_{nid}', st)  # prevent GC
                                 if attr == '_dssa_s1':
                                     s1_ptr = st.data_ptr()
@@ -681,7 +861,13 @@ class SEngine:
                     needs_permute, s1_ptr, s2_ptr,
                     ws_gemm1, ws_perm_q, ws_perm_k, ws_perm_v)
 
+            elif kv == KernelVariant.TileRepeat:
+                # Input T-replication (B → TB): handled by input setup, skip in graph
+                exe.set_skip_node(nid)
+
             else:
+                logger.warning("  C++ executor: unhandled variant %s for node %d, skipping",
+                               kv.name, nid)
                 exe.set_skip_node(nid)
 
         self._cpp_exec = exe
@@ -696,13 +882,14 @@ def build(onnx_path: str, T: int = 4, batch_size: int = 1, **kwargs) -> SEngine:
         onnx_path: Path to plugin-mode ONNX file.
         T: Number of temporal steps.
         batch_size: Inference batch size.
+        fusion: Fusion strategy — 'none' (ablation) or 'slicer' (graph slicer).
+        autotune: Run autotuning sweep for tile configs.
 
     Returns:
         Ready-to-run SEngine instance.
 
     Example:
-        engine = sengine.build("model.onnx", T=4, batch_size=1)
-        engine.save("model.sengine")
+        engine = sengine.build("model.onnx", T=4, batch_size=1, fusion='slicer')
     """
     return SEngine.build(onnx_path, T=T, batch_size=batch_size, **kwargs)
 

@@ -21,6 +21,7 @@ import tilelang.language as T
 def grouped_conv_bn_kernel(
     TB, C_in, H, W, C_out, K, S, D, P, groups,
     block_M, block_N, block_K, num_stages, threads,
+    io_dtype=T.float16,
 ):
     """Grouped Conv2d + BN.
 
@@ -49,21 +50,21 @@ def grouped_conv_bn_kernel(
 
     @T.prim_func
     def main(
-        data:     T.Tensor((TB, H, W, C_in), T.float16),
-        weight:   T.Tensor((KH, KW, C_in_per_g, C_out), T.float16),
+        data:     T.Tensor((TB, H, W, C_in), io_dtype),
+        weight:   T.Tensor((KH, KW, C_in_per_g, C_out), io_dtype),
         bn_scale: T.Tensor((C_out,), T.float32),
         bn_bias:  T.Tensor((C_out,), T.float32),
-        output:   T.Tensor((TB, OH, OW, C_out), T.float16),
+        output:   T.Tensor((TB, OH, OW, C_out), io_dtype),
     ):
-        output_flat = T.Tensor((M, C_out), T.float16, output.data)
+        output_flat = T.Tensor((M, C_out), io_dtype, output.data)
 
         # Grid: (ceil(C_out_per_g / block_N), ceil(M / block_M), groups)
         with T.Kernel(
             T.ceildiv(C_out_per_g, block_N), T.ceildiv(M, block_M), groups,
             threads=threads,
         ) as (bx, by, g):
-            data_shared   = T.alloc_shared((block_M, block_K), T.float16)
-            weight_shared = T.alloc_shared((block_K, block_N), T.float16)
+            data_shared   = T.alloc_shared((block_M, block_K), io_dtype)
+            weight_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc           = T.alloc_fragment((block_M, block_N), T.float32)
             T.clear(acc)
 
@@ -93,7 +94,7 @@ def grouped_conv_bn_kernel(
                     ib = ((ah >= 0) and (aw >= 0) and (ah < H)
                           and (aw < W) and (m < M) and (k < K_red))
                     data_shared[i, j] = T.if_then_else(
-                        ib, data[n_idx, ah, aw, cin_global], T.float16(0))
+                        ib, data[n_idx, ah, aw, cin_global], io_dtype(0))
 
                 # Weight tile: (K_red, C_out_per_g) — need to index into
                 # weight[kh, kw, cin_local, co_offset + bx*block_N + ...]
@@ -108,19 +109,19 @@ def grouped_conv_bn_kernel(
                     ib = (k < K_red) and (co < C_out_per_g)
                     weight_shared[i, j] = T.if_then_else(
                         ib, weight[kh_val, kw_val, cin_local, co_global],
-                        T.float16(0))
+                        io_dtype(0))
 
                 T.gemm(data_shared, weight_shared, acc)
 
             # BN epilogue — write to correct output channel offset
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
                 co = bx * block_N + j
                 co_global = co_offset + co
                 if m < M and co < C_out_per_g:
                     val = acc[i, j] * bn_scale[co_global] + bn_bias[co_global]
-                    out_shared[i, j] = T.cast(val, T.float16)
+                    out_shared[i, j] = T.cast(val, io_dtype)
             # Write to the correct output channel slice
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i

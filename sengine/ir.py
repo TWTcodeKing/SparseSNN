@@ -77,15 +77,14 @@ class KernelVariant(Enum):
     # Per-timestep fused Conv+BN+IF (T=1 per launch, correct, for large batch)
     TileLangFusedConvBNIF = auto() # Fused Conv+BN+IF epilogue (T_steps=1)
     TileLangFusedConv1x1BNIF = auto()  # Fused 1×1 Conv+BN+IF (T_steps=1)
-    # Conv+BN+IF+ResidualAdd (skip connection absorbed into epilogue)
-    TileLangFusedConvBNIFAdd = auto()      # Fused Conv+BN+IF+Add (3×3)
-    TileLangFusedConv1x1BNIFAdd = auto()   # Fused 1×1 Conv+BN+IF+Add
-    TileLangFusedDWConvBNIFAdd = auto()    # Fused DW Conv+BN+IF+Add
     # Depthwise conv kernels (for MaxFormer, QKFormer)
     TileLangDWConvBN = auto()          # DW Conv+BN (groups=C_in)
     TileLangFusedDWConvBNIF = auto()   # Fused DW Conv+BN+IF (T_steps=1)
     # Grouped Conv kernel (for SpikingResFormer GWFFN)
     TileLangGroupedConvBN = auto()     # Grouped Conv+BN (groups > 1, groups != C_in)
+    # Fused memory-bound op + LIF (single kernel, per-CTA T-loop)
+    TileLangFusedAddLIF = auto()       # Add(a,b)+LIF → single launch
+    TileLangFusedPoolLIF = auto()      # MaxPool+LIF → single launch
     # Attention matmul kernels (for SpikFormer/MaxFormer attention)
     TileLangMatMulScale = auto()       # MatMul + scale epilogue, COMPUTE-bound
     TileLangFusedMatMulLIF = auto()    # Fused MatMul + LIF epilogue (T=1/launch)
@@ -140,9 +139,6 @@ KERNEL_CONTRACTS: dict = {
     KernelVariant.TileLangStemConvBN:         KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
     KernelVariant.TileLangFusedConvBNIF:      KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
     KernelVariant.TileLangFusedConv1x1BNIF:   KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
-    KernelVariant.TileLangFusedConvBNIFAdd:   KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
-    KernelVariant.TileLangFusedConv1x1BNIFAdd: KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
-    KernelVariant.TileLangFusedDWConvBNIFAdd: KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
     KernelVariant.TileLangDWConvBN:           KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
     KernelVariant.TileLangFusedDWConvBNIF:    KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
     KernelVariant.TileLangGroupedConvBN:     KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
@@ -345,6 +341,7 @@ class EngineIR:
         self.edges: list[Edge] = []
         self.fusion_groups: list[FusionGroup] = []
         self.T: int = 4
+        self.precision: str = "fp16"   # "fp16" or "fp32", global engine precision
         self.model_input_shape: tuple = ()
         self.model_output_shape: tuple = ()
 

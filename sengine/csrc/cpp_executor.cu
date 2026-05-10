@@ -138,6 +138,150 @@ __global__ void temporal_mean_kernel(
     output[s] = __float2half(sum / (float)T);
 }
 
+// ─── FP32 variants of native kernels (for precision="fp32" mode) ───
+
+__global__ void if_neuron_fp32_kernel(
+    const float* __restrict__ input, float* __restrict__ membrane,
+    float* __restrict__ spikes, int total_elems, int spatial_elems, float v_threshold
+) {
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= spatial_elems) return;
+    int T = total_elems / spatial_elems;
+    float v = membrane[s];
+    for (int t = 0; t < T; t++) {
+        int g = t * spatial_elems + s;
+        float h = v + input[g];
+        float spike = (h >= v_threshold) ? 1.0f : 0.0f;
+        v = (1.0f - spike) * h;
+        spikes[g] = spike;
+    }
+    membrane[s] = v;
+}
+
+__global__ void lif_neuron_fp32_kernel(
+    const float* __restrict__ input, float* __restrict__ membrane,
+    float* __restrict__ spikes, int total_elems, int spatial_elems,
+    float v_threshold, float recip_tau
+) {
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= spatial_elems) return;
+    int T = total_elems / spatial_elems;
+    float decay = 1.0f - recip_tau;
+    float v = membrane[s];
+    for (int t = 0; t < T; t++) {
+        int g = t * spatial_elems + s;
+        float h = decay * v + recip_tau * input[g];
+        float spike = (h >= v_threshold) ? 1.0f : 0.0f;
+        v = (1.0f - spike) * h;
+        spikes[g] = spike;
+    }
+    membrane[s] = v;
+}
+
+__global__ void add_fp32_kernel(const float* a, const float* b, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i] + b[i];
+}
+
+__global__ void maxpool2d_fp32_kernel(
+    const float* __restrict__ input, float* __restrict__ output,
+    int N, int H, int W, int C, int OH, int OW,
+    int kernel_size, int stride, int padding
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * OH * OW * C;
+    if (idx >= total) return;
+    int c = idx % C;
+    int rem = idx / C;
+    int ow = rem % OW;
+    rem = rem / OW;
+    int oh = rem % OH;
+    int n = rem / OH;
+    float max_val = -FLT_MAX;
+    for (int kh = 0; kh < kernel_size; kh++) {
+        int ih = oh * stride - padding + kh;
+        if (ih < 0 || ih >= H) continue;
+        for (int kw = 0; kw < kernel_size; kw++) {
+            int iw = ow * stride - padding + kw;
+            if (iw < 0 || iw >= W) continue;
+            float v = input[((n * H + ih) * W + iw) * C + c];
+            if (v > max_val) max_val = v;
+        }
+    }
+    output[idx] = max_val;
+}
+
+__global__ void global_avgpool_fp32_kernel(
+    const float* __restrict__ input, float* __restrict__ output,
+    int N, int H, int W, int C
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C;
+    if (idx >= total) return;
+    int c = idx % C;
+    int n = idx / C;
+    float sum = 0.0f;
+    int hw = H * W;
+    for (int i = 0; i < hw; i++) {
+        sum += input[(n * hw + i) * C + c];
+    }
+    output[idx] = sum / (float)hw;
+}
+
+__global__ void temporal_mean_fp32_kernel(
+    const float* __restrict__ input, float* __restrict__ output,
+    int T, int spatial_elems
+) {
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= spatial_elems) return;
+    float sum = 0.0f;
+    for (int t = 0; t < T; t++) {
+        sum += input[t * spatial_elems + s];
+    }
+    output[s] = sum / (float)T;
+}
+
+__global__ void layout_transpose_fp32_kernel(
+    const float* __restrict__ input, float* __restrict__ output,
+    int N, int D1, int D2, int D3, int direction
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * D1 * D2 * D3;
+    if (idx >= total) return;
+    int d3 = idx % D3;
+    int rem = idx / D3;
+    int d2 = rem % D2;
+    rem = rem / D2;
+    int d1 = rem % D1;
+    int n = rem / D1;
+    if (direction == 0) {
+        // (N, D1, D2, D3) → (N, D2, D3, D1)  [NCHW→NHWC: D1=C, D2=H, D3=W]
+        output[((n * D2 + d2) * D3 + d3) * D1 + d1] = input[idx];
+    } else {
+        // (N, D1, D2, D3) → (N, D3, D1, D2)  [NHWC→NCHW: D1=H, D2=W, D3=C]
+        output[((n * D3 + d3) * D1 + d1) * D2 + d2] = input[idx];
+    }
+}
+
+__global__ void scale_tensor_broadcast_fp32_kernel(
+    float* data, const float* scale, int total, int heads, int inner
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    int h = (i / inner) % heads;
+    data[i] = data[i] * scale[h];
+}
+
+__global__ void scale_nhwc_broadcast_fp32_kernel(
+    float* data, const float* scale, int total, int C, int hd
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    int col = i % C;
+    int h = col / hd;
+    data[i] = data[i] * scale[h];
+}
+
 // FP16 GEMM: output = input @ weight^T  (row-major)
 // input: (M, K), weight: (N, K), output: (M, N)
 __global__ void gemm_fp16_kernel(
@@ -404,6 +548,7 @@ struct SEngineExecutor {
     cudaGraphExec_t exec;
     int captured;
     cublasHandle_t cublas;
+    int is_fp32;  // global precision flag: 0=fp16, 1=fp32
 };
 
 // ─── C API (exposed via ctypes) ───
@@ -417,6 +562,10 @@ SEngineExecutor* sengine_create() {
     cublasSetStream(e->cublas, e->stream);
     cublasSetMathMode(e->cublas, CUBLAS_TENSOR_OP_MATH);
     return e;
+}
+
+void sengine_set_fp32(SEngineExecutor* e, int fp32) {
+    e->is_fp32 = fp32;
 }
 
 void sengine_destroy(SEngineExecutor* e) {
@@ -729,62 +878,102 @@ void sengine_execute(SEngineExecutor* e) {
         }
         case KT_IF: {
             int thr = 256, blk = (nd.spatial_elems + thr - 1) / thr;
-            if_neuron_kernel<<<blk, thr, 0, s>>>(
-                nd.input_ptr, nd.membrane_ptr, nd.output_ptr,
-                nd.total_elems, nd.spatial_elems, nd.v_threshold);
+            if (e->is_fp32)
+                if_neuron_fp32_kernel<<<blk, thr, 0, s>>>(
+                    (float*)nd.input_ptr, nd.membrane_ptr, (float*)nd.output_ptr,
+                    nd.total_elems, nd.spatial_elems, nd.v_threshold);
+            else
+                if_neuron_kernel<<<blk, thr, 0, s>>>(
+                    nd.input_ptr, nd.membrane_ptr, nd.output_ptr,
+                    nd.total_elems, nd.spatial_elems, nd.v_threshold);
             break;
         }
         case KT_LIF: {
             int thr = 256, blk = (nd.spatial_elems + thr - 1) / thr;
-            lif_neuron_kernel<<<blk, thr, 0, s>>>(
-                nd.input_ptr, nd.membrane_ptr, nd.output_ptr,
-                nd.total_elems, nd.spatial_elems, nd.v_threshold, nd.recip_tau);
+            if (e->is_fp32)
+                lif_neuron_fp32_kernel<<<blk, thr, 0, s>>>(
+                    (float*)nd.input_ptr, nd.membrane_ptr, (float*)nd.output_ptr,
+                    nd.total_elems, nd.spatial_elems, nd.v_threshold, nd.recip_tau);
+            else
+                lif_neuron_kernel<<<blk, thr, 0, s>>>(
+                    nd.input_ptr, nd.membrane_ptr, nd.output_ptr,
+                    nd.total_elems, nd.spatial_elems, nd.v_threshold, nd.recip_tau);
             break;
         }
         case KT_ADD: {
             int thr = 256, blk = (nd.add_n + thr - 1) / thr;
-            add_fp16_kernel<<<blk, thr, 0, s>>>(
-                nd.add_a_ptr, nd.add_b_ptr, nd.add_out_ptr, nd.add_n);
+            if (e->is_fp32)
+                add_fp32_kernel<<<blk, thr, 0, s>>>(
+                    (float*)nd.add_a_ptr, (float*)nd.add_b_ptr, (float*)nd.add_out_ptr, nd.add_n);
+            else
+                add_fp16_kernel<<<blk, thr, 0, s>>>(
+                    nd.add_a_ptr, nd.add_b_ptr, nd.add_out_ptr, nd.add_n);
             break;
         }
         case KT_MAXPOOL: {
             int total = nd.pool_N * nd.pool_OH * nd.pool_OW * nd.pool_C;
             int thr = 256, blk = (total + thr - 1) / thr;
-            maxpool2d_nhwc_kernel<<<blk, thr, 0, s>>>(
-                nd.pool_in, nd.pool_out,
-                nd.pool_N, nd.pool_H, nd.pool_W, nd.pool_C,
-                nd.pool_OH, nd.pool_OW,
-                nd.pool_ks, nd.pool_stride, nd.pool_pad);
+            if (e->is_fp32)
+                maxpool2d_fp32_kernel<<<blk, thr, 0, s>>>(
+                    (float*)nd.pool_in, (float*)nd.pool_out,
+                    nd.pool_N, nd.pool_H, nd.pool_W, nd.pool_C,
+                    nd.pool_OH, nd.pool_OW,
+                    nd.pool_ks, nd.pool_stride, nd.pool_pad);
+            else
+                maxpool2d_nhwc_kernel<<<blk, thr, 0, s>>>(
+                    nd.pool_in, nd.pool_out,
+                    nd.pool_N, nd.pool_H, nd.pool_W, nd.pool_C,
+                    nd.pool_OH, nd.pool_OW,
+                    nd.pool_ks, nd.pool_stride, nd.pool_pad);
             break;
         }
         case KT_GLOBAL_AVGPOOL: {
             int total = nd.gavg_N * nd.gavg_C;
             int thr = 256, blk = (total + thr - 1) / thr;
-            global_avgpool_nhwc_kernel<<<blk, thr, 0, s>>>(
-                nd.gavg_in, nd.gavg_out,
-                nd.gavg_N, nd.gavg_H, nd.gavg_W, nd.gavg_C);
+            if (e->is_fp32)
+                global_avgpool_fp32_kernel<<<blk, thr, 0, s>>>(
+                    (float*)nd.gavg_in, (float*)nd.gavg_out,
+                    nd.gavg_N, nd.gavg_H, nd.gavg_W, nd.gavg_C);
+            else
+                global_avgpool_nhwc_kernel<<<blk, thr, 0, s>>>(
+                    nd.gavg_in, nd.gavg_out,
+                    nd.gavg_N, nd.gavg_H, nd.gavg_W, nd.gavg_C);
             break;
         }
         case KT_TEMPORAL_MEAN: {
             int thr = 256, blk = (nd.tmean_spatial + thr - 1) / thr;
-            temporal_mean_kernel<<<blk, thr, 0, s>>>(
-                nd.tmean_in, nd.tmean_out, nd.tmean_T, nd.tmean_spatial);
+            if (e->is_fp32)
+                temporal_mean_fp32_kernel<<<blk, thr, 0, s>>>(
+                    (float*)nd.tmean_in, (float*)nd.tmean_out, nd.tmean_T, nd.tmean_spatial);
+            else
+                temporal_mean_kernel<<<blk, thr, 0, s>>>(
+                    nd.tmean_in, nd.tmean_out, nd.tmean_T, nd.tmean_spatial);
             break;
         }
         case KT_GEMM: {
-            // Use cuBLAS for FP16 GEMM: C = A @ B^T
-            // cuBLAS is column-major, so we compute: C^T = B @ A^T
-            // which gives us row-major C = A @ B^T
-            const half alpha_h = __float2half(1.0f);
-            const half beta_h = __float2half(0.0f);
-            cublasHgemm(e->cublas,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                nd.gemm_N, nd.gemm_M, nd.gemm_K,
-                &alpha_h,
-                nd.gemm_w, nd.gemm_K,  // B^T: (N, K) stored row-major
-                nd.gemm_in, nd.gemm_K, // A: (M, K) stored row-major
-                &beta_h,
-                nd.gemm_out, nd.gemm_N);
+            // cuBLAS GEMM: C = A @ B^T (row-major via column-major trick)
+            if (e->is_fp32) {
+                const float alpha_f = 1.0f, beta_f = 0.0f;
+                cublasSgemm(e->cublas,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    nd.gemm_N, nd.gemm_M, nd.gemm_K,
+                    &alpha_f,
+                    (float*)nd.gemm_w, nd.gemm_K,
+                    (float*)nd.gemm_in, nd.gemm_K,
+                    &beta_f,
+                    (float*)nd.gemm_out, nd.gemm_N);
+            } else {
+                const half alpha_h = __float2half(1.0f);
+                const half beta_h = __float2half(0.0f);
+                cublasHgemm(e->cublas,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    nd.gemm_N, nd.gemm_M, nd.gemm_K,
+                    &alpha_h,
+                    nd.gemm_w, nd.gemm_K,
+                    nd.gemm_in, nd.gemm_K,
+                    &beta_h,
+                    nd.gemm_out, nd.gemm_N);
+            }
             break;
         }
         case KT_NAIVE_CONV: {
@@ -800,15 +989,21 @@ void sengine_execute(SEngineExecutor* e) {
         case KT_LAYOUT_TRANSPOSE: {
             int total = nd.lt_N * nd.lt_H * nd.lt_W * nd.lt_C;
             int thr = 256, blk = (total + thr - 1) / thr;
-            layout_transpose_kernel<<<blk, thr, 0, s>>>(
-                nd.lt_in, nd.lt_out, nd.lt_N, nd.lt_H, nd.lt_W, nd.lt_C, nd.lt_direction);
+            if (e->is_fp32)
+                layout_transpose_fp32_kernel<<<blk, thr, 0, s>>>(
+                    (float*)nd.lt_in, (float*)nd.lt_out,
+                    nd.lt_N, nd.lt_H, nd.lt_W, nd.lt_C, nd.lt_direction);
+            else
+                layout_transpose_kernel<<<blk, thr, 0, s>>>(
+                    nd.lt_in, nd.lt_out, nd.lt_N, nd.lt_H, nd.lt_W, nd.lt_C, nd.lt_direction);
             break;
         }
         case KT_ALIAS: {
             // Just memcpy (for reshape/transpose that need contiguous copy)
             if (nd.input_ptr != nd.output_ptr && nd.total_elems > 0) {
+                int elem_size = e->is_fp32 ? sizeof(float) : sizeof(half);
                 cudaMemcpyAsync(nd.output_ptr, nd.input_ptr,
-                    nd.total_elems * sizeof(half), cudaMemcpyDeviceToDevice, s);
+                    nd.total_elems * elem_size, cudaMemcpyDeviceToDevice, s);
             }
             break;
         }
@@ -820,11 +1015,15 @@ void sengine_execute(SEngineExecutor* e) {
             int TB = nd.fa_TB, heads = nd.fa_heads, hd = nd.fa_hd;
             int N = nd.fa_N, H = nd.fa_H, W = nd.fa_W;
             int C = heads * hd;
+            // Workspace pointer arithmetic: offsets are in element counts.
+            // Use byte arithmetic with correct element size for fp16/fp32.
+            int elem_sz = e->is_fp32 ? 4 : 2;
+            char* ws_bytes = (char*)nd.fa_workspace;
             half* ws = nd.fa_workspace;
-            half* pq = ws + nd.fa_ws_perm_q;
-            half* pk = ws + nd.fa_ws_perm_k;
-            half* pv = ws + nd.fa_ws_perm_v;
-            half* gemm1_out = ws + nd.fa_ws_gemm1_out;
+            void* pq = ws_bytes + nd.fa_ws_perm_q * elem_sz;
+            void* pk = ws_bytes + nd.fa_ws_perm_k * elem_sz;
+            void* pv = ws_bytes + nd.fa_ws_perm_v * elem_sz;
+            void* gemm1_out = ws_bytes + nd.fa_ws_gemm1_out * elem_sz;
 
             if (nd.fa_variant == 0) {
                 // ── SpikFormer: TileLang batched GEMM ──
@@ -837,93 +1036,105 @@ void sengine_execute(SEngineExecutor* e) {
                 int thr = 256, blk = (total + thr - 1) / thr;
 
                 // Permute
-                layout_transpose_kernel<<<blk, thr, 0, s>>>(nd.fa_q, pq, TB, N, heads, hd, 0);
-                layout_transpose_kernel<<<blk, thr, 0, s>>>(nd.fa_k, pk, TB, N, heads, hd, 0);
-                layout_transpose_kernel<<<blk, thr, 0, s>>>(nd.fa_v, pv, TB, N, heads, hd, 0);
+                if (e->is_fp32) {
+                    layout_transpose_fp32_kernel<<<blk, thr, 0, s>>>((float*)nd.fa_q, (float*)pq, TB, N, heads, hd, 0);
+                    layout_transpose_fp32_kernel<<<blk, thr, 0, s>>>((float*)nd.fa_k, (float*)pk, TB, N, heads, hd, 0);
+                    layout_transpose_fp32_kernel<<<blk, thr, 0, s>>>((float*)nd.fa_v, (float*)pv, TB, N, heads, hd, 0);
+                } else {
+                    layout_transpose_kernel<<<blk, thr, 0, s>>>(nd.fa_q, (half*)pq, TB, N, heads, hd, 0);
+                    layout_transpose_kernel<<<blk, thr, 0, s>>>(nd.fa_k, (half*)pk, TB, N, heads, hd, 0);
+                    layout_transpose_kernel<<<blk, thr, 0, s>>>(nd.fa_v, (half*)pv, TB, N, heads, hd, 0);
+                }
 
                 // GEMM1: attn_scores(batch*N, N) = Q(batch*N, hd) @ K(batch*N, hd)^T * scale
                 ((CallFn3)tl1.call_fn)(pq, pk, gemm1_out, s);
 
                 // GEMM2: out(batch*N, hd) = attn(batch*N, N) @ V(batch*N, hd)
-                half* g2out = pq;  // reuse Q buffer
+                void* g2out = pq;  // reuse Q buffer
                 ((CallFn3)tl2.call_fn)(gemm1_out, pv, g2out, s);
 
                 // Permute back
-                layout_transpose_kernel<<<blk, thr, 0, s>>>(g2out, nd.fa_out, TB, heads, N, hd, 1);
+                if (e->is_fp32)
+                    layout_transpose_fp32_kernel<<<blk, thr, 0, s>>>((float*)g2out, (float*)nd.fa_out, TB, heads, N, hd, 1);
+                else
+                    layout_transpose_kernel<<<blk, thr, 0, s>>>((half*)g2out, nd.fa_out, TB, heads, N, hd, 1);
 
                 // LIF
                 if (nd.fa_lif_spatial > 0 && nd.fa_lif_spatial < nd.fa_lif_total) {
                     blk = (nd.fa_lif_spatial + thr - 1) / thr;
-                    lif_neuron_kernel<<<blk, thr, 0, s>>>(
-                        nd.fa_out, nd.fa_membrane, nd.fa_out,
-                        nd.fa_lif_total, nd.fa_lif_spatial, nd.fa_v_thresh, nd.fa_recip_tau);
+                    if (e->is_fp32)
+                        lif_neuron_fp32_kernel<<<blk, thr, 0, s>>>(
+                            (float*)nd.fa_out, nd.fa_membrane, (float*)nd.fa_out,
+                            nd.fa_lif_total, nd.fa_lif_spatial, nd.fa_v_thresh, nd.fa_recip_tau);
+                    else
+                        lif_neuron_kernel<<<blk, thr, 0, s>>>(
+                            nd.fa_out, nd.fa_membrane, nd.fa_out,
+                            nd.fa_lif_total, nd.fa_lif_spatial, nd.fa_v_thresh, nd.fa_recip_tau);
                 }
             }
             else if (nd.fa_variant == 1) {
-                // ── MaxFormer: fused NHWC TileLang attention ──
-                // GEMM1 .so: reads K,V from NHWC, writes kv(batch*hd, hd)
-                // GEMM2 .so: reads Q from NHWC + kv, writes NHWC (scaled, no LIF)
-                // LIF: native CUDA kernel (sequential across T timesteps)
-                // ZERO explicit permute/transpose kernel calls.
-
-                // GEMM1: kv = K^T @ V (3-arg: K_nhwc, V_nhwc, kv_out)
+                // ── MaxFormer ──
                 ((CallFn3)tl1.call_fn)(nd.fa_k, nd.fa_v, gemm1_out, s);
-
-                // GEMM2: out = (Q @ kv) * scale → NHWC (3-arg: Q_nhwc, kv, out_nhwc)
                 ((CallFn3)tl2.call_fn)(nd.fa_q, gemm1_out, nd.fa_out, s);
-
-                // LIF: sequential across T (native CUDA, not TileLang)
                 if (nd.fa_lif_spatial > 0 && nd.fa_lif_spatial < nd.fa_lif_total) {
-                    int thr = 256;
-                    int blk = (nd.fa_lif_spatial + thr - 1) / thr;
-                    lif_neuron_kernel<<<blk, thr, 0, s>>>(
-                        nd.fa_out, nd.fa_membrane, nd.fa_out,
-                        nd.fa_lif_total, nd.fa_lif_spatial,
-                        nd.fa_v_thresh, nd.fa_recip_tau);
+                    int thr = 256, blk = (nd.fa_lif_spatial + thr - 1) / thr;
+                    if (e->is_fp32)
+                        lif_neuron_fp32_kernel<<<blk, thr, 0, s>>>(
+                            (float*)nd.fa_out, nd.fa_membrane, (float*)nd.fa_out,
+                            nd.fa_lif_total, nd.fa_lif_spatial, nd.fa_v_thresh, nd.fa_recip_tau);
+                    else
+                        lif_neuron_kernel<<<blk, thr, 0, s>>>(
+                            nd.fa_out, nd.fa_membrane, nd.fa_out,
+                            nd.fa_lif_total, nd.fa_lif_spatial, nd.fa_v_thresh, nd.fa_recip_tau);
                 }
             }
             else if (nd.fa_variant == 2) {
-                // ── DSSA: fused NHWC TileLang attention ──
-                // GEMM1 .so: reads K from y_kv, Q from x_query (both NHWC)
-                // Scale1: element-wise per-head broadcast
-                // LIF: native CUDA (sequential across T)
-                // GEMM2 .so: reads V from y_kv, attn from GEMM1 (writes NHWC)
-                // Scale2: element-wise per-head broadcast
-
-                // GEMM1: attn = K^T @ Q (3-arg: y_kv, x_query, attn_out)
+                // ── DSSA ──
                 ((CallFn3)tl1.call_fn)(nd.fa_q, nd.fa_k, gemm1_out, s);
 
-                // Scale1: attn *= scale1 (per-head broadcast)
+                // Scale1
                 if (nd.fa_scale1_ptr) {
                     int batch = TB * heads;
-                    int spatial_kv = nd.fa_ws_perm_q;   // DSSA spatial_kv stored here
+                    int spatial_kv = nd.fa_ws_perm_q;
                     int spatial_q = nd.fa_N;
                     int total_attn = batch * spatial_kv * spatial_q;
                     int inner = spatial_kv * spatial_q;
                     int thr = 256, blk = (total_attn + thr - 1) / thr;
-                    scale_tensor_broadcast_kernel<<<blk, thr, 0, s>>>(
-                        gemm1_out, nd.fa_scale1_ptr, total_attn, heads, inner);
+                    if (e->is_fp32)
+                        scale_tensor_broadcast_fp32_kernel<<<blk, thr, 0, s>>>(
+                            (float*)gemm1_out, (float*)nd.fa_scale1_ptr, total_attn, heads, inner);
+                    else
+                        scale_tensor_broadcast_kernel<<<blk, thr, 0, s>>>(
+                            (half*)gemm1_out, nd.fa_scale1_ptr, total_attn, heads, inner);
                 }
 
                 // LIF on attention scores
                 if (nd.fa_lif_spatial > 0 && nd.fa_lif_spatial < nd.fa_lif_total) {
                     int thr = 256, blk = (nd.fa_lif_spatial + thr - 1) / thr;
-                    lif_neuron_kernel<<<blk, thr, 0, s>>>(
-                        gemm1_out, nd.fa_membrane, gemm1_out,
-                        nd.fa_lif_total, nd.fa_lif_spatial,
-                        nd.fa_v_thresh, nd.fa_recip_tau);
+                    if (e->is_fp32)
+                        lif_neuron_fp32_kernel<<<blk, thr, 0, s>>>(
+                            (float*)gemm1_out, nd.fa_membrane, (float*)gemm1_out,
+                            nd.fa_lif_total, nd.fa_lif_spatial, nd.fa_v_thresh, nd.fa_recip_tau);
+                    else
+                        lif_neuron_kernel<<<blk, thr, 0, s>>>(
+                            (half*)gemm1_out, nd.fa_membrane, (half*)gemm1_out,
+                            nd.fa_lif_total, nd.fa_lif_spatial, nd.fa_v_thresh, nd.fa_recip_tau);
                 }
 
-                // GEMM2: out = V @ attn (3-arg: y_kv, attn, out_nhwc)
+                // GEMM2
                 ((CallFn3)tl2.call_fn)(nd.fa_q, gemm1_out, nd.fa_out, s);
 
-                // Scale2: out *= scale2 (per-head broadcast on NHWC output)
+                // Scale2
                 if (nd.fa_scale2_ptr) {
                     int spatial_q = nd.fa_N;
                     int total_out = TB * spatial_q * C;
                     int thr = 256, blk = (total_out + thr - 1) / thr;
-                    scale_nhwc_broadcast_kernel<<<blk, thr, 0, s>>>(
-                        nd.fa_out, nd.fa_scale2_ptr, total_out, C, hd);
+                    if (e->is_fp32)
+                        scale_nhwc_broadcast_fp32_kernel<<<blk, thr, 0, s>>>(
+                            (float*)nd.fa_out, (float*)nd.fa_scale2_ptr, total_out, C, hd);
+                    else
+                        scale_nhwc_broadcast_kernel<<<blk, thr, 0, s>>>(
+                            nd.fa_out, nd.fa_scale2_ptr, total_out, C, hd);
                 }
             }
             else if (nd.fa_variant == 3) {
@@ -943,6 +1154,44 @@ void sengine_reset_membranes(SEngineExecutor* e) {
         zero_fp32_kernel<<<blk, thr, 0, e->stream>>>(
             e->membranes[i], e->membrane_sizes[i]);
     }
+}
+
+// Debug: run nodes sequentially, sync + check after EACH node, stop on first error
+void sengine_execute_sequential_debug(SEngineExecutor* e) {
+    cudaStream_t s = e->stream;
+    cudaGetLastError(); // clear
+    for (int i = 0; i < e->schedule_len; i++) {
+        int nid = e->schedule[i];
+        if (nid < 0 || nid > e->max_node_id) continue;
+        auto& nd = e->nodes[nid];
+
+        // Run this ONE node using the regular dispatch
+        int orig_len = e->schedule_len;
+        int* orig_sched = e->schedule;
+        int single = nid;
+        e->schedule = &single;
+        e->schedule_len = 1;
+        sengine_execute(e);
+        e->schedule = orig_sched;
+        e->schedule_len = orig_len;
+
+        cudaError_t err = cudaStreamSynchronize(s);
+        cudaError_t err2 = cudaGetLastError();
+        if (err != cudaSuccess || err2 != cudaSuccess) {
+            const char* msg = (err != cudaSuccess) ? cudaGetErrorString(err) : cudaGetErrorString(err2);
+            fprintf(stderr, "FIRST FAILURE at schedule[%d]: node %d (type %d, tl_idx=%d, n_args=%d): %s\n",
+                    i, nid, nd.type, nd.tilelang_idx, nd.tl_n_args, msg);
+            // Print pointer info
+            if (nd.tl_args) {
+                fprintf(stderr, "  args: ");
+                for (int a = 0; a < nd.tl_n_args && a < 8; a++)
+                    fprintf(stderr, "[%d]=%p ", a, nd.tl_args[a]);
+                fprintf(stderr, "\n");
+            }
+            return;
+        }
+    }
+    fprintf(stderr, "Sequential debug: all %d nodes passed.\n", e->schedule_len);
 }
 
 // Debug: execute with error checking per node

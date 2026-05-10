@@ -77,9 +77,11 @@ def _setup_signatures(lib):
     lib.sengine_add_membrane.argtypes = [VP, VP, CI]
 
     lib.sengine_execute.argtypes = [VP]
+    lib.sengine_set_fp32.argtypes = [VP, CI]
     lib.sengine_reset_membranes.argtypes = [VP]
     lib.sengine_capture_graph.argtypes = [VP]
     lib.sengine_replay.argtypes = [VP]
+    lib.sengine_execute_sequential_debug.argtypes = [VP]
     lib.sengine_sync.argtypes = [VP]
 
     lib.sengine_benchmark.argtypes = [VP, CI, CI]
@@ -105,6 +107,9 @@ class CppExecutor:
         self._lib = lib
         self._handle = lib.sengine_create()
         self._tl_idx_cache: dict[str, int] = {}  # so_path → tl_idx
+
+    def set_fp32(self, fp32: bool):
+        self._lib.sengine_set_fp32(self._handle, 1 if fp32 else 0)
 
     def destroy(self):
         if self._handle:
@@ -232,6 +237,10 @@ class CppExecutor:
 
     def replay(self):
         self._lib.sengine_replay(self._handle)
+
+    def execute_sequential_debug(self):
+        """Run nodes one-by-one with sync after each, stop on first CUDA error."""
+        self._lib.sengine_execute_sequential_debug(self._handle)
 
     def sync(self):
         self._lib.sengine_sync(self._handle)

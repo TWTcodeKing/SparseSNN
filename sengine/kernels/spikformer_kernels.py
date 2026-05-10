@@ -20,6 +20,7 @@ import tilelang.language as T
 def linear_bn_lif_t4_kernel(
     M, K, N_out,
     block_M, block_N, block_K, num_stages, threads,
+    io_dtype=T.float16,
     v_threshold=1.0, v_reset=0.0, recip_tau=0.5,
     T_steps=4, spatial=1,
 ):
@@ -31,19 +32,19 @@ def linear_bn_lif_t4_kernel(
     """
     @T.prim_func
     def main(
-        inp:      T.Tensor((M, K), T.float16),
-        weight:   T.Tensor((K, N_out), T.float16),
+        inp:      T.Tensor((M, K), io_dtype),
+        weight:   T.Tensor((K, N_out), io_dtype),
         state:    T.Tensor((spatial, N_out), T.float32),
         bn_scale: T.Tensor((N_out,), T.float32),
         bn_bias:  T.Tensor((N_out,), T.float32),
-        spikes:   T.Tensor((M, N_out), T.float16),
+        spikes:   T.Tensor((M, N_out), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(N_out, block_N), T.ceildiv(M, block_M),
             threads=threads,
         ) as (bx, by):
-            A_shared = T.alloc_shared((block_M, block_K), T.float16)
-            B_shared = T.alloc_shared((block_K, block_N), T.float16)
+            A_shared = T.alloc_shared((block_M, block_K), io_dtype)
+            B_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc      = T.alloc_fragment((block_M, block_N), T.float32)
             T.clear(acc)
             for k_iter in T.Pipelined(
@@ -53,7 +54,7 @@ def linear_bn_lif_t4_kernel(
                 T.copy(weight[k_iter * block_K, bx * block_N], B_shared)
                 T.gemm(A_shared, B_shared, acc)
 
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
                 n = bx * block_N + j
@@ -67,7 +68,7 @@ def linear_bn_lif_t4_kernel(
                         h >= v_threshold, T.float32(1), T.float32(0))
                     v_new = (T.float32(1) - spike) * h + spike * T.float32(v_reset)
                     state[s_idx, n] = v_new
-                    out_shared[i, j] = T.cast(spike, T.float16)
+                    out_shared[i, j] = T.cast(spike, io_dtype)
             T.copy(out_shared, spikes[by * block_M, bx * block_N])
     return main
 
@@ -78,22 +79,23 @@ def linear_bn_lif_t4_kernel(
 def linear_bn_kernel(
     M, K, N_out,
     block_M, block_N, block_K, num_stages, threads,
+    io_dtype=T.float16,
 ):
     """Linear + BN scale/bias. No neuron — writes BN output directly."""
     @T.prim_func
     def main(
-        inp:      T.Tensor((M, K), T.float16),
-        weight:   T.Tensor((K, N_out), T.float16),
+        inp:      T.Tensor((M, K), io_dtype),
+        weight:   T.Tensor((K, N_out), io_dtype),
         bn_scale: T.Tensor((N_out,), T.float32),
         bn_bias:  T.Tensor((N_out,), T.float32),
-        output:   T.Tensor((M, N_out), T.float16),
+        output:   T.Tensor((M, N_out), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(N_out, block_N), T.ceildiv(M, block_M),
             threads=threads,
         ) as (bx, by):
-            A_shared = T.alloc_shared((block_M, block_K), T.float16)
-            B_shared = T.alloc_shared((block_K, block_N), T.float16)
+            A_shared = T.alloc_shared((block_M, block_K), io_dtype)
+            B_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc      = T.alloc_fragment((block_M, block_N), T.float32)
             T.clear(acc)
             for k_iter in T.Pipelined(
@@ -102,13 +104,13 @@ def linear_bn_kernel(
                 T.copy(inp[by * block_M, k_iter * block_K], A_shared)
                 T.copy(weight[k_iter * block_K, bx * block_N], B_shared)
                 T.gemm(A_shared, B_shared, acc)
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
                 n = bx * block_N + j
                 if m < M and n < N_out:
                     val = acc[i, j] * bn_scale[n] + bn_bias[n]
-                    out_shared[i, j] = T.cast(val, T.float16)
+                    out_shared[i, j] = T.cast(val, io_dtype)
             T.copy(out_shared, output[by * block_M, bx * block_N])
     return main
 
@@ -119,6 +121,7 @@ def linear_bn_kernel(
 def matmul_kernel(
     M, K, N,
     block_M, block_N, block_K, num_stages, threads,
+    io_dtype=T.float16,
     scale=1.0,
 ):
     """Pure GEMM: output = (A @ B) * scale.
@@ -131,16 +134,16 @@ def matmul_kernel(
     """
     @T.prim_func
     def main(
-        A: T.Tensor((M, K), T.float16),
-        B: T.Tensor((K, N), T.float16),
-        C: T.Tensor((M, N), T.float16),
+        A: T.Tensor((M, K), io_dtype),
+        B: T.Tensor((K, N), io_dtype),
+        C: T.Tensor((M, N), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(N, block_N), T.ceildiv(M, block_M),
             threads=threads,
         ) as (bx, by):
-            A_shared = T.alloc_shared((block_M, block_K), T.float16)
-            B_shared = T.alloc_shared((block_K, block_N), T.float16)
+            A_shared = T.alloc_shared((block_M, block_K), io_dtype)
+            B_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc      = T.alloc_fragment((block_M, block_N), T.float32)
             T.clear(acc)
             for k_iter in T.Pipelined(
@@ -149,13 +152,13 @@ def matmul_kernel(
                 T.copy(A[by * block_M, k_iter * block_K], A_shared)
                 T.copy(B[k_iter * block_K, bx * block_N], B_shared)
                 T.gemm(A_shared, B_shared, acc)
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
                 n = bx * block_N + j
                 if m < M and n < N:
                     out_shared[i, j] = T.cast(
-                        acc[i, j] * T.float32(scale), T.float16)
+                        acc[i, j] * T.float32(scale), io_dtype)
             T.copy(out_shared, C[by * block_M, bx * block_N])
     return main
 
@@ -166,6 +169,7 @@ def matmul_kernel(
 def batched_matmul_kernel(
     batch, M, K, N,
     block_M, block_N, block_K, num_stages, threads,
+    io_dtype=T.float16,
     scale=1.0,
 ):
     """Batched GEMM: C[b] = (A[b] @ B[b]) * scale, for b in 0..batch-1.
@@ -177,16 +181,16 @@ def batched_matmul_kernel(
     """
     @T.prim_func
     def main(
-        A: T.Tensor((batch * M, K), T.float16),
-        B: T.Tensor((batch * K, N), T.float16),
-        C: T.Tensor((batch * M, N), T.float16),
+        A: T.Tensor((batch * M, K), io_dtype),
+        B: T.Tensor((batch * K, N), io_dtype),
+        C: T.Tensor((batch * M, N), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(N, block_N), T.ceildiv(M, block_M), batch,
             threads=threads,
         ) as (bx, by, bz):
-            A_shared = T.alloc_shared((block_M, block_K), T.float16)
-            B_shared = T.alloc_shared((block_K, block_N), T.float16)
+            A_shared = T.alloc_shared((block_M, block_K), io_dtype)
+            B_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc      = T.alloc_fragment((block_M, block_N), T.float32)
             T.clear(acc)
 
@@ -201,14 +205,14 @@ def batched_matmul_kernel(
                 T.copy(B[b_base + k_iter * block_K, bx * block_N], B_shared)
                 T.gemm(A_shared, B_shared, acc)
 
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             c_base = bz * M
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
                 n = bx * block_N + j
                 if m < M and n < N:
                     out_shared[i, j] = T.cast(
-                        acc[i, j] * T.float32(scale), T.float16)
+                        acc[i, j] * T.float32(scale), io_dtype)
             T.copy(out_shared, C[c_base + by * block_M, bx * block_N])
     return main
 
@@ -219,6 +223,7 @@ def batched_matmul_kernel(
 def batched_matmul_bt_kernel(
     batch, M, K, N,
     block_M, block_N, block_K, num_stages, threads,
+    io_dtype=T.float16,
     scale=1.0,
 ):
     """Batched GEMM with B transposed: C[b] = (A[b] @ B[b]^T) * scale.
@@ -231,16 +236,16 @@ def batched_matmul_bt_kernel(
     """
     @T.prim_func
     def main(
-        A: T.Tensor((batch * M, K), T.float16),
-        B: T.Tensor((batch * N, K), T.float16),
-        C: T.Tensor((batch * M, N), T.float16),
+        A: T.Tensor((batch * M, K), io_dtype),
+        B: T.Tensor((batch * N, K), io_dtype),
+        C: T.Tensor((batch * M, N), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(N, block_N), T.ceildiv(M, block_M), batch,
             threads=threads,
         ) as (bx, by, bz):
-            A_shared = T.alloc_shared((block_M, block_K), T.float16)
-            B_shared = T.alloc_shared((block_N, block_K), T.float16)
+            A_shared = T.alloc_shared((block_M, block_K), io_dtype)
+            B_shared = T.alloc_shared((block_N, block_K), io_dtype)
             acc      = T.alloc_fragment((block_M, block_N), T.float32)
             T.clear(acc)
 
@@ -255,14 +260,14 @@ def batched_matmul_bt_kernel(
                 # GEMM: A_shared(M,K) @ B_shared(N,K)^T = A_shared @ B_shared^T
                 T.gemm(A_shared, B_shared, acc, transpose_B=True)
 
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             c_base = bz * M
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
                 n = bx * block_N + j
                 if m < M and n < N:
                     out_shared[i, j] = T.cast(
-                        acc[i, j] * T.float32(scale), T.float16)
+                        acc[i, j] * T.float32(scale), io_dtype)
             T.copy(out_shared, C[c_base + by * block_M, bx * block_N])
     return main
 
@@ -273,6 +278,7 @@ def batched_matmul_bt_kernel(
 def matmul_lif_kernel(
     M, K, N,
     block_M, block_N, block_K, num_stages, threads,
+    io_dtype=T.float16,
     v_threshold=1.0, v_reset=0.0, recip_tau=0.5,
     T_steps=4, spatial=1,
 ):
@@ -288,17 +294,17 @@ def matmul_lif_kernel(
     """
     @T.prim_func
     def main(
-        A:      T.Tensor((M, K), T.float16),
-        B_mat:  T.Tensor((K, N), T.float16),
+        A:      T.Tensor((M, K), io_dtype),
+        B_mat:  T.Tensor((K, N), io_dtype),
         state:  T.Tensor((spatial, N), T.float32),
-        spikes: T.Tensor((M, N), T.float16),
+        spikes: T.Tensor((M, N), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(N, block_N), T.ceildiv(M, block_M),
             threads=threads,
         ) as (bx, by):
-            A_shared = T.alloc_shared((block_M, block_K), T.float16)
-            B_shared = T.alloc_shared((block_K, block_N), T.float16)
+            A_shared = T.alloc_shared((block_M, block_K), io_dtype)
+            B_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc      = T.alloc_fragment((block_M, block_N), T.float32)
             T.clear(acc)
             for k_iter in T.Pipelined(
@@ -309,7 +315,7 @@ def matmul_lif_kernel(
                 T.gemm(A_shared, B_shared, acc)
 
             # LIF epilogue: integrate GEMM output into membrane, fire spikes
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
                 n = bx * block_N + j
@@ -323,7 +329,7 @@ def matmul_lif_kernel(
                         h >= v_threshold, T.float32(1), T.float32(0))
                     v_new = (T.float32(1) - spike) * h + spike * T.float32(v_reset)
                     state[s_idx, n] = v_new
-                    out_shared[i, j] = T.cast(spike, T.float16)
+                    out_shared[i, j] = T.cast(spike, io_dtype)
             T.copy(out_shared, spikes[by * block_M, bx * block_N])
     return main
 
@@ -334,15 +340,16 @@ def matmul_lif_kernel(
 def lif_neuron_kernel(
     M, N,
     block_M, block_N, threads=128,
+    io_dtype=T.float16,
     v_threshold=1.0, v_reset=0.0, recip_tau=0.5,
     T_steps=4, spatial=1,
 ):
     """Standalone LIF neuron with T-sequential membrane."""
     @T.prim_func
     def main(
-        inp:    T.Tensor((M, N), T.float16),
+        inp:    T.Tensor((M, N), io_dtype),
         state:  T.Tensor((spatial, N), T.float32),
-        spikes: T.Tensor((M, N), T.float16),
+        spikes: T.Tensor((M, N), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(N, block_N), T.ceildiv(M, block_M),
@@ -361,5 +368,5 @@ def lif_neuron_kernel(
                         h >= v_threshold, T.float32(1), T.float32(0))
                     v_new = (T.float32(1) - spike) * h + spike * T.float32(v_reset)
                     state[s_idx, n] = v_new
-                    spikes[m, n] = T.cast(spike, T.float16)
+                    spikes[m, n] = T.cast(spike, io_dtype)
     return main

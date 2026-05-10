@@ -22,6 +22,7 @@ import tilelang.language as T
 def maxformer_kTv_kernel(
     TB, heads, hd, N, H, W,
     block_M, block_N, block_K, num_stages, threads,
+    io_dtype=T.float16,
 ):
     """GEMM1 for MaxFormer: kv[b,head] = K[b,head]^T @ V[b,head].
 
@@ -39,16 +40,16 @@ def maxformer_kTv_kernel(
 
     @T.prim_func
     def main(
-        K_nhwc: T.Tensor((TB * N, C), T.float16),   # (TB, H, W, C) flattened to (TB*N, C)
-        V_nhwc: T.Tensor((TB * N, C), T.float16),
-        kv_out: T.Tensor((batch * hd, hd), T.float16),  # (batch, hd, hd) contiguous
+        K_nhwc: T.Tensor((TB * N, C), io_dtype),   # (TB, H, W, C) flattened to (TB*N, C)
+        V_nhwc: T.Tensor((TB * N, C), io_dtype),
+        kv_out: T.Tensor((batch * hd, hd), io_dtype),  # (batch, hd, hd) contiguous
     ):
         with T.Kernel(
             T.ceildiv(hd, block_N), T.ceildiv(hd, block_M), batch,
             threads=threads,
         ) as (bx, by, bz):
-            A_shared = T.alloc_shared((block_M, block_K), T.float16)
-            B_shared = T.alloc_shared((block_K, block_N), T.float16)
+            A_shared = T.alloc_shared((block_M, block_K), io_dtype)
+            B_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc      = T.alloc_fragment((block_M, block_N), T.float32)
             T.clear(acc)
 
@@ -64,7 +65,7 @@ def maxformer_kTv_kernel(
                     if d < hd and n < N:
                         A_shared[i, j] = K_nhwc[tb * N + n, head * hd + d]
                     else:
-                        A_shared[i, j] = T.float16(0)
+                        A_shared[i, j] = io_dtype(0)
 
                 # Load B = V block: B[n, d] = V_nhwc[tb*N + n, head*hd + d]
                 for i, j in T.Parallel(block_K, block_N):
@@ -73,17 +74,17 @@ def maxformer_kTv_kernel(
                     if n < N and d < hd:
                         B_shared[i, j] = V_nhwc[tb * N + n, head * hd + d]
                     else:
-                        B_shared[i, j] = T.float16(0)
+                        B_shared[i, j] = io_dtype(0)
 
                 T.gemm(A_shared, B_shared, acc)
 
             # Write output: kv_out[bz * hd + d1, d2]
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 d1 = by * block_M + i
                 d2 = bx * block_N + j
                 if d1 < hd and d2 < hd:
-                    out_shared[i, j] = T.cast(acc[i, j], T.float16)
+                    out_shared[i, j] = T.cast(acc[i, j], io_dtype)
             T.copy(out_shared, kv_out[bz * hd + by * block_M, bx * block_N])
 
     return main
@@ -93,6 +94,7 @@ def maxformer_kTv_kernel(
 def maxformer_qkv_kernel(
     TB, heads, hd, N, H, W,
     block_M, block_N, block_K, num_stages, threads,
+    io_dtype=T.float16,
     scale=1.0,
 ):
     """GEMM2 for MaxFormer: out[b,head] = (Q[b,head] @ kv[b,head]) * scale.
@@ -112,16 +114,16 @@ def maxformer_qkv_kernel(
 
     @T.prim_func
     def main(
-        Q_nhwc:  T.Tensor((TB * N, C), T.float16),
-        kv_in:   T.Tensor((batch * hd, hd), T.float16),
-        out_nhwc: T.Tensor((TB * N, C), T.float16),
+        Q_nhwc:  T.Tensor((TB * N, C), io_dtype),
+        kv_in:   T.Tensor((batch * hd, hd), io_dtype),
+        out_nhwc: T.Tensor((TB * N, C), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(hd, block_N), T.ceildiv(N, block_M), batch,
             threads=threads,
         ) as (bx, by, bz):
-            A_shared = T.alloc_shared((block_M, block_K), T.float16)
-            B_shared = T.alloc_shared((block_K, block_N), T.float16)
+            A_shared = T.alloc_shared((block_M, block_K), io_dtype)
+            B_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc      = T.alloc_fragment((block_M, block_N), T.float32)
             T.clear(acc)
 
@@ -136,7 +138,7 @@ def maxformer_qkv_kernel(
                     if n < N and d < hd:
                         A_shared[i, j] = Q_nhwc[tb * N + n, head * hd + d]
                     else:
-                        A_shared[i, j] = T.float16(0)
+                        A_shared[i, j] = io_dtype(0)
 
                 # Load B = kv block: contiguous
                 T.copy(kv_in[bz * hd + k_iter * block_K, bx * block_N], B_shared)
@@ -144,13 +146,13 @@ def maxformer_qkv_kernel(
                 T.gemm(A_shared, B_shared, acc)
 
             # Epilogue: scale + write NHWC (no LIF — done separately)
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 n = by * block_M + i
                 d = bx * block_N + j
                 if n < N and d < hd:
                     out_shared[i, j] = T.cast(
-                        acc[i, j] * T.float32(scale), T.float16)
+                        acc[i, j] * T.float32(scale), io_dtype)
 
             # Write to NHWC: out[tb*N + n, head*hd + d]
             for i, j in T.Parallel(block_M, block_N):
@@ -171,6 +173,7 @@ def maxformer_qkv_kernel(
 def dssa_kTq_kernel(
     TB, heads, hd, spatial_kv, spatial_q,
     block_M, block_N, block_K, num_stages, threads,
+    io_dtype=T.float16,
 ):
     """GEMM1 for DSSA: attn[b,head] = K[b,head]^T @ Q[b,head].
 
@@ -187,16 +190,16 @@ def dssa_kTq_kernel(
 
     @T.prim_func
     def main(
-        y_kv_nhwc:  T.Tensor((TB * spatial_kv, C2), T.float16),
-        x_q_nhwc:   T.Tensor((TB * spatial_q, C), T.float16),
-        attn_out:   T.Tensor((batch * spatial_kv, spatial_q), T.float16),
+        y_kv_nhwc:  T.Tensor((TB * spatial_kv, C2), io_dtype),
+        x_q_nhwc:   T.Tensor((TB * spatial_q, C), io_dtype),
+        attn_out:   T.Tensor((batch * spatial_kv, spatial_q), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(spatial_q, block_N), T.ceildiv(spatial_kv, block_M), batch,
             threads=threads,
         ) as (bx, by, bz):
-            A_shared = T.alloc_shared((block_M, block_K), T.float16)
-            B_shared = T.alloc_shared((block_K, block_N), T.float16)
+            A_shared = T.alloc_shared((block_M, block_K), io_dtype)
+            B_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc      = T.alloc_fragment((block_M, block_N), T.float32)
             T.clear(acc)
 
@@ -204,14 +207,15 @@ def dssa_kTq_kernel(
             head = bz % heads
 
             for k_iter in T.Pipelined(T.ceildiv(hd, block_K), num_stages=num_stages):
-                # Load A = K^T: A[n_kv, d] = y_kv[tb*spatial_kv + n_kv, head*hd + d]
+                # Load A = K^T: A[n_kv, d] = y_kv[tb*spatial_kv + n_kv, head*2*hd + d]
+                # y_kv channels: [head0_K(hd) | head0_V(hd) | head1_K(hd) | head1_V(hd) | ...]
                 for i, j in T.Parallel(block_M, block_K):
                     n_kv = by * block_M + i
                     d = k_iter * block_K + j
                     if n_kv < spatial_kv and d < hd:
-                        A_shared[i, j] = y_kv_nhwc[tb * spatial_kv + n_kv, head * hd + d]
+                        A_shared[i, j] = y_kv_nhwc[tb * spatial_kv + n_kv, head * 2 * hd + d]
                     else:
-                        A_shared[i, j] = T.float16(0)
+                        A_shared[i, j] = io_dtype(0)
 
                 # Load B = Q: B[d, n_q] = x_q[tb*spatial_q + n_q, head*hd + d]
                 for i, j in T.Parallel(block_K, block_N):
@@ -220,18 +224,23 @@ def dssa_kTq_kernel(
                     if d < hd and n_q < spatial_q:
                         B_shared[i, j] = x_q_nhwc[tb * spatial_q + n_q, head * hd + d]
                     else:
-                        B_shared[i, j] = T.float16(0)
+                        B_shared[i, j] = io_dtype(0)
 
                 T.gemm(A_shared, B_shared, acc)
 
             # Write attn_out contiguous: [bz * spatial_kv + n_kv, n_q]
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 n_kv = by * block_M + i
                 n_q = bx * block_N + j
                 if n_kv < spatial_kv and n_q < spatial_q:
-                    out_shared[i, j] = T.cast(acc[i, j], T.float16)
-            T.copy(out_shared, attn_out[bz * spatial_kv + by * block_M, bx * block_N])
+                    out_shared[i, j] = T.cast(acc[i, j], io_dtype)
+
+            for i, j in T.Parallel(block_M, block_N):
+                n_kv = by * block_M + i
+                n_q = bx * block_N + j
+                if n_kv < spatial_kv and n_q < spatial_q:
+                    attn_out[bz * spatial_kv + n_kv, n_q] = out_shared[i, j]
 
     return main
 
@@ -240,6 +249,7 @@ def dssa_kTq_kernel(
 def dssa_v_attn_kernel(
     TB, heads, hd, spatial_kv, spatial_q, H_out, W_out,
     block_M, block_N, block_K, num_stages, threads,
+    io_dtype=T.float16,
 ):
     """GEMM2 for DSSA: out[b,head] = V[b,head] @ attn[b,head].
 
@@ -256,16 +266,16 @@ def dssa_v_attn_kernel(
 
     @T.prim_func
     def main(
-        y_kv_nhwc:  T.Tensor((TB * spatial_kv, C2), T.float16),
-        attn_in:    T.Tensor((batch * spatial_kv, spatial_q), T.float16),
-        out_nhwc:   T.Tensor((TB * spatial_q, C), T.float16),
+        y_kv_nhwc:  T.Tensor((TB * spatial_kv, C2), io_dtype),
+        attn_in:    T.Tensor((batch * spatial_kv, spatial_q), io_dtype),
+        out_nhwc:   T.Tensor((TB * spatial_q, C), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(spatial_q, block_N), T.ceildiv(hd, block_M), batch,
             threads=threads,
         ) as (bx, by, bz):
-            A_shared = T.alloc_shared((block_M, block_K), T.float16)
-            B_shared = T.alloc_shared((block_K, block_N), T.float16)
+            A_shared = T.alloc_shared((block_M, block_K), io_dtype)
+            B_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc      = T.alloc_fragment((block_M, block_N), T.float32)
             T.clear(acc)
 
@@ -273,28 +283,34 @@ def dssa_v_attn_kernel(
             head = bz % heads
 
             for k_iter in T.Pipelined(T.ceildiv(spatial_kv, block_K), num_stages=num_stages):
-                # Load A = V: A[d, n_kv] = y_kv[tb*spatial_kv + n_kv, C + head*hd + d]
-                # (V is second half of channels, offset by C)
+                # Load A = V: A[d, n_kv] = y_kv[tb*spatial_kv + n_kv, head*2*hd + hd + d]
+                # y_kv channels: [head0_K(hd) | head0_V(hd) | head1_K(hd) | head1_V(hd) | ...]
                 for i, j in T.Parallel(block_M, block_K):
                     d = by * block_M + i
                     n_kv = k_iter * block_K + j
                     if d < hd and n_kv < spatial_kv:
-                        A_shared[i, j] = y_kv_nhwc[tb * spatial_kv + n_kv, C + head * hd + d]
+                        A_shared[i, j] = y_kv_nhwc[tb * spatial_kv + n_kv, head * 2 * hd + hd + d]
                     else:
-                        A_shared[i, j] = T.float16(0)
+                        A_shared[i, j] = io_dtype(0)
 
-                # Load B = attn: contiguous
-                T.copy(attn_in[bz * spatial_kv + k_iter * block_K, bx * block_N], B_shared)
+                # Load B = attn: bounds-checked for non-aligned spatial dims
+                for i, j in T.Parallel(block_K, block_N):
+                    n_kv = k_iter * block_K + i
+                    n_q = bx * block_N + j
+                    if n_kv < spatial_kv and n_q < spatial_q:
+                        B_shared[i, j] = attn_in[bz * spatial_kv + n_kv, n_q]
+                    else:
+                        B_shared[i, j] = io_dtype(0)
 
                 T.gemm(A_shared, B_shared, acc)
 
             # Write to NHWC: out[tb*spatial_q + n_q, head*hd + d]
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 d = by * block_M + i
                 n_q = bx * block_N + j
                 if d < hd and n_q < spatial_q:
-                    out_shared[i, j] = T.cast(acc[i, j], T.float16)
+                    out_shared[i, j] = T.cast(acc[i, j], io_dtype)
 
             for i, j in T.Parallel(block_M, block_N):
                 d = by * block_M + i

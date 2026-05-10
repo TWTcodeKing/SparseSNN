@@ -82,6 +82,7 @@ def _make_configs_conv(C_in, F, K, OH, OW, TB):
 def make_conv2d_bn_if_t4(
     TB, C_in, H, W, F, K, S, D, P,
     v_threshold=1.0, v_reset=0.0, T_steps=4,
+    io_dtype=T.float16,
 ):
     """Build an autotuned fused Conv2d+BN+IF kernel with T-batching.
 
@@ -125,12 +126,12 @@ def make_conv2d_bn_if_t4(
     ):
         @T.prim_func
         def main(
-            data:     T.Tensor((TB, H, W, C_in), T.float16),
-            weight:   T.Tensor((KH, KW, C_in, F), T.float16),
+            data:     T.Tensor((TB, H, W, C_in), io_dtype),
+            weight:   T.Tensor((KH, KW, C_in, F), io_dtype),
             state:    T.Tensor((B, OH, OW, F), T.float32),
             bn_scale: T.Tensor((F,), T.float32),
             bn_bias:  T.Tensor((F,), T.float32),
-            spikes:   T.Tensor((TB, OH, OW, F), T.float16),
+            spikes:   T.Tensor((TB, OH, OW, F), io_dtype),
         ):
             with T.Kernel(
                 T.ceildiv(F, block_N),
@@ -138,12 +139,12 @@ def make_conv2d_bn_if_t4(
                 threads=threads,
             ) as (bx, by):
                 # ── allocations ──
-                data_shared   = T.alloc_shared((block_M, block_K), T.float16)
-                weight_shared = T.alloc_shared((block_K, block_N), T.float16)
+                data_shared   = T.alloc_shared((block_M, block_K), io_dtype)
+                weight_shared = T.alloc_shared((block_K, block_N), io_dtype)
                 acc           = T.alloc_fragment((block_M, block_N), T.float32)
 
-                weight_flat = T.Tensor((K_red, F), T.float16, weight.data)
-                spikes_flat = T.Tensor((M, F), T.float16, spikes.data)
+                weight_flat = T.Tensor((K_red, F), io_dtype, weight.data)
+                spikes_flat = T.Tensor((M, F), io_dtype, spikes.data)
                 state_flat  = T.Tensor((B * OH * OW, F), T.float32, state.data)
 
                 T.clear(acc)
@@ -176,7 +177,7 @@ def make_conv2d_bn_if_t4(
                             data_shared[i, j] = T.if_then_else(
                                 in_bound,
                                 data[n_idx, access_h, access_w, cin],
-                                T.float16(0),
+                                io_dtype(0),
                             )
 
                     T.copy(weight_flat[k_iter * block_K, bx * block_N],
@@ -184,7 +185,7 @@ def make_conv2d_bn_if_t4(
                     T.gemm(data_shared, weight_shared, acc)
 
                 # ── BN + IF neuron epilogue with T-sequential membrane ──
-                out_shared = T.alloc_shared((block_M, block_N), T.float16)
+                out_shared = T.alloc_shared((block_M, block_N), io_dtype)
 
                 for i, j in T.Parallel(block_M, block_N):
                     m = by * block_M + i
@@ -215,7 +216,7 @@ def make_conv2d_bn_if_t4(
                         # t=0 positions come before t=1 positions)
                         state_flat[s_idx, f] = v_new
 
-                        out_shared[i, j] = T.cast(spike, T.float16)
+                        out_shared[i, j] = T.cast(spike, io_dtype)
 
                 T.copy(out_shared, spikes_flat[by * block_M, bx * block_N])
 
@@ -233,6 +234,7 @@ def conv2d_bn_if_t4_kernel(
     TB, C_in, H, W, F, K, S, D, P,
     block_M, block_N, block_K, num_stages, threads,
     v_threshold=1.0, v_reset=0.0, T_steps=4,
+    io_dtype=T.float16,
 ):
     """Non-autotuned variant — call with explicit tile config."""
     KH = KW = K
@@ -246,24 +248,24 @@ def conv2d_bn_if_t4_kernel(
 
     @T.prim_func
     def main(
-        data:     T.Tensor((TB, H, W, C_in), T.float16),
-        weight:   T.Tensor((KH, KW, C_in, F), T.float16),
+        data:     T.Tensor((TB, H, W, C_in), io_dtype),
+        weight:   T.Tensor((KH, KW, C_in, F), io_dtype),
         state:    T.Tensor((B, OH, OW, F), T.float32),
         bn_scale: T.Tensor((F,), T.float32),
         bn_bias:  T.Tensor((F,), T.float32),
-        spikes:   T.Tensor((TB, OH, OW, F), T.float16),
+        spikes:   T.Tensor((TB, OH, OW, F), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(F, block_N),
             T.ceildiv(M, block_M),
             threads=threads,
         ) as (bx, by):
-            data_shared   = T.alloc_shared((block_M, block_K), T.float16)
-            weight_shared = T.alloc_shared((block_K, block_N), T.float16)
+            data_shared   = T.alloc_shared((block_M, block_K), io_dtype)
+            weight_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc           = T.alloc_fragment((block_M, block_N), T.float32)
 
-            weight_flat = T.Tensor((K_red, F), T.float16, weight.data)
-            spikes_flat = T.Tensor((M, F), T.float16, spikes.data)
+            weight_flat = T.Tensor((K_red, F), io_dtype, weight.data)
+            spikes_flat = T.Tensor((M, F), io_dtype, spikes.data)
             state_flat  = T.Tensor((B * OH * OW, F), T.float32, state.data)
 
             T.clear(acc)
@@ -294,14 +296,14 @@ def conv2d_bn_if_t4_kernel(
                         data_shared[i, j] = T.if_then_else(
                             in_bound,
                             data[n_idx, access_h, access_w, cin],
-                            T.float16(0),
+                            io_dtype(0),
                         )
 
                 T.copy(weight_flat[k_iter * block_K, bx * block_N],
                        weight_shared)
                 T.gemm(data_shared, weight_shared, acc)
 
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
 
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
@@ -316,7 +318,7 @@ def conv2d_bn_if_t4_kernel(
                         h >= v_threshold, T.float32(1), T.float32(0))
                     v_new = (T.float32(1) - spike) * h + spike * T.float32(v_reset)
                     state_flat[s_idx, f] = v_new
-                    out_shared[i, j] = T.cast(spike, T.float16)
+                    out_shared[i, j] = T.cast(spike, io_dtype)
 
             T.copy(out_shared, spikes_flat[by * block_M, bx * block_N])
 
@@ -361,6 +363,7 @@ def conv1x1_bn_if_t4_kernel(
     TB, C_in, H, W, F, S,
     block_M, block_N, block_K, num_stages, threads,
     v_threshold=1.0, v_reset=0.0, T_steps=4,
+    io_dtype=T.float16,
 ):
     """Fused 1×1 Conv+BN+IF with stride support. Pure GEMM — no im2col.
 
@@ -374,22 +377,22 @@ def conv1x1_bn_if_t4_kernel(
 
     @T.prim_func
     def main(
-        data:     T.Tensor((TB, H, W, C_in), T.float16),
-        weight:   T.Tensor((C_in, F), T.float16),
+        data:     T.Tensor((TB, H, W, C_in), io_dtype),
+        weight:   T.Tensor((C_in, F), io_dtype),
         state:    T.Tensor((B, OH, OW, F), T.float32),
         bn_scale: T.Tensor((F,), T.float32),
         bn_bias:  T.Tensor((F,), T.float32),
-        spikes:   T.Tensor((TB, OH, OW, F), T.float16),
+        spikes:   T.Tensor((TB, OH, OW, F), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(F, block_N), T.ceildiv(M, block_M),
             threads=threads,
         ) as (bx, by):
-            data_shared   = T.alloc_shared((block_M, block_K), T.float16)
-            weight_shared = T.alloc_shared((block_K, block_N), T.float16)
+            data_shared   = T.alloc_shared((block_M, block_K), io_dtype)
+            weight_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc           = T.alloc_fragment((block_M, block_N), T.float32)
 
-            spikes_flat = T.Tensor((M, F), T.float16, spikes.data)
+            spikes_flat = T.Tensor((M, F), io_dtype, spikes.data)
             state_flat  = T.Tensor((B * OH * OW, F), T.float32, state.data)
 
             T.clear(acc)
@@ -409,7 +412,7 @@ def conv1x1_bn_if_t4_kernel(
                     data_shared[i, j] = T.if_then_else(
                         in_bound,
                         data[n_idx, oh * S, ow * S, cin],
-                        T.float16(0),
+                        io_dtype(0),
                     )
 
                 T.copy(weight[k_iter * block_K, bx * block_N],
@@ -417,7 +420,7 @@ def conv1x1_bn_if_t4_kernel(
                 T.gemm(data_shared, weight_shared, acc)
 
             # BN + IF epilogue
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
                 f = bx * block_N + j
@@ -430,7 +433,7 @@ def conv1x1_bn_if_t4_kernel(
                         h >= v_threshold, T.float32(1), T.float32(0))
                     v_new = (T.float32(1) - spike) * h + spike * T.float32(v_reset)
                     state_flat[s_idx, f] = v_new
-                    out_shared[i, j] = T.cast(spike, T.float16)
+                    out_shared[i, j] = T.cast(spike, io_dtype)
 
             T.copy(out_shared, spikes_flat[by * block_M, bx * block_N])
 
@@ -447,6 +450,7 @@ def stem_conv_bn_if_t4_kernel(
     block_M, block_N, block_K, num_stages, threads,
     v_threshold=1.0, v_reset=0.0, T_steps=4,
     C_in_padded=16, C_in_real=3, F=64, KH=7, KW=7, S=2, P=3,
+    io_dtype=T.float16,
 ):
     """Fused stem Conv(3→64, 7×7, s=2, p=3) + BN + IF.
 
@@ -462,23 +466,23 @@ def stem_conv_bn_if_t4_kernel(
 
     @T.prim_func
     def main(
-        data:     T.Tensor((TB, H, W, C_in_padded), T.float16),
-        weight:   T.Tensor((KH, KW, C_in_padded, F), T.float16),
+        data:     T.Tensor((TB, H, W, C_in_padded), io_dtype),
+        weight:   T.Tensor((KH, KW, C_in_padded, F), io_dtype),
         state:    T.Tensor((B, OH, OW, F), T.float32),
         bn_scale: T.Tensor((F,), T.float32),
         bn_bias:  T.Tensor((F,), T.float32),
-        spikes:   T.Tensor((TB, OH, OW, F), T.float16),
+        spikes:   T.Tensor((TB, OH, OW, F), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(F, block_N), T.ceildiv(M, block_M),
             threads=threads,
         ) as (bx, by):
-            data_shared   = T.alloc_shared((block_M, block_K), T.float16)
-            weight_shared = T.alloc_shared((block_K, block_N), T.float16)
+            data_shared   = T.alloc_shared((block_M, block_K), io_dtype)
+            weight_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc           = T.alloc_fragment((block_M, block_N), T.float32)
 
-            weight_flat = T.Tensor((K_red, F), T.float16, weight.data)
-            spikes_flat = T.Tensor((M, F), T.float16, spikes.data)
+            weight_flat = T.Tensor((K_red, F), io_dtype, weight.data)
+            spikes_flat = T.Tensor((M, F), io_dtype, spikes.data)
             state_flat  = T.Tensor((B * OH * OW, F), T.float32, state.data)
 
             T.clear(acc)
@@ -508,7 +512,7 @@ def stem_conv_bn_if_t4_kernel(
                     data_shared[i, j] = T.if_then_else(
                         in_bound,
                         data[n_idx, access_h, access_w, cin],
-                        T.float16(0),
+                        io_dtype(0),
                     )
 
                 T.copy(weight_flat[k_iter * block_K, bx * block_N],
@@ -516,7 +520,7 @@ def stem_conv_bn_if_t4_kernel(
                 T.gemm(data_shared, weight_shared, acc)
 
             # BN + IF epilogue
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
                 f = bx * block_N + j
@@ -529,7 +533,7 @@ def stem_conv_bn_if_t4_kernel(
                         h >= v_threshold, T.float32(1), T.float32(0))
                     v_new = (T.float32(1) - spike) * h + spike * T.float32(v_reset)
                     state_flat[s_idx, f] = v_new
-                    out_shared[i, j] = T.cast(spike, T.float16)
+                    out_shared[i, j] = T.cast(spike, io_dtype)
 
             T.copy(out_shared, spikes_flat[by * block_M, bx * block_N])
 
@@ -548,8 +552,9 @@ def stem_conv_bn_if_t4_kernel(
 def conv2d_bn_t4_kernel(
     TB, C_in, H, W, F, K, S, D, P,
     block_M, block_N, block_K, num_stages, threads,
+    io_dtype=T.float16,
 ):
-    """Conv2d+BN without neuron. Writes BN output (FP16) to DRAM."""
+    """Conv2d+BN without neuron. Writes BN output to DRAM."""
     KH = KW = K
     OH = (H + 2 * P - D * (K - 1) - 1) // S + 1
     OW = (W + 2 * P - D * (K - 1) - 1) // S + 1
@@ -559,21 +564,21 @@ def conv2d_bn_t4_kernel(
 
     @T.prim_func
     def main(
-        data:     T.Tensor((TB, H, W, C_in), T.float16),
-        weight:   T.Tensor((KH, KW, C_in, F), T.float16),
+        data:     T.Tensor((TB, H, W, C_in), io_dtype),
+        weight:   T.Tensor((KH, KW, C_in, F), io_dtype),
         bn_scale: T.Tensor((F,), T.float32),
         bn_bias:  T.Tensor((F,), T.float32),
-        output:   T.Tensor((TB, OH, OW, F), T.float16),
+        output:   T.Tensor((TB, OH, OW, F), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(F, block_N), T.ceildiv(M, block_M),
             threads=threads,
         ) as (bx, by):
-            data_shared   = T.alloc_shared((block_M, block_K), T.float16)
-            weight_shared = T.alloc_shared((block_K, block_N), T.float16)
+            data_shared   = T.alloc_shared((block_M, block_K), io_dtype)
+            weight_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc           = T.alloc_fragment((block_M, block_N), T.float32)
-            weight_flat = T.Tensor((K_red, F), T.float16, weight.data)
-            output_flat = T.Tensor((M, F), T.float16, output.data)
+            weight_flat = T.Tensor((K_red, F), io_dtype, weight.data)
+            output_flat = T.Tensor((M, F), io_dtype, output.data)
             T.clear(acc)
             for k_iter in T.Pipelined(
                 T.ceildiv(K_red, block_K), num_stages=num_stages,
@@ -596,16 +601,16 @@ def conv2d_bn_t4_kernel(
                         ib = ((ah >= 0) and (aw >= 0) and (ah < H)
                               and (aw < W) and (m < M) and (k < K_red))
                         data_shared[i, j] = T.if_then_else(
-                            ib, data[n_idx, ah, aw, cin_val], T.float16(0))
+                            ib, data[n_idx, ah, aw, cin_val], io_dtype(0))
                 T.copy(weight_flat[k_iter * block_K, bx * block_N], weight_shared)
                 T.gemm(data_shared, weight_shared, acc)
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
                 f = bx * block_N + j
                 if m < M and f < F:
                     val = acc[i, j] * bn_scale[f] + bn_bias[f]
-                    out_shared[i, j] = T.cast(val, T.float16)
+                    out_shared[i, j] = T.cast(val, io_dtype)
             T.copy(out_shared, output_flat[by * block_M, bx * block_N])
     return main
 
@@ -618,6 +623,7 @@ def conv2d_bn_t4_kernel(
 def conv1x1_bn_t4_kernel(
     TB, C_in, H, W, F, S,
     block_M, block_N, block_K, num_stages, threads,
+    io_dtype=T.float16,
 ):
     """1×1 Conv+BN without neuron."""
     OH = (H + S - 1) // S
@@ -626,20 +632,20 @@ def conv1x1_bn_t4_kernel(
 
     @T.prim_func
     def main(
-        data:     T.Tensor((TB, H, W, C_in), T.float16),
-        weight:   T.Tensor((C_in, F), T.float16),
+        data:     T.Tensor((TB, H, W, C_in), io_dtype),
+        weight:   T.Tensor((C_in, F), io_dtype),
         bn_scale: T.Tensor((F,), T.float32),
         bn_bias:  T.Tensor((F,), T.float32),
-        output:   T.Tensor((TB, OH, OW, F), T.float16),
+        output:   T.Tensor((TB, OH, OW, F), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(F, block_N), T.ceildiv(M, block_M),
             threads=threads,
         ) as (bx, by):
-            data_shared   = T.alloc_shared((block_M, block_K), T.float16)
-            weight_shared = T.alloc_shared((block_K, block_N), T.float16)
+            data_shared   = T.alloc_shared((block_M, block_K), io_dtype)
+            weight_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc           = T.alloc_fragment((block_M, block_N), T.float32)
-            output_flat = T.Tensor((M, F), T.float16, output.data)
+            output_flat = T.Tensor((M, F), io_dtype, output.data)
             T.clear(acc)
             for k_iter in T.Pipelined(
                 T.ceildiv(C_in, block_K), num_stages=num_stages,
@@ -653,16 +659,16 @@ def conv1x1_bn_t4_kernel(
                     ow = hw % OW
                     ib = (m < M) and (cin < C_in)
                     data_shared[i, j] = T.if_then_else(
-                        ib, data[n_idx, oh * S, ow * S, cin], T.float16(0))
+                        ib, data[n_idx, oh * S, ow * S, cin], io_dtype(0))
                 T.copy(weight[k_iter * block_K, bx * block_N], weight_shared)
                 T.gemm(data_shared, weight_shared, acc)
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
                 f = bx * block_N + j
                 if m < M and f < F:
                     val = acc[i, j] * bn_scale[f] + bn_bias[f]
-                    out_shared[i, j] = T.cast(val, T.float16)
+                    out_shared[i, j] = T.cast(val, io_dtype)
             T.copy(out_shared, output_flat[by * block_M, bx * block_N])
     return main
 
@@ -676,24 +682,25 @@ def if_neuron_t4_kernel(
     TB, OH, OW, F,
     block_M, block_N, threads=128,
     v_threshold=1.0, v_reset=0.0, T_steps=4,
+    io_dtype=T.float16,
 ):
-    """Standalone IF neuron. Memory-bound: read FP16 → update FP32 membrane → write FP16 spikes."""
+    """Standalone IF neuron. Memory-bound: read input → update FP32 membrane → write spikes."""
     M = TB * OH * OW
     B = TB // T_steps
     spatial = B * OH * OW
 
     @T.prim_func
     def main(
-        bn_out:  T.Tensor((TB, OH, OW, F), T.float16),
+        bn_out:  T.Tensor((TB, OH, OW, F), io_dtype),
         state:   T.Tensor((B, OH, OW, F), T.float32),
-        spikes:  T.Tensor((TB, OH, OW, F), T.float16),
+        spikes:  T.Tensor((TB, OH, OW, F), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(F, block_N), T.ceildiv(M, block_M),
             threads=threads,
         ) as (bx, by):
-            bn_flat     = T.Tensor((M, F), T.float16, bn_out.data)
-            spikes_flat = T.Tensor((M, F), T.float16, spikes.data)
+            bn_flat     = T.Tensor((M, F), io_dtype, bn_out.data)
+            spikes_flat = T.Tensor((M, F), io_dtype, spikes.data)
             state_flat  = T.Tensor((spatial, F), T.float32, state.data)
 
             for i, j in T.Parallel(block_M, block_N):
@@ -708,7 +715,7 @@ def if_neuron_t4_kernel(
                         h >= v_threshold, T.float32(1), T.float32(0))
                     v_new = (T.float32(1) - spike) * h + spike * T.float32(v_reset)
                     state_flat[s_idx, f] = v_new
-                    spikes_flat[m, f] = T.cast(spike, T.float16)
+                    spikes_flat[m, f] = T.cast(spike, io_dtype)
     return main
 
 
@@ -721,6 +728,7 @@ def conv1x1_bn_if_add_t4_kernel(
     TB, C_in, H, W, F, S,
     block_M, block_N, block_K, num_stages, threads,
     v_threshold=1.0, v_reset=0.0, T_steps=4,
+    io_dtype=T.float16,
 ):
     """Fused 1×1 Conv+BN+IF+ResidualAdd.
 
@@ -736,24 +744,24 @@ def conv1x1_bn_if_add_t4_kernel(
 
     @T.prim_func
     def main(
-        data:     T.Tensor((TB, H, W, C_in), T.float16),
-        weight:   T.Tensor((C_in, F), T.float16),
+        data:     T.Tensor((TB, H, W, C_in), io_dtype),
+        weight:   T.Tensor((C_in, F), io_dtype),
         state:    T.Tensor((B, OH, OW, F), T.float32),
         bn_scale: T.Tensor((F,), T.float32),
         bn_bias:  T.Tensor((F,), T.float32),
-        residual: T.Tensor((TB, OH, OW, F), T.float16),
-        output:   T.Tensor((TB, OH, OW, F), T.float16),
+        residual: T.Tensor((TB, OH, OW, F), io_dtype),
+        output:   T.Tensor((TB, OH, OW, F), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(F, block_N), T.ceildiv(M, block_M),
             threads=threads,
         ) as (bx, by):
-            data_shared   = T.alloc_shared((block_M, block_K), T.float16)
-            weight_shared = T.alloc_shared((block_K, block_N), T.float16)
+            data_shared   = T.alloc_shared((block_M, block_K), io_dtype)
+            weight_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc           = T.alloc_fragment((block_M, block_N), T.float32)
 
-            output_flat   = T.Tensor((M, F), T.float16, output.data)
-            residual_flat = T.Tensor((M, F), T.float16, residual.data)
+            output_flat   = T.Tensor((M, F), io_dtype, output.data)
+            residual_flat = T.Tensor((M, F), io_dtype, residual.data)
             state_flat    = T.Tensor((B * OH * OW, F), T.float32, state.data)
 
             T.clear(acc)
@@ -770,13 +778,13 @@ def conv1x1_bn_if_add_t4_kernel(
                     ow = hw % OW
                     ib = (m < M) and (cin < C_in)
                     data_shared[i, j] = T.if_then_else(
-                        ib, data[n_idx, oh * S, ow * S, cin], T.float16(0))
+                        ib, data[n_idx, oh * S, ow * S, cin], io_dtype(0))
 
                 T.copy(weight[k_iter * block_K, bx * block_N], weight_shared)
                 T.gemm(data_shared, weight_shared, acc)
 
             # BN + IF + Residual Add epilogue
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
                 f = bx * block_N + j
@@ -791,7 +799,7 @@ def conv1x1_bn_if_add_t4_kernel(
                     state_flat[s_idx, f] = v_new
                     # Fused residual add: spike + skip connection
                     res_val = T.cast(residual_flat[m, f], T.float32)
-                    out_shared[i, j] = T.cast(spike + res_val, T.float16)
+                    out_shared[i, j] = T.cast(spike + res_val, io_dtype)
 
             T.copy(out_shared, output_flat[by * block_M, bx * block_N])
 
@@ -807,6 +815,7 @@ def conv2d_bn_if_add_t4_kernel(
     TB, C_in, H, W, F, K, S, D, P,
     block_M, block_N, block_K, num_stages, threads,
     v_threshold=1.0, v_reset=0.0, T_steps=4,
+    io_dtype=T.float16,
 ):
     """Fused Conv+BN+IF+ResidualAdd (general KxK conv with im2col).
 
@@ -823,25 +832,25 @@ def conv2d_bn_if_add_t4_kernel(
 
     @T.prim_func
     def main(
-        data:     T.Tensor((TB, H, W, C_in), T.float16),
-        weight:   T.Tensor((KH, KW, C_in, F), T.float16),
+        data:     T.Tensor((TB, H, W, C_in), io_dtype),
+        weight:   T.Tensor((KH, KW, C_in, F), io_dtype),
         state:    T.Tensor((B, OH, OW, F), T.float32),
         bn_scale: T.Tensor((F,), T.float32),
         bn_bias:  T.Tensor((F,), T.float32),
-        residual: T.Tensor((TB, OH, OW, F), T.float16),
-        output:   T.Tensor((TB, OH, OW, F), T.float16),
+        residual: T.Tensor((TB, OH, OW, F), io_dtype),
+        output:   T.Tensor((TB, OH, OW, F), io_dtype),
     ):
         with T.Kernel(
             T.ceildiv(F, block_N), T.ceildiv(M, block_M),
             threads=threads,
         ) as (bx, by):
-            data_shared   = T.alloc_shared((block_M, block_K), T.float16)
-            weight_shared = T.alloc_shared((block_K, block_N), T.float16)
+            data_shared   = T.alloc_shared((block_M, block_K), io_dtype)
+            weight_shared = T.alloc_shared((block_K, block_N), io_dtype)
             acc           = T.alloc_fragment((block_M, block_N), T.float32)
 
-            weight_flat   = T.Tensor((K_red, F), T.float16, weight.data)
-            output_flat   = T.Tensor((M, F), T.float16, output.data)
-            residual_flat = T.Tensor((M, F), T.float16, residual.data)
+            weight_flat   = T.Tensor((K_red, F), io_dtype, weight.data)
+            output_flat   = T.Tensor((M, F), io_dtype, output.data)
+            residual_flat = T.Tensor((M, F), io_dtype, residual.data)
             state_flat    = T.Tensor((B * OH * OW, F), T.float32, state.data)
 
             T.clear(acc)
@@ -872,7 +881,7 @@ def conv2d_bn_if_add_t4_kernel(
                         data_shared[i, j] = T.if_then_else(
                             in_bound,
                             data[n_idx, access_h, access_w, cin],
-                            T.float16(0),
+                            io_dtype(0),
                         )
 
                 T.copy(weight_flat[k_iter * block_K, bx * block_N],
@@ -880,7 +889,7 @@ def conv2d_bn_if_add_t4_kernel(
                 T.gemm(data_shared, weight_shared, acc)
 
             # BN + IF + Residual Add epilogue
-            out_shared = T.alloc_shared((block_M, block_N), T.float16)
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
                 f = bx * block_N + j
@@ -895,8 +904,119 @@ def conv2d_bn_if_add_t4_kernel(
                     state_flat[s_idx, f] = v_new
                     # Fused residual add
                     res_val = T.cast(residual_flat[m, f], T.float32)
-                    out_shared[i, j] = T.cast(spike + res_val, T.float16)
+                    out_shared[i, j] = T.cast(spike + res_val, io_dtype)
 
             T.copy(out_shared, output_flat[by * block_M, bx * block_N])
+
+    return main
+
+
+# ---------------------------------------------------------------------------
+# Kernel: Conv3x3+BN+IF interleaved — per-CTA T-loop with im2col
+# ---------------------------------------------------------------------------
+
+@tilelang.jit(out_idx=[-1])
+def conv2d_bn_if_interleaved_kernel(
+    B, C_in, H, W, F, K, S, D, P, T_steps,
+    block_M, block_N, block_K, num_stages, threads,
+    v_threshold=1.0, v_reset=0.0,
+    io_dtype=T.float16,
+):
+    """Interleaved Conv3x3+BN+IF with per-CTA T-loop.
+
+    Same architecture as conv1x1_bn_if_interleaved_kernel but with im2col
+    gather for KxK convolutions. Grid covers B*OH*OW spatial positions,
+    each CTA loops over T timesteps internally.
+
+    Membrane state persists in fragment across T iterations — no cross-CTA race.
+    """
+    KH = KW = K
+    OH = (H + 2 * P - D * (K - 1) - 1) // S + 1
+    OW = (W + 2 * P - D * (K - 1) - 1) // S + 1
+    M_per_t = B * OH * OW
+    K_red = KH * KW * C_in
+    TB = T_steps * B
+
+    @T.prim_func
+    def main(
+        data:     T.Tensor((TB, H, W, C_in), io_dtype),
+        weight:   T.Tensor((KH, KW, C_in, F), io_dtype),
+        state:    T.Tensor((M_per_t, F), T.float32),
+        bn_scale: T.Tensor((F,), T.float32),
+        bn_bias:  T.Tensor((F,), T.float32),
+        spikes:   T.Tensor((TB, OH, OW, F), io_dtype),
+    ):
+        weight_flat = T.Tensor((K_red, F), io_dtype, weight.data)
+        spikes_flat = T.Tensor((TB * OH * OW, F), io_dtype, spikes.data)
+
+        with T.Kernel(
+            T.ceildiv(F, block_N), T.ceildiv(M_per_t, block_M),
+            threads=threads,
+        ) as (bx, by):
+            data_shared   = T.alloc_shared((block_M, block_K), io_dtype)
+            weight_shared = T.alloc_shared((block_K, block_N), io_dtype)
+            acc           = T.alloc_fragment((block_M, block_N), T.float32)
+            mem_frag      = T.alloc_fragment((block_M, block_N), T.float32)
+            out_shared    = T.alloc_shared((block_M, block_N), io_dtype)
+
+            # Load initial membrane
+            for i, j in T.Parallel(block_M, block_N):
+                m = by * block_M + i
+                f = bx * block_N + j
+                if m < M_per_t and f < F:
+                    mem_frag[i, j] = state[m, f]
+                else:
+                    mem_frag[i, j] = T.float32(0)
+
+            for t in range(T_steps):
+                # Conv+BN GEMM with im2col for timestep t
+                T.clear(acc)
+                for k_iter in T.Pipelined(
+                    T.ceildiv(K_red, block_K), num_stages=num_stages,
+                ):
+                    for i, j in T.Parallel(block_M, block_K):
+                        k = k_iter * block_K + j
+                        m = by * block_M + i
+                        n_idx = t * B + m // (OH * OW)
+                        hw = m % (OH * OW)
+                        oh = hw // OW
+                        ow = hw % OW
+                        kh = k // (KW * C_in)
+                        kw = (k // C_in) % KW
+                        cin = k % C_in
+                        ih = oh * S + kh * D - P
+                        iw = ow * S + kw * D - P
+                        ib = ((ih >= 0) and (iw >= 0) and (ih < H) and (iw < W)
+                              and (m < M_per_t) and (k < K_red))
+                        data_shared[i, j] = T.if_then_else(
+                            ib, data[n_idx, ih, iw, cin], io_dtype(0))
+
+                    T.copy(weight_flat[k_iter * block_K, bx * block_N],
+                           weight_shared)
+                    T.gemm(data_shared, weight_shared, acc)
+
+                # BN + IF epilogue
+                for i, j in T.Parallel(block_M, block_N):
+                    m = by * block_M + i
+                    f = bx * block_N + j
+                    if m < M_per_t and f < F:
+                        bn_out = acc[i, j] * bn_scale[f] + bn_bias[f]
+                        h = mem_frag[i, j] + bn_out
+                        spike = T.if_then_else(
+                            h >= T.float32(v_threshold),
+                            T.float32(1), T.float32(0))
+                        mem_frag[i, j] = (T.float32(1) - spike) * h + \
+                                          spike * T.float32(v_reset)
+                        out_shared[i, j] = T.cast(spike, io_dtype)
+
+                T.copy(out_shared,
+                       spikes_flat[t * M_per_t + by * block_M, bx * block_N])
+
+            # Write final membrane
+            for i, j in T.Parallel(block_M, block_N):
+                m = by * block_M + i
+                f = bx * block_N + j
+                if m < M_per_t and f < F:
+                    state[m, f] = mem_frag[i, j]
 
     return main

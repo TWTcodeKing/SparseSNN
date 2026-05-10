@@ -12,63 +12,11 @@ Input: (B, T, C, H, W) for DVS or (B, C, H, W) for static images.
 Output: (B, num_classes) logits.
 """
 
-import math
-
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from models.layers import SeqToANNContainer
-from models.neurons import heaviside
-
-
-# ── Parametric LIF neuron (same as dvs_sewresnet.py) ──────────────────────
-
-class PLIFNeuron(nn.Module):
-    """Multi-step Parametric LIF neuron with learnable decay.
-
-    Parameterization (matches spikingjelly):
-        reciprocal_tau = sigmoid(w)
-        v[t] = v[t-1] + reciprocal_tau * (x[t] - v[t-1])
-        spike = Heaviside(v - v_threshold)
-
-    Input/Output: (T, B, C, ...) binary spikes.
-    """
-
-    def __init__(self, init_tau=2.0, v_threshold=1.0, v_reset=0.0,
-                 surrogate='atan', detach_reset=True):
-        super().__init__()
-        init_w = -math.log(init_tau - 1.0)
-        self.w = nn.Parameter(torch.tensor([init_w]))
-        self.v_threshold = v_threshold
-        self.v_reset = v_reset
-        self.surrogate = surrogate
-        self.detach_reset = detach_reset
-        self.v = 0.0
-
-    def reset(self):
-        self.v = 0.0
-
-    def _step(self, x):
-        if isinstance(self.v, float):
-            self.v = torch.zeros_like(x)
-        reciprocal_tau = self.w.sigmoid()
-        self.v = self.v + reciprocal_tau * (x - self.v)
-        spike = heaviside(self.v - self.v_threshold, self.surrogate)
-        spike_d = spike.detach() if self.detach_reset else spike
-        if self.v_reset is None:
-            self.v = self.v - spike_d * self.v_threshold
-        else:
-            self.v = (1.0 - spike_d) * self.v + spike_d * self.v_reset
-        return spike
-
-    def forward(self, x_seq):
-        """x_seq: (T, B, C, ...) → (T, B, C, ...) spikes"""
-        self.reset()
-        spikes = []
-        for t in range(x_seq.shape[0]):
-            spikes.append(self._step(x_seq[t]))
-        return torch.stack(spikes, dim=0)
+from models.neurons import MultiStepLIFNeuron
 
 
 # ── VGG feature configs ───────────────────────────────────────────────────
@@ -92,7 +40,7 @@ VGG_CFGS = {
 # ── Feature extractor builder ─────────────────────────────────────────────
 
 def _make_features(cfg_list, in_channels, init_tau=2.0):
-    """Build VGG feature layers: Conv+BN+PLIF blocks with MaxPool."""
+    """Build VGG feature layers: Conv+BN+LIF blocks with MaxPool."""
     layers = []
     ch = in_channels
     for v in cfg_list:
@@ -105,7 +53,7 @@ def _make_features(cfg_list, in_channels, init_tau=2.0):
                         nn.Conv2d(ch, v, 3, padding=1, bias=False),
                         nn.BatchNorm2d(v),
                     ),
-                    PLIFNeuron(init_tau=init_tau, detach_reset=True),
+                    MultiStepLIFNeuron(tau=init_tau, detach_reset=True),
                 )
             )
             ch = v

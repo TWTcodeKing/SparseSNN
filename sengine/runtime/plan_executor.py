@@ -16,7 +16,7 @@ import torch
 
 from sengine.build.buffer_planner import ExecutionPlan, NodeExecPlan, BufferDesc
 from sengine.runtime.cpp_executor import CppExecutor
-from sengine.ir import EngineIR
+from sengine.ir import EngineIR, OpType
 from sengine.logger import logger
 
 
@@ -143,6 +143,37 @@ def setup_executor_from_plan(
                 b_ptr = p(node_plan.input_bufs[1])
                 out_ptr = p(node_plan.output_buf)
                 exe.set_tilelang_3(nid, tl_idx, a_ptr, b_ptr, out_ptr)
+            elif tl_idx >= 0 and len(node_plan.input_bufs) == 1:
+                # Missing second input — likely a MatMul whose weight comes
+                # through a ZeroCost Transpose. Resolve from ir.weights.
+                a_ptr = p(node_plan.input_bufs[0])
+                out_ptr = p(node_plan.output_buf)
+                node = ir.nodes.get(nid)
+                b_ptr = 0
+                if node:
+                    import numpy as np
+                    for pid in ir.predecessors(nid):
+                        pn = ir.nodes.get(pid)
+                        if pn and pn.op_type == OpType.Transpose:
+                            perm = pn.extra_attrs.get("perm")
+                            for iname in pn.input_names:
+                                w = ir.weights.get(iname)
+                                if w is not None:
+                                    _w_dtype = torch.float32 if ir.precision == "fp32" else torch.float16
+                                    wt = torch.from_numpy(w.copy()).to(_w_dtype).cuda() if isinstance(w, np.ndarray) else w.to(_w_dtype).cuda()
+                                    if perm and len(perm) == wt.ndim:
+                                        wt = wt.permute(*perm).contiguous()
+                                    # Store on a keep-alive list (NOT in activations —
+                                    # the ZeroCost dispatch would double-transpose it)
+                                    if not hasattr(py_engine, '_weight_keepalive'):
+                                        py_engine._weight_keepalive = []
+                                    py_engine._weight_keepalive.append(wt)
+                                    b_ptr = wt.data_ptr()
+                                    break
+                if b_ptr:
+                    exe.set_tilelang_3(nid, tl_idx, a_ptr, b_ptr, out_ptr)
+                else:
+                    exe.set_skip_node(nid)
             else:
                 exe.set_skip_node(nid)
 

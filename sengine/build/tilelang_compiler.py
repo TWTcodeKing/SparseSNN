@@ -183,8 +183,11 @@ def _pick_interleaved_config(M: int, K_red: int, F: int,
                 num_stages=2, threads=128)
 
 
-def _pick_config(M: int, K_red: int, F: int) -> dict:
+def _pick_config(M: int, K_red: int, F: int, bpe: int = 2) -> dict:
     """Pick a reasonable default tile config for a GEMM problem.
+
+    Args:
+        bpe: bytes per element (2 for fp16, 4 for fp32).
 
     Returns dict with block_M, block_N, block_K, num_stages, threads.
     """
@@ -199,6 +202,18 @@ def _pick_config(M: int, K_red: int, F: int) -> dict:
     bk = min(32, K_red) if K_red > 0 else 32
     ns = 2
     thr = 128
+
+    # FP32: TileLang can't generate float32xN vector types for N>8.
+    # Cap tile sizes so each thread copies at most 8 elements per shared tile.
+    # data_shared = (bm, bk): max vectorization = bm*bk/thr
+    # weight_shared = (bk, bn): max vectorization = bk*bn/thr
+    if bpe == 4:
+        while (bm * bk // thr > 8 or bn * bk // thr > 8) and bn > 32:
+            bn //= 2
+        while bm * bk // thr > 8 and bm > 16:
+            bm //= 2
+        while bm * bk // thr > 8 and bk > 16:
+            bk //= 2
 
     return dict(block_M=bm, block_N=bn, block_K=bk, num_stages=ns, threads=thr)
 
@@ -1061,37 +1076,54 @@ class TileLangCompiler:
             from sengine.kernels.fused_attention_kernels import (
                 dssa_kTq_kernel, dssa_v_attn_kernel)
 
+            C_full = heads * hd
             key1 = f"dssa_kTq_{TB}_{heads}_{hd}_{spatial_kv}_{spatial_q}_{self.precision}"
             key2 = f"dssa_v_attn_{TB}_{heads}_{hd}_{spatial_kv}_{spatial_q}_{H}x{W}_{self.precision}"
 
             gemm1 = self._kernel_cache.get(key1)
             if gemm1 is None:
-                cfg1 = self._resolve_config(key1, spatial_kv, hd, spatial_q)
-                try:
-                    gemm1 = dssa_kTq_kernel(
+                def _compile_g1(cfg):
+                    return dssa_kTq_kernel(
                         TB=TB, heads=heads, hd=hd,
                         spatial_kv=spatial_kv, spatial_q=spatial_q,
                         io_dtype=self.io_dtype_tl,
-                        **{k: cfg1[k] for k in ('block_M', 'block_N', 'block_K',
+                        **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K',
                                                  'num_stages', 'threads')})
+                _profile_g1 = (
+                    torch.empty(TB * spatial_kv, 2 * C_full, dtype=self.io_dtype_torch, device='cuda'),
+                    torch.empty(TB * spatial_q, C_full, dtype=self.io_dtype_torch, device='cuda'),
+                )
+                cfg1 = self._resolve_config(key1, spatial_kv, hd, spatial_q,
+                                            compile_fn=_compile_g1, profile_args=_profile_g1)
+                try:
+                    gemm1 = _compile_g1(cfg1)
                 except Exception:
                     gemm1 = None
                 self._kernel_cache[key1] = gemm1
+                self._config_cache[key1] = cfg1
 
             gemm2 = self._kernel_cache.get(key2)
             if gemm2 is None:
-                cfg2 = self._resolve_config(key2, hd, spatial_kv, spatial_q)
-                try:
-                    gemm2 = dssa_v_attn_kernel(
+                def _compile_g2(cfg):
+                    return dssa_v_attn_kernel(
                         TB=TB, heads=heads, hd=hd,
                         spatial_kv=spatial_kv, spatial_q=spatial_q,
                         H_out=H, W_out=W,
                         io_dtype=self.io_dtype_tl,
-                        **{k: cfg2[k] for k in ('block_M', 'block_N', 'block_K',
+                        **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K',
                                                  'num_stages', 'threads')})
+                _profile_g2 = (
+                    torch.empty(TB * spatial_kv, 2 * C_full, dtype=self.io_dtype_torch, device='cuda'),
+                    torch.empty(batch * spatial_kv, spatial_q, dtype=self.io_dtype_torch, device='cuda'),
+                )
+                cfg2 = self._resolve_config(key2, hd, spatial_kv, spatial_q,
+                                            compile_fn=_compile_g2, profile_args=_profile_g2)
+                try:
+                    gemm2 = _compile_g2(cfg2)
                 except Exception:
                     gemm2 = None
                 self._kernel_cache[key2] = gemm2
+                self._config_cache[key2] = cfg2
 
         else:
             # TokenQK: no matmul, handled by Python runtime
@@ -1115,9 +1147,12 @@ class TileLangCompiler:
         logger.debug("  DWConv+BN %d %dx%d s=%d",
                      cp.in_channels, H, W, cp.stride_h)
 
+        # FP32: cap block_HW so vectorization stays within float32x8
+        block_HW = 64 if self.precision == 'fp32' else 128
         kern = dwconv_bn_kernel(
             TB=self.TB, C=cp.in_channels, H=H, W=W,
             K=cp.kernel_h, S=cp.stride_h, P=cp.pad_h,
+            block_HW=block_HW,
             io_dtype=self.io_dtype_tl)
 
         self._kernel_cache[key] = kern
@@ -1135,9 +1170,11 @@ class TileLangCompiler:
         logger.debug("  DWConv+BN+IF %d %dx%d s=%d",
                      cp.in_channels, H, W, cp.stride_h)
 
+        block_HW = 64 if self.precision == 'fp32' else 128
         kern = dwconv_bn_if_kernel(
             TB=self.B, C=cp.in_channels, H=H, W=W,
             K=cp.kernel_h, S=cp.stride_h, P=cp.pad_h,
+            block_HW=block_HW,
             T_steps=1,
             io_dtype=self.io_dtype_tl)
 
@@ -1236,12 +1273,10 @@ class TileLangCompiler:
         OW = (W + 2 * cp.pad_w - cp.dilation_w * (cp.kernel_w - 1) - 1) // cp.stride_w + 1
         M = self.TB * OH * OW
 
-        cfg = self._resolve_config(key, M, K_red, C_out_per_g)
-
         from sengine.kernels.grouped_conv_bn import grouped_conv_bn_kernel
 
-        try:
-            kern = grouped_conv_bn_kernel(
+        def _compile(cfg):
+            return grouped_conv_bn_kernel(
                 TB=self.TB, C_in=cp.in_channels, H=H, W=W,
                 C_out=cp.out_channels, K=cp.kernel_h,
                 S=cp.stride_h, D=cp.dilation_h, P=cp.pad_h,
@@ -1249,12 +1284,24 @@ class TileLangCompiler:
                 io_dtype=self.io_dtype_tl,
                 **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K',
                                         'num_stages', 'threads')})
+        _profile_args = (
+            torch.empty(self.TB, H, W, cp.in_channels, dtype=self.io_dtype_torch, device='cuda'),
+            torch.empty(cp.kernel_h, cp.kernel_w, C_in_per_g, cp.out_channels, dtype=self.io_dtype_torch, device='cuda'),
+            torch.ones(cp.out_channels, dtype=torch.float32, device='cuda'),
+            torch.zeros(cp.out_channels, dtype=torch.float32, device='cuda'),
+        )
+        cfg = self._resolve_config(key, M, K_red, C_out_per_g,
+                                    compile_fn=_compile, profile_args=_profile_args)
+
+        try:
+            kern = _compile(cfg)
         except Exception:
             kern = None
 
         self._kernel_cache[key] = kern
         self._config_cache[key] = cfg
         node.tilelang_config = cfg
+        node.est_latency_us = cfg.get('latency_us', 0.0)
         return kern, kern is not None
 
     # ─── Helpers ───
@@ -1315,7 +1362,8 @@ class TileLangCompiler:
     def _resolve_config(self, key: str, M: int, K_red: int, F: int,
                         compile_fn=None, profile_args=None,
                         interleaved: bool = False,
-                        n_membranes: int = 1) -> dict:
+                        n_membranes: int = 1,
+                        bpe: int = 0) -> dict:
         """Get tile config from cache, autotune, or heuristic.
 
         Priority: cache hit → autotune (if enabled) → heuristic default.
@@ -1343,19 +1391,22 @@ class TileLangCompiler:
             T_steps = self.T if interleaved else 1
             logger.debug("  Roofline tuning %s (M=%d, K=%d, F=%d, T=%d)...",
                          key, M, K_red, F, T_steps)
+            _bpe = bpe if bpe > 0 else (4 if self.precision == 'fp32' else 2)
             cfg = select_config_roofline(
                 M, K_red, F, T_steps,
                 compile_fn=compile_fn,
                 profile_args=profile_args,
                 n_membranes=n_membranes,
-                top_k=5, n_profile=100)
+                top_k=5, n_profile=100,
+                bpe=_bpe)
             if self.tuning_cache:
                 self.tuning_cache.put(key, gpu_name, cfg, gpu_arch, self.T, self.B)
             return cfg
 
         # No autotuning: use heuristic default
+        _bpe = bpe if bpe > 0 else (4 if self.precision == 'fp32' else 2)
         if interleaved:
             return _pick_interleaved_config(M, K_red, F,
                                              sm_count=hw['sm_count'],
                                              n_membranes=n_membranes)
-        return _pick_config(M, K_red, F)
+        return _pick_config(M, K_red, F, bpe=_bpe)

@@ -346,6 +346,44 @@ __global__ void naive_conv2d_bn_nhwc_kernel(
     output[idx] = __float2half(sum);
 }
 
+__global__ void naive_conv2d_bn_fp32_kernel(
+    const float* __restrict__ input, const float* __restrict__ weight,
+    const float* __restrict__ bn_scale, const float* __restrict__ bn_bias,
+    float* __restrict__ output,
+    int N, int H, int W, int C_in, int C_out,
+    int KH, int KW, int stride, int pad, int OH, int OW, int groups
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * OH * OW * C_out;
+    if (idx >= total) return;
+    int co = idx % C_out;
+    int rem = idx / C_out;
+    int ow = rem % OW;
+    rem = rem / OW;
+    int oh = rem % OH;
+    int n = rem / OH;
+    int C_in_per_g = C_in / groups;
+    int C_out_per_g = C_out / groups;
+    int g = co / C_out_per_g;
+    int ci_start = g * C_in_per_g;
+    float sum = 0.0f;
+    for (int kh = 0; kh < KH; kh++) {
+        int ih = oh * stride - pad + kh;
+        if (ih < 0 || ih >= H) continue;
+        for (int kw = 0; kw < KW; kw++) {
+            int iw = ow * stride - pad + kw;
+            if (iw < 0 || iw >= W) continue;
+            for (int ci_local = 0; ci_local < C_in_per_g; ci_local++) {
+                int ci = ci_start + ci_local;
+                sum += input[((n * H + ih) * W + iw) * C_in + ci]
+                     * weight[((kh * KW + kw) * C_in_per_g + ci_local) * C_out + co];
+            }
+        }
+    }
+    sum = sum * bn_scale[co] + bn_bias[co];
+    output[idx] = sum;
+}
+
 // Layout Transpose: NHWC↔NCHW
 // direction=0: NHWC(N,H,W,C) → NCHW(N,C,H,W)
 // direction=1: NCHW(N,C,H,W) → NHWC(N,H,W,C)
@@ -979,11 +1017,18 @@ void sengine_execute(SEngineExecutor* e) {
         case KT_NAIVE_CONV: {
             int total = nd.nc_N * nd.nc_OH * nd.nc_OW * nd.nc_Cout;
             int thr = 256, blk = (total + thr - 1) / thr;
-            naive_conv2d_bn_nhwc_kernel<<<blk, thr, 0, s>>>(
-                nd.nc_in, nd.nc_w, nd.nc_sc, nd.nc_bi, nd.nc_out,
-                nd.nc_N, nd.nc_H, nd.nc_W, nd.nc_Cin, nd.nc_Cout,
-                nd.nc_KH, nd.nc_KW, nd.nc_stride, nd.nc_pad, nd.nc_OH, nd.nc_OW,
-                nd.nc_groups);
+            if (e->is_fp32)
+                naive_conv2d_bn_fp32_kernel<<<blk, thr, 0, s>>>(
+                    (float*)nd.nc_in, (float*)nd.nc_w, nd.nc_sc, nd.nc_bi, (float*)nd.nc_out,
+                    nd.nc_N, nd.nc_H, nd.nc_W, nd.nc_Cin, nd.nc_Cout,
+                    nd.nc_KH, nd.nc_KW, nd.nc_stride, nd.nc_pad, nd.nc_OH, nd.nc_OW,
+                    nd.nc_groups);
+            else
+                naive_conv2d_bn_nhwc_kernel<<<blk, thr, 0, s>>>(
+                    nd.nc_in, nd.nc_w, nd.nc_sc, nd.nc_bi, nd.nc_out,
+                    nd.nc_N, nd.nc_H, nd.nc_W, nd.nc_Cin, nd.nc_Cout,
+                    nd.nc_KH, nd.nc_KW, nd.nc_stride, nd.nc_pad, nd.nc_OH, nd.nc_OW,
+                    nd.nc_groups);
             break;
         }
         case KT_LAYOUT_TRANSPOSE: {

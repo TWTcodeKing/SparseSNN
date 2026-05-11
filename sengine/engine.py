@@ -420,7 +420,8 @@ class SEngine:
         if ws_total <= 0:
             exe.set_skip_node(nid); return
 
-        workspace = torch.empty(ws_total, dtype=torch.float16, device='cuda')
+        _ws_dtype = torch.float32 if getattr(self, '_precision', 'fp16') == 'fp32' else torch.float16
+        workspace = torch.empty(ws_total, dtype=_ws_dtype, device='cuda')
         self._attn_workspaces = getattr(self, '_attn_workspaces', [])
         self._attn_workspaces.append(workspace)
 
@@ -442,7 +443,7 @@ class SEngine:
                         if attr == '_dssa_s1': s1_ptr = st.data_ptr()
                         else: s2_ptr = st.data_ptr()
             lif_total = gemm1_size
-            lif_spatial = gemm1_size // 4
+            lif_spatial = mem.numel() if mem is not None else (gemm1_size // self.T)
 
         exe.set_fused_attn_node(
             nid, variant, gemm1_idx, gemm2_idx,

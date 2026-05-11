@@ -27,7 +27,7 @@ from sengine.logger import logger
 
 
 def generate_recommendations(onnx_path: str, T: int, batch_size: int,
-                              output_path: str):
+                              output_path: str, precision: str = "fp16"):
     """Profile each fusible shape and output recommendations.
 
     For each unique fused shape: compile both interleaved and decomposed,
@@ -43,6 +43,12 @@ def generate_recommendations(onnx_path: str, T: int, batch_size: int,
             if nvcc_bin not in os.environ.get('PATH', ''):
                 os.environ['PATH'] = nvcc_bin + ':' + os.environ.get('PATH', '')
             break
+
+    import torch
+    io_torch_dtype = torch.float32 if precision == "fp32" else torch.float16
+    bpe = 4 if precision == "fp32" else 2
+    import tilelang.language as _TL
+    io_dtype_tl = _TL.float32 if precision == "fp32" else _TL.float16
 
     # Disable TileLang disk cache during validation — the validator profiles
     # many tile configs per shape. Caching them would pollute the engine
@@ -153,12 +159,12 @@ def generate_recommendations(onnx_path: str, T: int, batch_size: int,
 
         # Allocate all tensors on the pinned device
         torch.cuda.set_device(_device_id)
-        data = torch.randn(TB, H, W, C_in, dtype=torch.float16, device=_device)
+        data = torch.randn(TB, H, W, C_in, dtype=io_torch_dtype, device=_device)
         if is_1x1 or is_matmul:
-            w = torch.randn(C_in, C_out, dtype=torch.float16, device=_device)
+            w = torch.randn(C_in, C_out, dtype=io_torch_dtype, device=_device)
         else:
             w = torch.randn(cp.kernel_h, cp.kernel_w, C_in, C_out,
-                            dtype=torch.float16, device=_device)
+                            dtype=io_torch_dtype, device=_device)
         bn_s = torch.ones(C_out, dtype=torch.float32, device=_device)
         bn_b = torch.zeros(C_out, dtype=torch.float32, device=_device)
         st = torch.zeros(M_per_t, C_out, dtype=torch.float32, device=_device)
@@ -170,13 +176,13 @@ def generate_recommendations(onnx_path: str, T: int, batch_size: int,
                 from sengine.kernels.interleaved_templates import conv1x1_bn_lif
                 def _compile_fused(cfg):
                     return conv1x1_bn_lif(B=batch_size, C_in=C_in, H=H, W=W,
-                                          F=C_out, T_steps=T, S=fused_S, recip_tau=recip_tau,
+                                          F=C_out, T_steps=T, io_dtype=io_dtype_tl, S=fused_S, recip_tau=recip_tau,
                                           **{k: cfg[k] for k in ('block_M','block_N','block_K','num_stages','threads')})
             else:
                 from sengine.kernels.interleaved_templates import conv1x1_bn_if
                 def _compile_fused(cfg):
                     return conv1x1_bn_if(B=batch_size, C_in=C_in, H=H, W=W,
-                                          F=C_out, T_steps=T, S=fused_S,
+                                          F=C_out, T_steps=T, io_dtype=io_dtype_tl, S=fused_S,
                                           **{k: cfg[k] for k in ('block_M','block_N','block_K','num_stages','threads')})
         else:
             from sengine.kernels.conv2d_bn_if_t4 import conv2d_bn_if_interleaved_kernel
@@ -184,12 +190,13 @@ def generate_recommendations(onnx_path: str, T: int, batch_size: int,
                 return conv2d_bn_if_interleaved_kernel(
                     B=batch_size, C_in=C_in, H=H, W=W, F=C_out,
                     T_steps=T, K=cp.kernel_h, S=cp.stride_h, D=cp.dilation_h, P=cp.pad_h,
+                    io_dtype=io_dtype_tl,
                     **{k: cfg[k] for k in ('block_M','block_N','block_K','num_stages','threads')})
 
         fused_cfg = select_config_roofline(M_per_t, K_red, C_out, T,
                                            compile_fn=_compile_fused,
                                            profile_args=(data, w, st, bn_s, bn_b),
-                                           top_k=5, n_profile=100)
+                                           top_k=5, n_profile=100, bpe=bpe)
         torch.cuda.set_device(_device_id)  # restore after TileLang compilation
         fused_kern = _compile_fused(fused_cfg)
         fused_us = _profile(fused_kern, (data, w, st, bn_s, bn_b), reset_fn=st.zero_)
@@ -200,21 +207,21 @@ def generate_recommendations(onnx_path: str, T: int, batch_size: int,
             from sengine.kernels.conv2d_bn_if_t4 import conv1x1_bn_t4_kernel
             def _compile_decomp(cfg):
                 return conv1x1_bn_t4_kernel(TB=TB, C_in=C_in, H=H, W=W,
-                                             F=C_out, S=decomp_S,
+                                             F=C_out, S=decomp_S, io_dtype=io_dtype_tl,
                                              **{k: cfg[k] for k in ('block_M','block_N','block_K','num_stages','threads')})
         else:
             from sengine.kernels.conv2d_bn_if_t4 import conv2d_bn_t4_kernel
             def _compile_decomp(cfg):
                 return conv2d_bn_t4_kernel(TB=TB, C_in=C_in, H=H, W=W,
                                             F=C_out, K=cp.kernel_h, S=cp.stride_h,
-                                            D=cp.dilation_h, P=cp.pad_h,
+                                            D=cp.dilation_h, P=cp.pad_h, io_dtype=io_dtype_tl,
                                             **{k: cfg[k] for k in ('block_M','block_N','block_K','num_stages','threads')})
 
         M_decomp = TB * OH * OW
         decomp_cfg = select_config_roofline(M_decomp, K_red, C_out, 1,
                                              compile_fn=_compile_decomp,
                                              profile_args=(data, w, bn_s, bn_b),
-                                             top_k=3, n_profile=100)
+                                             top_k=3, n_profile=100, bpe=bpe)
         torch.cuda.set_device(_device_id)  # restore after TileLang compilation
         decomp_kern = _compile_decomp(decomp_cfg)
         decomp_conv_us = _profile(decomp_kern, (data, w, bn_s, bn_b))
@@ -222,7 +229,7 @@ def generate_recommendations(onnx_path: str, T: int, batch_size: int,
         # Profile native C++ IF/LIF
         total_elems = TB * OH * OW * C_out
         spatial_elems = M_per_t * C_out
-        if_in = torch.randn(TB, OH, OW, C_out, dtype=torch.float16, device=_device)
+        if_in = torch.randn(TB, OH, OW, C_out, dtype=io_torch_dtype, device=_device)
         if_out = torch.zeros_like(if_in)
         if_mem = torch.zeros(M_per_t, C_out, dtype=torch.float32, device=_device)
         exe_if = CppExecutor()

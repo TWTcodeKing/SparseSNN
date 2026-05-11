@@ -40,15 +40,19 @@ def _detect_gpu():
 
 # ─── Shared memory and occupancy ───
 
-def _smem_bytes(bM, bN, bK, ns):
-    """Shared memory for pipelined GEMM + output staging."""
-    return (bM * bK + bK * bN) * 2 * ns + bM * bN * 2
+def _smem_bytes(bM, bN, bK, ns, bpe=2):
+    """Shared memory for pipelined GEMM + output staging.
+
+    Args:
+        bpe: bytes per element (2 for fp16, 4 for fp32).
+    """
+    return (bM * bK + bK * bN) * bpe * ns + bM * bN * bpe
 
 
-def _occupancy(bM, bN, bK, ns, thr, n_membranes=1):
+def _occupancy(bM, bN, bK, ns, thr, n_membranes=1, bpe=2):
     """Estimate max CTAs per SM."""
     hw = _detect_gpu()
-    smem = _smem_bytes(bM, bN, bK, ns)
+    smem = _smem_bytes(bM, bN, bK, ns, bpe)
     elems = (bM * bN) // thr
     regs = elems * (1 + n_membranes) + 10
     by_smem = hw['max_smem_per_sm'] // max(smem, 1)
@@ -59,14 +63,19 @@ def _occupancy(bM, bN, bK, ns, thr, n_membranes=1):
 
 # ─── Roofline classification ───
 
-def classify_shape(M_per_t, K, N, T_steps):
-    """Classify an interleaved GEMM as compute-bound or memory-bound."""
+def classify_shape(M_per_t, K, N, T_steps, bpe=2):
+    """Classify an interleaved GEMM as compute-bound or memory-bound.
+
+    Args:
+        bpe: bytes per element for data/weight I/O (2 for fp16, 4 for fp32).
+             Membrane is always fp32 (4 bytes).
+    """
     hw = _detect_gpu()
     flops = 2.0 * M_per_t * K * N * T_steps
-    data_bytes = M_per_t * K * 2 * T_steps
-    weight_bytes = K * N * 2
-    output_bytes = M_per_t * N * 2 * T_steps
-    membrane_bytes = M_per_t * N * 4 * 2
+    data_bytes = M_per_t * K * bpe * T_steps
+    weight_bytes = K * N * bpe
+    output_bytes = M_per_t * N * bpe * T_steps
+    membrane_bytes = M_per_t * N * 4 * 2  # always fp32
     total_bytes = data_bytes + weight_bytes + output_bytes + membrane_bytes
 
     ai = flops / total_bytes
@@ -77,27 +86,38 @@ def classify_shape(M_per_t, K, N, T_steps):
 
 # ─── Candidate pruning ───
 
-def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5):
-    """Generate top-K tile config candidates using roofline classification."""
+def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
+    """Generate top-K tile config candidates using roofline classification.
+
+    Args:
+        bpe: bytes per element (2 for fp16, 4 for fp32).
+    """
     hw = _detect_gpu()
-    bound, ai, _ = classify_shape(M_per_t, K, N, T_steps)
+    bound, ai, _ = classify_shape(M_per_t, K, N, T_steps, bpe)
     sm_count = hw['sm_count']
 
     all_cfgs = []
+    # FP32 can't vectorize as wide as FP16 — TileLang's T.copy() generates
+    # float32xN vector types that CUDA doesn't support when N>8.
+    # Constraint: bM * bK / threads <= 8 for fp32 (and bN * bK / threads too).
+    bK_choices = [32, 64] if bpe == 2 else [32]
     for bM in [16, 32, 64, 128]:
         for bN in [32, 64, 128]:
-            for bK in [32, 64]:
+            for bK in bK_choices:
                 if bK > K:
                     continue
                 for ns in [2, 3]:
                     thr = 128
-                    smem = _smem_bytes(bM, bN, bK, ns)
+                    # FP32: skip configs where T.copy vectorization exceeds float32x8
+                    if bpe == 4 and (bM * bK // thr > 8 or bN * bK // thr > 8):
+                        continue
+                    smem = _smem_bytes(bM, bN, bK, ns, bpe)
                     if smem > hw['max_smem_per_sm']:
                         continue
                     grid = math.ceil(M_per_t / bM) * math.ceil(N / bN)
                     if grid < sm_count // 8:
                         continue
-                    occ = _occupancy(bM, bN, bK, ns, thr, n_membranes)
+                    occ = _occupancy(bM, bN, bK, ns, thr, n_membranes, bpe)
                     tile_area = bM * bN
                     cfg = dict(block_M=bM, block_N=bN, block_K=bK,
                                num_stages=ns, threads=thr)
@@ -153,7 +173,8 @@ def select_config_roofline(M_per_t, K, N, T_steps,
                             compile_fn, profile_args,
                             n_membranes=1, top_k=5,
                             n_profile=100,
-                            compile_timeout=10.0):
+                            compile_timeout=10.0,
+                            bpe=2):
     """Select best config using roofline pruning + GPU profiling.
 
     Args:
@@ -167,12 +188,14 @@ def select_config_roofline(M_per_t, K, N, T_steps,
         top_k: Max candidates to profile.
         n_profile: Profiling iterations per candidate.
         compile_timeout: Skip configs that take longer to compile (seconds).
+        bpe: bytes per element (2 for fp16, 4 for fp32).
 
     Returns:
         dict with block_M, block_N, block_K, num_stages, threads, latency_us.
     """
     candidates = prune_candidates(M_per_t, K, N, T_steps,
-                                   n_membranes=n_membranes, top_k=top_k)
+                                   n_membranes=n_membranes, top_k=top_k,
+                                   bpe=bpe)
 
     best_us = float('inf')
     best_cfg = candidates[0] if candidates else dict(

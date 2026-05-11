@@ -85,13 +85,15 @@ class CUDAGraphEngine:
         self._allocate_membranes()
         self._allocate_activations()
 
-        # Load CUDA IF/LIF extension if any neuron nodes exist
-        for nid in self.schedule:
-            node = self.ir.nodes[nid]
-            if node.assigned_kernel in (KernelVariant.CUDAVec4IF, KernelVariant.CUDAVec4LIF):
-                from sengine.build.tilelang_compiler import get_cuda_if
-                self._ext_if = get_cuda_if()
-                break
+        # Load CUDA IF/LIF extension if any neuron nodes exist.
+        # Skip for fp32 — the CUDA extension is fp16-only; fp32 uses PyTorch fallback.
+        if self.precision != "fp32":
+            for nid in self.schedule:
+                node = self.ir.nodes[nid]
+                if node.assigned_kernel in (KernelVariant.CUDAVec4IF, KernelVariant.CUDAVec4LIF):
+                    from sengine.build.tilelang_compiler import get_cuda_if
+                    self._ext_if = get_cuda_if()
+                    break
 
         logger.phase("ENGINE", "Built: %d schedule ops, %d weights, %d membranes, %d buffers",
                      len(schedule), len(self.weights) + len(self.weights_1x1),
@@ -340,12 +342,28 @@ class CUDAGraphEngine:
                     spatial = H * W  # N tokens
                     self.membranes[nid] = torch.zeros(B * num_h, spatial,
                                                       dtype=torch.float32, device='cuda')
-                elif ap.variant in ("maxformer", "dssa") and len(shape) == 4:
-                    # Output (TB, C, H, W): attn_lif operates on merged spatial
+                elif ap.variant == "maxformer" and len(shape) == 4:
+                    # Output (TB, C, H, W): attn_lif operates on (TB, heads, N, hd)
                     N, C, H, W = shape
                     B = max(N // self.T, 1)
                     self.membranes[nid] = torch.zeros(B * H * W, C,
                                                       dtype=torch.float32, device='cuda')
+                elif ap.variant == "dssa" and len(shape) == 4:
+                    # DSSA: attn_lif operates on attention matrix (TB, heads, spatial_kv, spatial_q)
+                    # output shape = (TB, C, H_in, W_in), input[0] = y_kv (TB, 2C, h', w')
+                    TB_val = shape[0]
+                    B = max(TB_val // self.T, 1)
+                    H_in, W_in = ap.H, ap.W
+                    spatial_q = H_in * W_in
+                    # KV spatial from first input shape (y_kv)
+                    in_shapes = node.input_shapes
+                    if len(in_shapes) >= 1 and len(in_shapes[0]) == 4:
+                        spatial_kv = in_shapes[0][2] * in_shapes[0][3]
+                    else:
+                        spatial_kv = spatial_q  # fallback
+                    self.membranes[nid] = torch.zeros(
+                        B * ap.num_heads * spatial_kv, spatial_q,
+                        dtype=torch.float32, device='cuda')
                 continue
 
             if node.op_type not in (OpType.IF, OpType.LIF, OpType.MS):
@@ -440,7 +458,7 @@ class CUDAGraphEngine:
                                                         dtype=self.io_torch_dtype, device='cuda')
                 elif len(shape) >= 1:
                     self.activations[nid] = torch.zeros(*shape,
-                                                        dtype=torch.float16, device='cuda')
+                                                        dtype=self.io_torch_dtype, device='cuda')
         except torch.cuda.OutOfMemoryError:
             # OOM during pre-allocation — free everything and allocate
             # only the graph input buffer. The rest will be created
@@ -680,24 +698,42 @@ class CUDAGraphEngine:
 
         elif kv in (KernelVariant.CUDAVec4IF, KernelVariant.CUDAVec4LIF):
             mem = self.membranes.get(nid)
-            if self._ext_if is not None and mem is not None:
-                # Flatten to 2D for the CUDA kernel
+            if mem is not None:
                 x_flat = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
                 v_thresh = 1.0
                 if node.neuron_params:
                     v_thresh = node.neuron_params.v_threshold
+                recip_tau = 0.5
+                if kv == KernelVariant.CUDAVec4LIF and node.neuron_params and node.neuron_params.tau > 0:
+                    recip_tau = 1.0 / node.neuron_params.tau
 
-                if kv == KernelVariant.CUDAVec4LIF:
-                    # LIF: use decay parameter from neuron params
-                    recip_tau = 0.5
-                    if node.neuron_params and node.neuron_params.tau > 0:
-                        recip_tau = 1.0 / node.neuron_params.tau
-                    result = self._ext_if.lif_neuron(x_flat, mem, v_thresh, recip_tau)
+                if self._ext_if is not None:
+                    # FP16 CUDA extension path
+                    if kv == KernelVariant.CUDAVec4LIF:
+                        result = self._ext_if.lif_neuron(x_flat, mem, v_thresh, recip_tau)
+                    else:
+                        result = self._ext_if.if_neuron(x_flat, mem, v_thresh)
                 else:
-                    result = self._ext_if.if_neuron(x_flat, mem, v_thresh)
+                    # PyTorch fallback (fp32 mode or missing extension)
+                    TB = x_flat.shape[0]
+                    spatial = mem.shape[0]
+                    T_steps = TB // spatial if spatial > 0 else 1
+                    decay = 1.0 - recip_tau
+                    spikes = []
+                    v = mem.clone()
+                    for t in range(T_steps):
+                        x_t = x_flat[t * spatial:(t + 1) * spatial]
+                        if kv == KernelVariant.CUDAVec4LIF:
+                            h = decay * v + recip_tau * x_t.float()
+                        else:
+                            h = v + x_t.float()
+                        spike = (h >= v_thresh).float()
+                        v = (1.0 - spike) * h
+                        spikes.append(spike.to(self.io_torch_dtype))
+                    mem.copy_(v)
+                    result = torch.cat(spikes, dim=0)
 
-                result_shaped = result.reshape(x.shape)
-                self.activations[nid] = result_shaped
+                self.activations[nid] = result.reshape(x.shape)
 
         elif kv == KernelVariant.TileLangLinearBN:
             kern = self.kernels.get(nid)
@@ -1087,7 +1123,24 @@ class CUDAGraphEngine:
             result = self._ext_if.lif_neuron(x_flat, mem, ap.attn_lif_v_threshold,
                                               recip_tau)
             return result.reshape(x.shape)
-        # Fallback: simple threshold
+        # PyTorch fallback (fp32 mode or missing extension)
+        if mem is not None:
+            x_flat = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
+            recip_tau = 1.0 / ap.attn_lif_tau if ap.attn_lif_tau > 0 else 0.5
+            decay = 1.0 - recip_tau
+            TB = x_flat.shape[0]
+            spatial = mem.shape[0]
+            T_steps = TB // spatial if spatial > 0 else 1
+            spikes = []
+            v = mem.clone()
+            for t in range(T_steps):
+                x_t = x_flat[t * spatial:(t + 1) * spatial]
+                h = decay * v + recip_tau * x_t.float()
+                spike = (h >= ap.attn_lif_v_threshold).float()
+                v = (1.0 - spike) * h
+                spikes.append(spike.to(x.dtype))
+            mem.copy_(v)
+            return torch.cat(spikes, dim=0).reshape(x.shape)
         return (x >= ap.attn_lif_v_threshold).to(x.dtype)
 
     def _get_dssa_scale(self, name):

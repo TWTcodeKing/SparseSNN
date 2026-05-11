@@ -78,6 +78,8 @@ def main():
     parser.add_argument('--iters', type=int, default=1000)
     parser.add_argument('--export-dir', type=str, default='sengine/exports')
     parser.add_argument('--export-only', action='store_true')
+    parser.add_argument('--precision', type=str, default='fp16',
+                        choices=['fp16', 'fp32'], help='Global precision (fp16 or fp32)')
     parser.add_argument('--gpu-ids', type=str, default='0')
     args = parser.parse_args()
 
@@ -101,7 +103,7 @@ def main():
     gpu_mem = props.total_memory / 1e9
     print(f"GPU {device_id}: {gpu_name} ({gpu_arch}, {gpu_sms} SMs, {gpu_mem:.1f} GB)")
     print(f"Model: {tag} | Dataset: {args.dataset} | T={args.T}")
-    print(f"Fusion: {fusion_modes} | Autotune: {args.autotune}")
+    print(f"Fusion: {fusion_modes} | Autotune: {args.autotune} | Precision: {args.precision}")
 
     os.makedirs(args.export_dir, exist_ok=True)
 
@@ -134,7 +136,7 @@ def main():
                 continue
             print(f"\n  [B={B}] Validating fused shapes...")
             t0 = time.time()
-            generate_recommendations(plugin_onnx, args.T, B, rec_path)
+            generate_recommendations(plugin_onnx, args.T, B, rec_path, precision=args.precision)
             print(f"  Done in {time.time()-t0:.0f}s")
             rec_files[('slicer', B)] = rec_path
     else:
@@ -156,9 +158,10 @@ def main():
             # The validator pre-pass and previous builds may leave stale
             # CUDA errors that corrupt graph capture in the same process.
             import subprocess, json as json_mod
+            prec_suffix = f'_{args.precision}' if args.precision != 'fp16' else ''
             cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                                      '.cache', f'sengine_B{B}')
-            result_file = f'/tmp/sengine_bench_{tag}_{fusion}_B{B}.json'
+                                      '.cache', f'sengine_B{B}{prec_suffix}')
+            result_file = f'/tmp/sengine_bench_{tag}_{fusion}_B{B}_{args.precision}.json'
 
             sub_cmd = f"""
 import os, sys, time, json; sys.path.insert(0, '{os.path.dirname(os.path.dirname(__file__))}')
@@ -173,7 +176,8 @@ try:
     t0 = time.time()
     e = sengine.build('{plugin_onnx}', T={args.T}, batch_size={B},
                        fusion='{fusion}', autotune={args.autotune},
-                       fusion_rec={repr(rec_path)})
+                       fusion_rec={repr(rec_path)},
+                       precision='{args.precision}')
     build_s = time.time() - t0
     mode = 'C++' if not e._use_python_runtime else 'Python'
     n_fused = sum(1 for n in e._ir.nodes.values()
@@ -182,7 +186,8 @@ try:
     ms = e.benchmark(warmup={args.warmup}, iters={args.iters})
     fps = 1000.0 / ms * {B} if ms > 0 else 0
     json.dump({{'ms': ms, 'fps': fps, 'mode': mode, 'fused': n_fused,
-                'build_s': build_s, 'validated': {rec_path is not None}}},
+                'build_s': build_s, 'validated': {rec_path is not None},
+                'precision': '{args.precision}'}},
               open('{result_file}', 'w'))
 except Exception as ex:
     json.dump({{'error': str(ex)}}, open('{result_file}', 'w'))
@@ -222,7 +227,7 @@ except Exception as ex:
     print(f"\n{'='*80}")
     print(f"  {tag} | {args.dataset} | T={args.T}")
     print(f"  GPU {device_id}: {gpu_name} ({gpu_arch}, {gpu_sms} SMs)")
-    print(f"  Autotune: {args.autotune}")
+    print(f"  Autotune: {args.autotune} | Precision: {args.precision}")
     print(f"{'='*80}")
     print(f"  {'Fusion':<10} {'Batch':<6} {'Latency':>10} {'Throughput':>12} "
           f"{'Fused':>6} {'Runtime':>8} {'Build':>8} {'Valid':>6}")

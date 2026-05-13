@@ -108,6 +108,8 @@ def main():
                         help='Export ONNX only, skip engine build and benchmark')
     parser.add_argument('--single-file', action='store_true',
                         help='Consolidate ONNX external data into a single .onnx file')
+    parser.add_argument('--dynamic-batch', action='store_true',
+                        help='Export one ONNX with dynamic batch dim (one file for all batch sizes)')
 
     # Benchmark
     parser.add_argument('--batch-sizes', type=str, default='1,4,8,16',
@@ -224,13 +226,29 @@ def main():
     sparse_tag = '_sparse' if args.sparse else ''
     results = {}
 
+    # Dynamic batch: export once with B=1 + dynamic axis, reuse for all sizes
+    if args.dynamic_batch:
+        dyn_onnx = os.path.join(args.engine_dir, f"{tag}{sparse_tag}.onnx")
+        if not os.path.exists(dyn_onnx):
+            print(f"\n  Exporting ONNX (dynamic batch)...")
+            reset_net(model)
+            export_onnx(model, dyn_onnx, input_shape=(1, in_channels, img_size, img_size),
+                        dynamic_batch=True, simplify=not args.no_simplify,
+                        verbose=False)
+            print(f"          Saved: {dyn_onnx}")
+        else:
+            print(f"\n  ONNX exists: {dyn_onnx}")
+
     for B in batch_sizes:
-        onnx_path = os.path.join(args.engine_dir, f"{tag}_b{B}{sparse_tag}.onnx")
+        if args.dynamic_batch:
+            onnx_path = dyn_onnx
+        else:
+            onnx_path = os.path.join(args.engine_dir, f"{tag}_b{B}{sparse_tag}.onnx")
         engine_path = os.path.join(args.engine_dir, f"{tag}_b{B}{sparse_tag}.engine")
         input_shape = (B, in_channels, img_size, img_size)
 
         # Step 1: Export standard ONNX (no TDL, no custom ops)
-        if not os.path.exists(onnx_path):
+        if not args.dynamic_batch and not os.path.exists(onnx_path):
             print(f"\n  [B={B}] Exporting ONNX (standard torch.onnx.export)...")
             reset_net(model)
             export_onnx(model, onnx_path, input_shape=input_shape,

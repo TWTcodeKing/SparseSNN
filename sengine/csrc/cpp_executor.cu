@@ -466,6 +466,151 @@ __global__ void reduce_sum_head_dim_kernel(
     output[o_idx * N + n_idx] = __float2half(sum);
 }
 
+// ─── Detection model kernels ───
+
+// Nearest-neighbor upsample (NHWC): (N,H,W,C) → (N,OH,OW,C)
+__global__ void nearest_upsample_nhwc_kernel(
+    const half* __restrict__ input, half* __restrict__ output,
+    int N, int H, int W, int C, int OH, int OW, int scale_h, int scale_w
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * OH * OW * C;
+    if (idx >= total) return;
+    int c  = idx % C;
+    int ow = (idx / C) % OW;
+    int oh = (idx / (C * OW)) % OH;
+    int n  = idx / (C * OW * OH);
+    int ih = oh / scale_h;
+    int iw = ow / scale_w;
+    output[idx] = input[((n * H + ih) * W + iw) * C + c];
+}
+
+__global__ void nearest_upsample_nhwc_fp32_kernel(
+    const float* __restrict__ input, float* __restrict__ output,
+    int N, int H, int W, int C, int OH, int OW, int scale_h, int scale_w
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * OH * OW * C;
+    if (idx >= total) return;
+    int c  = idx % C;
+    int ow = (idx / C) % OW;
+    int oh = (idx / (C * OW)) % OH;
+    int n  = idx / (C * OW * OH);
+    int ih = oh / scale_h;
+    int iw = ow / scale_w;
+    output[idx] = input[((n * H + ih) * W + iw) * C + c];
+}
+
+// Channel concat (NHWC): (N,H,W,Ca) + (N,H,W,Cb) → (N,H,W,Ca+Cb)
+__global__ void concat_nhwc_kernel(
+    const half* __restrict__ a, const half* __restrict__ b,
+    half* __restrict__ output,
+    int N, int H, int W, int Ca, int Cb
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int C_out = Ca + Cb;
+    int total = N * H * W * C_out;
+    if (idx >= total) return;
+    int c   = idx % C_out;
+    int hw  = (idx / C_out);
+    if (c < Ca)
+        output[idx] = a[hw * Ca + c];
+    else
+        output[idx] = b[hw * Cb + (c - Ca)];
+}
+
+__global__ void concat_nhwc_fp32_kernel(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ output,
+    int N, int H, int W, int Ca, int Cb
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int C_out = Ca + Cb;
+    int total = N * H * W * C_out;
+    if (idx >= total) return;
+    int c   = idx % C_out;
+    int hw  = (idx / C_out);
+    if (c < Ca)
+        output[idx] = a[hw * Ca + c];
+    else
+        output[idx] = b[hw * Cb + (c - Ca)];
+}
+
+// I-LIF neuron: mem = decay*(mem-spike) + x; spike = round(clamp(mem,0,max_level))
+__global__ void ilif_neuron_kernel(
+    const half* __restrict__ input, float* __restrict__ membrane,
+    half* __restrict__ spikes, int total_elems, int spatial_elems,
+    float decay, float max_level
+) {
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= spatial_elems) return;
+    int T = total_elems / spatial_elems;
+    float v = membrane[s];
+    float spike = 0.0f;
+    for (int t = 0; t < T; t++) {
+        int g = t * spatial_elems + s;
+        v = decay * (v - spike) + __half2float(input[g]);
+        spike = roundf(fminf(fmaxf(v, 0.0f), max_level));
+        spikes[g] = __float2half(spike);
+    }
+    membrane[s] = v;
+}
+
+__global__ void ilif_neuron_fp32_kernel(
+    const float* __restrict__ input, float* __restrict__ membrane,
+    float* __restrict__ spikes, int total_elems, int spatial_elems,
+    float decay, float max_level
+) {
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= spatial_elems) return;
+    int T = total_elems / spatial_elems;
+    float v = membrane[s];
+    float spike = 0.0f;
+    for (int t = 0; t < T; t++) {
+        int g = t * spatial_elems + s;
+        v = decay * (v - spike) + input[g];
+        spike = roundf(fminf(fmaxf(v, 0.0f), max_level));
+        spikes[g] = spike;
+    }
+    membrane[s] = v;
+}
+
+// Softmax along inner dimension: input(outer, inner) → output(outer, inner)
+__global__ void softmax_fp16_kernel(
+    const half* __restrict__ input, half* __restrict__ output,
+    int outer, int inner
+) {
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= outer) return;
+    float max_val = -1e30f;
+    for (int i = 0; i < inner; i++)
+        max_val = fmaxf(max_val, __half2float(input[o * inner + i]));
+    float sum = 0.0f;
+    for (int i = 0; i < inner; i++)
+        sum += expf(__half2float(input[o * inner + i]) - max_val);
+    float inv_sum = 1.0f / sum;
+    for (int i = 0; i < inner; i++)
+        output[o * inner + i] = __float2half(
+            expf(__half2float(input[o * inner + i]) - max_val) * inv_sum);
+}
+
+__global__ void softmax_fp32_kernel(
+    const float* __restrict__ input, float* __restrict__ output,
+    int outer, int inner
+) {
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= outer) return;
+    float max_val = -1e30f;
+    for (int i = 0; i < inner; i++)
+        max_val = fmaxf(max_val, input[o * inner + i]);
+    float sum = 0.0f;
+    for (int i = 0; i < inner; i++)
+        sum += expf(input[o * inner + i] - max_val);
+    float inv_sum = 1.0f / sum;
+    for (int i = 0; i < inner; i++)
+        output[o * inner + i] = expf(input[o * inner + i] - max_val) * inv_sum;
+}
+
 // ─── Kernel types ───
 enum KernelType {
     KT_TILELANG = 0, KT_IF = 1, KT_LIF = 2, KT_ADD = 3, KT_SKIP = 4,
@@ -473,7 +618,11 @@ enum KernelType {
     KT_GEMM = 8, KT_ALIAS = 9, KT_LAYOUT_TRANSPOSE = 10,
     KT_TILELANG_3 = 11,  // 3-arg TileLang (MatMul: A, B, output)
     KT_NAIVE_CONV = 12,  // Naive Conv2d+BN for stem (C_in=3)
-    KT_FUSED_ATTN = 13   // Fused attention (cuBLAS batched GEMM + LIF)
+    KT_FUSED_ATTN = 13,  // Fused attention (cuBLAS batched GEMM + LIF)
+    KT_RESIZE = 14,      // Nearest-neighbor upsample (FPN)
+    KT_CONCAT = 15,      // Channel concat (FPN/PANet)
+    KT_ILIF = 16,        // Integer LIF neuron (spike_yolo)
+    KT_SOFTMAX = 17      // Softmax (DFL detection head)
 };
 
 // ─── TileLang standalone kernel (loaded via dlopen) ───
@@ -568,6 +717,21 @@ struct NodeDesc {
     // Workspace offsets (in half elements)
     int fa_ws_gemm1_out;         // GEMM1 output / GEMM2 input
     int fa_ws_perm_q, fa_ws_perm_k, fa_ws_perm_v;  // permuted Q/K/V
+
+    // For nearest-neighbor upsample (KT_RESIZE)
+    void *rs_in, *rs_out;
+    int rs_N, rs_H, rs_W, rs_C, rs_OH, rs_OW, rs_scale_h, rs_scale_w;
+
+    // For channel concat (KT_CONCAT)
+    void *cat_a, *cat_b, *cat_out;
+    int cat_NHW, cat_Ca, cat_Cb;
+
+    // For I-LIF neuron (KT_ILIF)
+    float ilif_decay, ilif_max_level;
+
+    // For softmax (KT_SOFTMAX)
+    void *sm_in, *sm_out;
+    int sm_outer, sm_inner;
 };
 
 // ─── Executor ───
@@ -869,6 +1033,52 @@ void sengine_set_layout_transpose_node(SEngineExecutor* e, int nid,
     nd.lt_out = output;
     nd.lt_N = N; nd.lt_H = H; nd.lt_W = W; nd.lt_C = C;
     nd.lt_direction = direction;
+}
+
+// ─── Detection model node setters ───
+
+void sengine_set_resize_node(SEngineExecutor* e, int nid,
+                              void* input, void* output,
+                              int N, int H, int W, int C,
+                              int OH, int OW, int scale_h, int scale_w) {
+    auto& nd = e->nodes[nid];
+    nd.type = KT_RESIZE;
+    nd.rs_in = input; nd.rs_out = output;
+    nd.rs_N = N; nd.rs_H = H; nd.rs_W = W; nd.rs_C = C;
+    nd.rs_OH = OH; nd.rs_OW = OW;
+    nd.rs_scale_h = scale_h; nd.rs_scale_w = scale_w;
+}
+
+void sengine_set_concat_node(SEngineExecutor* e, int nid,
+                              void* a, void* b, void* output,
+                              int NHW, int Ca, int Cb) {
+    auto& nd = e->nodes[nid];
+    nd.type = KT_CONCAT;
+    nd.cat_a = a; nd.cat_b = b; nd.cat_out = output;
+    nd.cat_NHW = NHW; nd.cat_Ca = Ca; nd.cat_Cb = Cb;
+}
+
+void sengine_set_ilif_node(SEngineExecutor* e, int nid,
+                            void* input, void* output, float* membrane,
+                            int total, int spatial, float decay, float max_level) {
+    auto& nd = e->nodes[nid];
+    nd.type = KT_ILIF;
+    nd.input_ptr = (half*)input;
+    nd.output_ptr = (half*)output;
+    nd.membrane_ptr = membrane;
+    nd.total_elems = total;
+    nd.spatial_elems = spatial;
+    nd.ilif_decay = decay;
+    nd.ilif_max_level = max_level;
+}
+
+void sengine_set_softmax_node(SEngineExecutor* e, int nid,
+                               void* input, void* output,
+                               int outer, int inner) {
+    auto& nd = e->nodes[nid];
+    nd.type = KT_SOFTMAX;
+    nd.sm_in = input; nd.sm_out = output;
+    nd.sm_outer = outer; nd.sm_inner = inner;
 }
 
 void sengine_add_membrane(SEngineExecutor* e, float* ptr, int size) {
@@ -1185,6 +1395,57 @@ void sengine_execute(SEngineExecutor* e) {
             else if (nd.fa_variant == 3) {
                 // TokenQK: not yet in C++, handled by Python runtime.
             }
+            break;
+        }
+        case KT_RESIZE: {
+            int total = nd.rs_N * nd.rs_OH * nd.rs_OW * nd.rs_C;
+            int thr = 256, blk = (total + thr - 1) / thr;
+            if (e->is_fp32)
+                nearest_upsample_nhwc_fp32_kernel<<<blk, thr, 0, s>>>(
+                    (float*)nd.rs_in, (float*)nd.rs_out,
+                    nd.rs_N, nd.rs_H, nd.rs_W, nd.rs_C,
+                    nd.rs_OH, nd.rs_OW, nd.rs_scale_h, nd.rs_scale_w);
+            else
+                nearest_upsample_nhwc_kernel<<<blk, thr, 0, s>>>(
+                    (half*)nd.rs_in, (half*)nd.rs_out,
+                    nd.rs_N, nd.rs_H, nd.rs_W, nd.rs_C,
+                    nd.rs_OH, nd.rs_OW, nd.rs_scale_h, nd.rs_scale_w);
+            break;
+        }
+        case KT_CONCAT: {
+            int C_out = nd.cat_Ca + nd.cat_Cb;
+            int total = nd.cat_NHW * C_out;
+            int thr = 256, blk = (total + thr - 1) / thr;
+            if (e->is_fp32)
+                concat_nhwc_fp32_kernel<<<blk, thr, 0, s>>>(
+                    (float*)nd.cat_a, (float*)nd.cat_b, (float*)nd.cat_out,
+                    1, 1, nd.cat_NHW, nd.cat_Ca, nd.cat_Cb);
+            else
+                concat_nhwc_kernel<<<blk, thr, 0, s>>>(
+                    (half*)nd.cat_a, (half*)nd.cat_b, (half*)nd.cat_out,
+                    1, 1, nd.cat_NHW, nd.cat_Ca, nd.cat_Cb);
+            break;
+        }
+        case KT_ILIF: {
+            int thr = 256, blk = (nd.spatial_elems + thr - 1) / thr;
+            if (e->is_fp32)
+                ilif_neuron_fp32_kernel<<<blk, thr, 0, s>>>(
+                    (float*)nd.input_ptr, nd.membrane_ptr, (float*)nd.output_ptr,
+                    nd.total_elems, nd.spatial_elems, nd.ilif_decay, nd.ilif_max_level);
+            else
+                ilif_neuron_kernel<<<blk, thr, 0, s>>>(
+                    nd.input_ptr, nd.membrane_ptr, nd.output_ptr,
+                    nd.total_elems, nd.spatial_elems, nd.ilif_decay, nd.ilif_max_level);
+            break;
+        }
+        case KT_SOFTMAX: {
+            int thr = 256, blk = (nd.sm_outer + thr - 1) / thr;
+            if (e->is_fp32)
+                softmax_fp32_kernel<<<blk, thr, 0, s>>>(
+                    (float*)nd.sm_in, (float*)nd.sm_out, nd.sm_outer, nd.sm_inner);
+            else
+                softmax_fp16_kernel<<<blk, thr, 0, s>>>(
+                    (half*)nd.sm_in, (half*)nd.sm_out, nd.sm_outer, nd.sm_inner);
             break;
         }
         case KT_SKIP:

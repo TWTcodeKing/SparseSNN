@@ -21,6 +21,10 @@ Usage:
     # Quick (no autotuning, no validation)
     python scripts/bench_sengine_latency.py \
         --model sew_resnet18 --dataset imagenet --batch-sizes 4
+
+    # Export only (for cross-platform: export on x86, build on Jetson Orin)
+    python scripts/bench_sengine_latency.py \
+        --model sew_resnet18 --dataset imagenet --T 4 --export-only
 """
 
 import argparse
@@ -59,6 +63,79 @@ def export_plugin_onnx(args, ds_cfg, img_size, output_dir):
     else:
         raise RuntimeError(f"ONNX export failed for {model_name}")
     return result
+
+
+def print_export_summary(onnx_path, model_tag, args):
+    """Print TDL export summary with sengine build specs for cross-platform deploy."""
+    import onnx
+    model = onnx.load(onnx_path, load_external_data=False)
+    file_mb = os.path.getsize(onnx_path) / 1e6
+
+    # Input / output shapes
+    inputs = []
+    for inp in model.graph.input:
+        shape = [d.dim_value for d in inp.type.tensor_type.shape.dim]
+        inputs.append((inp.name, shape))
+    outputs = []
+    for out in model.graph.output:
+        shape = [d.dim_value for d in out.type.tensor_type.shape.dim]
+        outputs.append((out.name, shape))
+
+    # Count ops by domain (standard vs custom SNN ops)
+    op_counts = {}
+    snn_ops = {}
+    for node in model.graph.node:
+        domain = node.domain or "onnx"
+        op = node.op_type
+        if domain != "onnx":
+            snn_ops[op] = snn_ops.get(op, 0) + 1
+        else:
+            op_counts[op] = op_counts.get(op, 0) + 1
+
+    n_total = len(model.graph.node)
+    n_weights = len(model.graph.initializer)
+
+    # Derive specs from input shape
+    in_shape = inputs[0][1] if inputs else []
+    in_channels = in_shape[1] if len(in_shape) == 4 else '?'
+    img_h = in_shape[2] if len(in_shape) == 4 else '?'
+    img_w = in_shape[3] if len(in_shape) == 4 else '?'
+
+    print(f"\n{'='*70}")
+    print(f"  TDL Plugin ONNX Export Summary")
+    print(f"{'='*70}")
+    print(f"  File       : {onnx_path}")
+    print(f"  Size       : {file_mb:.1f} MB")
+    print(f"  Model      : {model_tag}")
+    print(f"  Dataset    : {args.dataset}")
+    print(f"  Input      : ({in_channels}, {img_h}, {img_w})  [C, H, W per image]")
+    print(f"  T          : {args.T}")
+    print(f"  Nodes      : {n_total}  ({n_weights} initializers)")
+
+    if snn_ops:
+        snn_str = ", ".join(f"{k}={v}" for k, v in sorted(snn_ops.items()))
+        print(f"  SNN ops    : {snn_str}")
+
+    top_ops = sorted(op_counts.items(), key=lambda x: -x[1])[:8]
+    ops_str = ", ".join(f"{k}={v}" for k, v in top_ops)
+    print(f"  ONNX ops   : {ops_str}")
+
+    # Build command for target platform
+    batch_str = args.batch_sizes
+    prec = args.precision
+    print(f"\n{'='*70}")
+    print(f"  SEngine Build Command (run on target device)")
+    print(f"{'='*70}")
+    print(f"  python -c \"")
+    print(f"  import sengine")
+    print(f"  e = sengine.build('{os.path.basename(onnx_path)}',")
+    print(f"                    T={args.T}, batch_size=1,")
+    print(f"                    fusion='slicer', autotune=True,")
+    print(f"                    precision='{prec}')")
+    print(f"  e.save('{model_tag}.sengine')")
+    print(f"  ms = e.benchmark()")
+    print(f"  print(f'Latency: {{ms:.3f}} ms')\"")
+    print(f"{'='*70}\n")
 
 
 def main():
@@ -114,7 +191,7 @@ def main():
     plugin_onnx = export_plugin_onnx(args, ds_cfg, img_size, args.export_dir)
 
     if args.export_only:
-        print(f"\n  Export complete: {plugin_onnx}")
+        print_export_summary(plugin_onnx, tag, args)
         return
 
     # ── Phase 2: Fusion validation (per batch size) ──

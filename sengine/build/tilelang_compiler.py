@@ -1312,6 +1312,17 @@ class TileLangCompiler:
             s = node.input_shapes[0]
             if len(s) == 4:
                 return s[2], s[3]  # NCHW: (N, C, H, W)
+            if len(s) == 5:
+                return s[3], s[4]  # (T, B, C, H, W) or (B, 1, C, H, W)
+        # Fallback: try output shapes
+        if node.output_shapes:
+            s = node.output_shapes[0]
+            cp = node.conv_params
+            if cp and len(s) == 4:
+                OH, OW = s[2], s[3]
+                H = (OH - 1) * cp.stride_h - 2 * cp.pad_h + cp.kernel_h
+                W = (OW - 1) * cp.stride_w - 2 * cp.pad_w + cp.kernel_w
+                return H, W
         return 0, 0
 
     def _get_linear_dims(self, node: Node) -> tuple[int, int, int]:

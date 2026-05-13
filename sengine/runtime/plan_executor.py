@@ -399,6 +399,67 @@ def setup_executor_from_plan(
                 exe.set_skip_node(nid)
                 logger.warning("  Plan executor: fused_attn #%d skipped (no handler)", nid)
 
+        elif kt == "resize":
+            in_ptr = p(node_plan.input_bufs[0]) if node_plan.input_bufs else 0
+            out_ptr = p(node_plan.output_buf)
+            params = node_plan.params
+            N = params.get("N", 1); H = params.get("H", 1)
+            W = params.get("W", 1); C = params.get("C", 1)
+            sh = params.get("scale_h", 2); sw = params.get("scale_w", 2)
+            OH = H * sh; OW = W * sw
+            if in_ptr and out_ptr:
+                exe.set_resize_node(nid, in_ptr, out_ptr, N, H, W, C, OH, OW, sh, sw)
+            else:
+                exe.set_skip_node(nid)
+
+        elif kt == "concat":
+            out_ptr = p(node_plan.output_buf)
+            if len(node_plan.input_bufs) >= 2:
+                a_ptr = p(node_plan.input_bufs[0])
+                b_ptr = p(node_plan.input_bufs[1])
+                # Get channel dims from buffer shapes
+                Ca = Cb = 0
+                for bd in plan.buffers:
+                    if bd.buf_id == node_plan.input_bufs[0]:
+                        Ca = bd.shape[-1] if bd.shape else 0
+                    if bd.buf_id == node_plan.input_bufs[1]:
+                        Cb = bd.shape[-1] if bd.shape else 0
+                NHW = 1
+                for bd in plan.buffers:
+                    if bd.buf_id == node_plan.input_bufs[0] and len(bd.shape) >= 2:
+                        for d in bd.shape[:-1]: NHW *= d
+                        break
+                if a_ptr and b_ptr and out_ptr and Ca and Cb:
+                    exe.set_concat_node(nid, a_ptr, b_ptr, out_ptr, NHW, Ca, Cb)
+                else:
+                    exe.set_skip_node(nid)
+            else:
+                exe.set_skip_node(nid)
+
+        elif kt == "ilif_neuron":
+            in_ptr = p(node_plan.input_bufs[0]) if node_plan.input_bufs else 0
+            out_ptr = p(node_plan.output_buf)
+            m_ptr = p(node_plan.membrane_buf)
+            params = node_plan.params
+            if in_ptr and out_ptr and m_ptr:
+                exe.set_ilif_node(nid, in_ptr, out_ptr, m_ptr,
+                                  params.get("total_elems", 0),
+                                  params.get("spatial_elems", 0),
+                                  params.get("decay", 0.25),
+                                  params.get("max_level", 4.0))
+            else:
+                exe.set_skip_node(nid)
+
+        elif kt == "softmax":
+            in_ptr = p(node_plan.input_bufs[0]) if node_plan.input_bufs else 0
+            out_ptr = p(node_plan.output_buf)
+            params = node_plan.params
+            if in_ptr and out_ptr:
+                exe.set_softmax_node(nid, in_ptr, out_ptr,
+                                     params.get("outer", 1), params.get("inner", 1))
+            else:
+                exe.set_skip_node(nid)
+
         elif kt == "skip":
             exe.set_skip_node(nid)
 

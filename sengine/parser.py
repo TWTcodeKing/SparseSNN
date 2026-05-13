@@ -26,6 +26,7 @@ _NEURON_OP_MAP = {
     "FusedIFNeuron": NeuronType.IF,
     "FusedLIFNeuron": NeuronType.LIF,
     "FusedMSNeuron": NeuronType.MS,
+    "FusedILIFNeuron": NeuronType.ILIF,
 }
 
 _ATTENTION_OP_MAP = {
@@ -37,7 +38,7 @@ _ATTENTION_OP_MAP = {
 
 # ONNX ops that are part of the temporal-mean tail and can be collapsed
 _TEMPORAL_MEAN_TAIL_OPS = {
-    "Shape", "Gather", "Div", "Cast", "Unsqueeze", "Concat", "Reshape",
+    "Shape", "Gather", "Div", "Cast", "Unsqueeze", "Reshape",
     "Constant", "ConstantOfShape", "Expand",
 }
 
@@ -79,6 +80,13 @@ class ONNXParser:
 
     def __init__(self, onnx_path: str):
         self.onnx_model = onnx.load(onnx_path)
+        # Run ONNX shape inference to populate value_info for all tensors.
+        # This enables constant folding of Shape→Gather→Slice chains
+        # (needed for Resize target sizes and Reshape target shapes).
+        try:
+            self.onnx_model = onnx.shape_inference.infer_shapes(self.onnx_model)
+        except Exception:
+            pass  # Shape inference may fail on custom ops; proceed anyway
         self.graph = self.onnx_model.graph
 
         # Build initializer lookup (name → numpy array)
@@ -90,33 +98,8 @@ class ONNXParser:
         # BN running stats (not always in graph.initializer)
         self._resolve_constant_identity_nodes()
 
-        # Extract Constant node values (for Slice starts/ends/axes resolution)
-        # Also trace through Unsqueeze/Squeeze/Reshape applied to constants.
-        self._constants: dict[str, np.ndarray] = dict(self._initializers)
-        for node in self.graph.node:
-            if node.op_type == "Constant" and node.output:
-                for attr in node.attribute:
-                    if attr.name == "value":
-                        self._constants[node.output[0]] = numpy_helper.to_array(attr.t)
-        # Propagate constants through shape-preserving ops
-        for node in self.graph.node:
-            if node.op_type in ("Unsqueeze", "Squeeze", "Reshape", "Cast"):
-                if node.input and node.input[0] in self._constants and node.output:
-                    self._constants[node.output[0]] = self._constants[node.input[0]]
-            elif node.op_type == "Concat" and node.output:
-                # Concat of constants → constant
-                parts = []
-                all_const = True
-                for inp in node.input:
-                    if inp in self._constants:
-                        parts.append(self._constants[inp].flatten())
-                    else:
-                        all_const = False
-                        break
-                if all_const and parts:
-                    self._constants[node.output[0]] = np.concatenate(parts)
-
         # Build tensor shape map from value_info + graph inputs
+        # (needed before constant propagation for Shape op resolution)
         self._tensor_shapes: dict[str, tuple] = {}
         for vi in list(self.graph.input) + list(self.graph.value_info) + list(self.graph.output):
             if vi.type.tensor_type.HasField("shape"):
@@ -125,6 +108,214 @@ class ONNXParser:
                     for d in vi.type.tensor_type.shape.dim
                 )
                 self._tensor_shapes[vi.name] = dims
+
+        # Extract Constant node values (for Slice starts/ends/axes resolution)
+        # Also trace through Unsqueeze/Squeeze/Reshape applied to constants.
+        self._constants: dict[str, np.ndarray] = dict(self._initializers)
+        for node in self.graph.node:
+            if node.op_type == "Constant" and node.output:
+                for attr in node.attribute:
+                    if attr.name == "value":
+                        self._constants[node.output[0]] = numpy_helper.to_array(attr.t)
+        # Propagate constants AND tensor shapes through ONNX ops.
+        # Shape propagation enables Shape→Gather→Concat chains to resolve
+        # (needed for Resize target sizes and Reshape target shapes).
+        # Custom ops (FusedMSNeuron etc.) are passthrough for shapes.
+        for _pass in range(5):
+            for node in self.graph.node:
+                out = node.output[0] if node.output else ''
+                op = node.op_type
+
+                # --- Constant propagation ---
+                if op in ("Unsqueeze", "Squeeze", "Cast", "ConstantOfShape", "Expand"):
+                    if node.input and node.input[0] in self._constants and out:
+                        self._constants[out] = self._constants[node.input[0]]
+                elif op == "Reshape" and len(node.input) >= 2:
+                    if node.input[0] in self._constants and out:
+                        self._constants[out] = self._constants[node.input[0]]
+                elif op == "Shape" and out:
+                    if node.input and node.input[0] in self._tensor_shapes:
+                        shape = self._tensor_shapes[node.input[0]]
+                        if all(d > 0 for d in shape):
+                            self._constants[out] = np.array(shape, dtype=np.int64)
+                elif op == "Gather" and out:
+                    if (len(node.input) >= 2
+                            and node.input[0] in self._constants
+                            and node.input[1] in self._constants):
+                        data = self._constants[node.input[0]].flatten()
+                        idx = int(self._constants[node.input[1]].flatten()[0])
+                        if 0 <= idx < len(data):
+                            self._constants[out] = np.array([data[idx]], dtype=data.dtype)
+                elif op == "Slice" and out:
+                    if (len(node.input) >= 3
+                            and all(node.input[i] in self._constants for i in range(min(3, len(node.input))))):
+                        data = self._constants[node.input[0]].flatten()
+                        starts = int(self._constants[node.input[1]].flatten()[0])
+                        ends = int(self._constants[node.input[2]].flatten()[0])
+                        self._constants[out] = data[starts:min(ends, len(data))]
+                elif op == "Mul" and out:
+                    if (len(node.input) >= 2
+                            and node.input[0] in self._constants
+                            and node.input[1] in self._constants):
+                        a = self._constants[node.input[0]].flatten()
+                        b = self._constants[node.input[1]].flatten()
+                        self._constants[out] = (a.astype(np.int64) * b.astype(np.int64))
+                elif op == "Div" and out:
+                    if (len(node.input) >= 2
+                            and node.input[0] in self._constants
+                            and node.input[1] in self._constants):
+                        a = self._constants[node.input[0]].flatten().astype(float)
+                        b = self._constants[node.input[1]].flatten().astype(float)
+                        b = np.where(b == 0, 1, b)
+                        self._constants[out] = (a / b).astype(np.int64)
+                elif op == "Concat" and out:
+                    parts = []
+                    all_const = True
+                    for inp in node.input:
+                        if inp in self._constants:
+                            parts.append(self._constants[inp].flatten())
+                        else:
+                            all_const = False; break
+                    if all_const and parts:
+                        self._constants[out] = np.concatenate(parts)
+
+                # --- Tensor shape propagation (enables Shape op resolution) ---
+                if out and out not in self._tensor_shapes:
+                    in0 = node.input[0] if node.input else ''
+                    in0_shape = self._tensor_shapes.get(in0)
+                    if in0_shape is not None:
+                        # Passthrough ops (output shape = input shape)
+                        if op in ("BatchNormalization", "Relu", "Clip", "Round",
+                                  "FusedIFNeuron", "FusedLIFNeuron", "FusedMSNeuron",
+                                  "FusedILIFNeuron", "Add", "Mul", "Sub", "Div",
+                                  "Identity", "Cast", "Expand", "Softmax"):
+                            self._tensor_shapes[out] = in0_shape
+                        elif op == "Conv" and node.input[1] in self._initializers:
+                            w = self._initializers[node.input[1]]
+                            attrs = {a.name: (list(a.ints) if a.ints else [a.i])
+                                     for a in node.attribute}
+                            if len(in0_shape) == 4 and len(w.shape) == 4:
+                                N, C, H, W_ = in0_shape
+                                kh = attrs.get('kernel_shape', [w.shape[2]])[0]
+                                s = attrs.get('strides', [1])[0]
+                                p = attrs.get('pads', [0])[0]
+                                g = attrs.get('group', [1])[0]
+                                OH = (H + 2*p - kh) // s + 1
+                                OW = (W_ + 2*p - kh) // s + 1
+                                self._tensor_shapes[out] = (N, w.shape[0], OH, OW)
+                        elif op == "MaxPool" and len(in0_shape) == 4:
+                            attrs = {a.name: (list(a.ints) if a.ints else [a.i])
+                                     for a in node.attribute}
+                            N, C, H, W_ = in0_shape
+                            kh = attrs.get('kernel_shape', [3])[0]
+                            s = attrs.get('strides', [2])[0]
+                            p = attrs.get('pads', [0])[0]
+                            OH = (H + 2*p - kh) // s + 1
+                            OW = (W_ + 2*p - kh) // s + 1
+                            self._tensor_shapes[out] = (N, C, OH, OW)
+                        elif op == "Resize":
+                            # Try to resolve from sizes constant
+                            sizes_name = node.input[3] if len(node.input) > 3 and node.input[3] else ''
+                            if sizes_name in self._constants:
+                                sizes = self._constants[sizes_name]
+                                self._tensor_shapes[out] = tuple(int(s) for s in sizes.flatten())
+                            else:
+                                self._tensor_shapes[out] = in0_shape
+                        elif op == "Tile" and len(node.input) >= 2 and node.input[1] in self._constants:
+                            repeats = self._constants[node.input[1]].flatten()
+                            if len(repeats) == len(in0_shape):
+                                self._tensor_shapes[out] = tuple(
+                                    int(d * r) for d, r in zip(in0_shape, repeats))
+                        elif op == "Transpose":
+                            perm = None
+                            for a in node.attribute:
+                                if a.name == 'perm':
+                                    perm = list(a.ints)
+                            if perm and len(perm) == len(in0_shape):
+                                self._tensor_shapes[out] = tuple(in0_shape[p] for p in perm)
+                        elif op == "Reshape" and len(node.input) >= 2 and node.input[1] in self._constants:
+                            target = self._constants[node.input[1]].flatten().tolist()
+                            total = 1
+                            for d in in0_shape: total *= d
+                            resolved = list(target)
+                            neg_idx = -1
+                            known = 1
+                            for i, d in enumerate(resolved):
+                                if d == 0 and i < len(in0_shape):
+                                    resolved[i] = in0_shape[i]
+                                if d == -1:
+                                    neg_idx = i
+                                elif resolved[i] > 0:
+                                    known *= resolved[i]
+                            if neg_idx >= 0 and known > 0:
+                                resolved[neg_idx] = total // known
+                            if all(d > 0 for d in resolved):
+                                self._tensor_shapes[out] = tuple(int(d) for d in resolved)
+                        elif op == "Slice":
+                            # Resolve Slice output shape from starts/ends/axes constants
+                            if (len(node.input) >= 4
+                                    and node.input[1] in self._constants
+                                    and node.input[2] in self._constants):
+                                starts = self._constants[node.input[1]].flatten()
+                                ends = self._constants[node.input[2]].flatten()
+                                axes = self._constants[node.input[3]].flatten() if (
+                                    len(node.input) > 3 and node.input[3] in self._constants
+                                ) else list(range(len(starts)))
+                                out_s = list(in0_shape)
+                                for a, s, e in zip(axes, starts, ends):
+                                    a = int(a)
+                                    if 0 <= a < len(out_s):
+                                        dim = out_s[a]
+                                        e_c = min(int(e), dim) if int(e) >= 0 else max(0, dim + int(e))
+                                        s_c = max(0, int(s)) if int(s) >= 0 else max(0, dim + int(s))
+                                        out_s[a] = e_c - s_c
+                                self._tensor_shapes[out] = tuple(out_s)
+                        elif op == "Flatten":
+                            if len(in0_shape) >= 2:
+                                flat = 1
+                                for d in in0_shape[1:]: flat *= d
+                                self._tensor_shapes[out] = (in0_shape[0], flat)
+                        elif op == "Concat":
+                            # Concat shapes: sum along axis
+                            attrs = {a.name: a.i for a in node.attribute}
+                            axis = attrs.get('axis', 0)
+                            all_shapes = [self._tensor_shapes.get(inp) for inp in node.input]
+                            if all(s is not None for s in all_shapes) and all_shapes:
+                                ndim = len(all_shapes[0])
+                                ax = axis if axis >= 0 else ndim + axis
+                                out_s = list(all_shapes[0])
+                                if 0 <= ax < ndim:
+                                    out_s[ax] = sum(s[ax] for s in all_shapes)
+                                self._tensor_shapes[out] = tuple(out_s)
+                        elif op == "GlobalAveragePool" and len(in0_shape) == 4:
+                            self._tensor_shapes[out] = (in0_shape[0], in0_shape[1], 1, 1)
+                        elif op == "Gemm" and len(node.input) >= 2 and node.input[1] in self._initializers:
+                            w = self._initializers[node.input[1]]
+                            transB = 0
+                            for a in node.attribute:
+                                if a.name == 'transB': transB = a.i
+                            N_out = w.shape[0] if transB else w.shape[1]
+                            self._tensor_shapes[out] = (in0_shape[0], N_out)
+                        elif op == "MatMul" and len(node.input) >= 2:
+                            in1_shape = self._tensor_shapes.get(node.input[1])
+                            if in1_shape and len(in0_shape) >= 2 and len(in1_shape) >= 2:
+                                self._tensor_shapes[out] = in0_shape[:-1] + (in1_shape[-1],)
+                        elif op == "ReduceMean":
+                            axes = None
+                            keepdims = 1
+                            for a in node.attribute:
+                                if a.name == 'axes': axes = list(a.ints)
+                                if a.name == 'keepdims': keepdims = a.i
+                            if axes and keepdims:
+                                out_s = list(in0_shape)
+                                for ax in axes:
+                                    if 0 <= ax < len(out_s): out_s[ax] = 1
+                                self._tensor_shapes[out] = tuple(out_s)
+                            elif axes and not keepdims:
+                                out_s = [d for i, d in enumerate(in0_shape) if i not in axes]
+                                self._tensor_shapes[out] = tuple(out_s)
+                            else:
+                                self._tensor_shapes[out] = in0_shape
 
     def parse(self) -> EngineIR:
         """Parse the ONNX model into an EngineIR."""
@@ -202,6 +393,14 @@ class ONNXParser:
                 self._parse_mul(onnx_node, ir)
             elif op_type == "Split":
                 self._parse_split(onnx_node, ir)
+            elif op_type == "Resize":
+                self._parse_resize(onnx_node, ir)
+            elif op_type == "Concat":
+                self._parse_concat(onnx_node, ir)
+            elif op_type == "Softmax":
+                self._parse_softmax(onnx_node, ir)
+            elif op_type == "Slice":
+                self._parse_slice(onnx_node, ir)
             elif op_type in _TEMPORAL_MEAN_TAIL_OPS:
                 # Shape/Gather/Div/Cast/etc. that don't belong to temporal tail
                 # and aren't structural (Reshape/Transpose/Mul handled above) — skip
@@ -352,13 +551,20 @@ class ONNXParser:
                                    _get_attr(onnx_node, "decay", 0.25))
             params.v_threshold = _get_attr(onnx_node, "thresh_f",
                                            _get_attr(onnx_node, "thresh", 0.5))
+        elif neuron_type == NeuronType.ILIF:
+            params.decay = _get_attr(onnx_node, "decay_f",
+                                     _get_attr(onnx_node, "decay", 0.25))
+            params.max_level = int(_get_attr(onnx_node, "max_level_i",
+                                             _get_attr(onnx_node, "max_level", 4)))
 
+        _NEURON_OPTYPE = {
+            NeuronType.IF: OpType.IF, NeuronType.LIF: OpType.LIF,
+            NeuronType.MS: OpType.MS, NeuronType.ILIF: OpType.ILIF,
+        }
         node = Node(
             id=-1,
             name=onnx_node.name or f"neuron_{onnx_node.output[0]}",
-            op_type=OpType.IF if neuron_type == NeuronType.IF
-                    else OpType.LIF if neuron_type == NeuronType.LIF
-                    else OpType.MS,
+            op_type=_NEURON_OPTYPE.get(neuron_type, OpType.LIF),
             is_stateful=True,
             input_names=[n for n in onnx_node.input if n],
             output_names=list(onnx_node.output),
@@ -552,17 +758,19 @@ class ONNXParser:
         ir.add_node(node)
 
     def _parse_reshape(self, onnx_node, ir: EngineIR):
-        # Get target shape from input[1] (constant tensor)
+        # Get target shape from input[1] — check both initializers and resolved constants
         shape_name = onnx_node.input[1] if len(onnx_node.input) > 1 else ""
         target_shape = None
-        if shape_name in self._initializers:
+        if shape_name in self._constants:
+            target_shape = self._constants[shape_name].flatten().astype(int).tolist()
+        elif shape_name in self._initializers:
             target_shape = self._initializers[shape_name].astype(int).tolist()
 
         node = Node(
             id=-1,
             name=onnx_node.name or f"reshape_{onnx_node.output[0]}",
             op_type=OpType.Reshape,
-            input_names=[n for n in onnx_node.input if n],
+            input_names=[onnx_node.input[0]] if onnx_node.input else [],
             output_names=list(onnx_node.output),
             extra_attrs={"target_shape": target_shape},
             assigned_kernel=KernelVariant.ZeroCost,
@@ -607,6 +815,112 @@ class ONNXParser:
             output_names=list(onnx_node.output),
             extra_attrs={"original_op": "Split", **_get_attrs(onnx_node)},
             assigned_kernel=KernelVariant.ZeroCost,
+        )
+        ir.add_node(node)
+
+    def _parse_resize(self, onnx_node, ir: EngineIR):
+        """Parse Resize (nearest-neighbor upsample for FPN necks)."""
+        scales = None
+        sizes = None
+        # Input[2] = scales, Input[3] = sizes (one of them is populated)
+        if len(onnx_node.input) > 2 and onnx_node.input[2]:
+            scales = self._constants.get(onnx_node.input[2])
+        if len(onnx_node.input) > 3 and onnx_node.input[3]:
+            sizes = self._constants.get(onnx_node.input[3])
+
+        mode = "nearest"
+        for attr in onnx_node.attribute:
+            if attr.name == "mode":
+                mode = attr.s.decode() if isinstance(attr.s, bytes) else attr.s
+
+        extra = {"mode": mode}
+        if scales is not None:
+            extra["scales"] = [float(s) for s in scales.flatten().tolist()]
+        if sizes is not None:
+            extra["sizes"] = [int(s) for s in sizes.flatten().tolist()]
+
+        # Only the first input (X) is the data tensor; roi/scales/sizes are
+        # shape metadata already resolved into extra_attrs above.
+        data_input = [onnx_node.input[0]] if onnx_node.input else []
+        node = Node(
+            id=-1,
+            name=onnx_node.name or f"resize_{onnx_node.output[0]}",
+            op_type=OpType.Resize,
+            input_names=data_input,
+            output_names=list(onnx_node.output),
+            extra_attrs=extra,
+            assigned_kernel=KernelVariant.CUDAResize,
+        )
+        ir.add_node(node)
+
+    def _parse_concat(self, onnx_node, ir: EngineIR):
+        """Parse Concat (channel merge in FPN/PANet necks)."""
+        axis = 1  # default: channel dim in NCHW
+        for attr in onnx_node.attribute:
+            if attr.name == "axis":
+                axis = int(attr.i)
+
+        # Filter out constant-only inputs (shape manipulation concat)
+        data_inputs = [n for n in onnx_node.input
+                       if n and n not in self._constants]
+        if not data_inputs:
+            # All-constant concat (shape manipulation) — treat as Identity
+            node = Node(
+                id=-1,
+                name=onnx_node.name or f"concat_{onnx_node.output[0]}",
+                op_type=OpType.Identity,
+                input_names=[n for n in onnx_node.input if n],
+                output_names=list(onnx_node.output),
+                assigned_kernel=KernelVariant.ZeroCost,
+            )
+            ir.add_node(node)
+            return
+
+        node = Node(
+            id=-1,
+            name=onnx_node.name or f"concat_{onnx_node.output[0]}",
+            op_type=OpType.Concat,
+            input_names=data_inputs,
+            output_names=list(onnx_node.output),
+            extra_attrs={"axis": axis},
+            assigned_kernel=KernelVariant.CUDAConcat,
+        )
+        ir.add_node(node)
+
+    def _parse_softmax(self, onnx_node, ir: EngineIR):
+        """Parse Softmax (used in DFL detection head)."""
+        axis = -1
+        for attr in onnx_node.attribute:
+            if attr.name == "axis":
+                axis = int(attr.i)
+        node = Node(
+            id=-1,
+            name=onnx_node.name or f"softmax_{onnx_node.output[0]}",
+            op_type=OpType.Softmax,
+            input_names=[n for n in onnx_node.input if n],
+            output_names=list(onnx_node.output),
+            extra_attrs={"axis": axis},
+            assigned_kernel=KernelVariant.CUDASoftmax,
+        )
+        ir.add_node(node)
+
+    def _parse_slice(self, onnx_node, ir: EngineIR):
+        """Parse Slice (channel split in C2fSpike, etc.)."""
+        extra = {}
+        # Resolve starts/ends/axes from constants
+        for idx, key in [(1, "starts"), (2, "ends"), (3, "axes")]:
+            if idx < len(onnx_node.input):
+                val = self._constants.get(onnx_node.input[idx])
+                if val is not None:
+                    extra[key] = [int(v) for v in val.flatten().tolist()]
+        node = Node(
+            id=-1,
+            name=onnx_node.name or f"slice_{onnx_node.output[0]}",
+            op_type=OpType.Slice,
+            input_names=[onnx_node.input[0]] if onnx_node.input else [],
+            output_names=list(onnx_node.output),
+            extra_attrs=extra,
+            assigned_kernel=KernelVariant.Elementwise,
         )
         ir.add_node(node)
 

@@ -74,6 +74,11 @@ def _setup_signatures(lib):
         VP, VP,           # scale1_ptr, scale2_ptr
         CI, CI, CI, CI,   # ws_gemm1_out, ws_perm_q, ws_perm_k, ws_perm_v
     ]
+    # Detection model ops
+    lib.sengine_set_resize_node.argtypes = [VP, CI, VP, VP, CI, CI, CI, CI, CI, CI, CI, CI]
+    lib.sengine_set_concat_node.argtypes = [VP, CI, VP, VP, VP, CI, CI, CI]
+    lib.sengine_set_ilif_node.argtypes = [VP, CI, VP, VP, VP, CI, CI, CF, CF]
+    lib.sengine_set_softmax_node.argtypes = [VP, CI, VP, VP, CI, CI]
     lib.sengine_add_membrane.argtypes = [VP, VP, CI]
 
     lib.sengine_execute.argtypes = [VP]
@@ -229,6 +234,28 @@ class CppExecutor:
             needs_permute,
             scale1_ptr, scale2_ptr,
             ws_gemm1_out, ws_perm_q, ws_perm_k, ws_perm_v)
+
+    # ─── Detection model ops ───
+
+    def set_resize_node(self, nid, in_ptr, out_ptr, N, H, W, C, OH, OW, scale_h, scale_w):
+        self._lib.sengine_set_resize_node(self._handle, nid,
+            ctypes.c_void_p(in_ptr), ctypes.c_void_p(out_ptr),
+            N, H, W, C, OH, OW, scale_h, scale_w)
+
+    def set_concat_node(self, nid, a_ptr, b_ptr, out_ptr, NHW, Ca, Cb):
+        self._lib.sengine_set_concat_node(self._handle, nid,
+            ctypes.c_void_p(a_ptr), ctypes.c_void_p(b_ptr),
+            ctypes.c_void_p(out_ptr), NHW, Ca, Cb)
+
+    def set_ilif_node(self, nid, in_ptr, out_ptr, mem_ptr, total, spatial, decay, max_level):
+        self._lib.sengine_set_ilif_node(self._handle, nid,
+            ctypes.c_void_p(in_ptr), ctypes.c_void_p(out_ptr),
+            ctypes.c_void_p(mem_ptr),
+            total, spatial, ctypes.c_float(decay), ctypes.c_float(max_level))
+
+    def set_softmax_node(self, nid, in_ptr, out_ptr, outer, inner):
+        self._lib.sengine_set_softmax_node(self._handle, nid,
+            ctypes.c_void_p(in_ptr), ctypes.c_void_p(out_ptr), outer, inner)
 
     # ─── Execution ───
 

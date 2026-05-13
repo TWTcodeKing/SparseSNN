@@ -376,7 +376,7 @@ class CUDAGraphEngine:
                         dtype=torch.float32, device='cuda')
                 continue
 
-            if node.op_type not in (OpType.IF, OpType.LIF, OpType.MS):
+            if node.op_type not in (OpType.IF, OpType.LIF, OpType.MS, OpType.ILIF):
                 continue
             if not node.output_shapes:
                 continue
@@ -438,8 +438,9 @@ class CUDAGraphEngine:
                 # - MatMul/Linear: flattened 2D (M,N) for GEMM kernels
                 # - Everything else: ONNX shape as-is
                 _NHWC_OPS = {OpType.Conv2d, OpType.MaxPool, OpType.GlobalAvgPool,
-                             OpType.Add, OpType.IF, OpType.LIF, OpType.MS,
+                             OpType.Add, OpType.IF, OpType.LIF, OpType.MS, OpType.ILIF,
                              OpType.Tile, OpType.Sub, OpType.Mul, OpType.Scale,
+                             OpType.Resize, OpType.Concat, OpType.Slice,
                              OpType.FusedAttention}
                 _GEMM_OPS = {OpType.MatMul, OpType.Linear}
                 if len(shape) == 4 and node.op_type in _NHWC_OPS:
@@ -497,7 +498,7 @@ class CUDAGraphEngine:
         # Neuron buffers: derive shape from predecessor
         for nid in self.ir.topo_order:
             node = self.ir.nodes[nid]
-            if node.op_type not in (OpType.IF, OpType.LIF, OpType.MS):
+            if node.op_type not in (OpType.IF, OpType.LIF, OpType.MS, OpType.ILIF):
                 continue
             preds = self.ir.predecessors(nid)
             if preds and preds[0] in self.activations:
@@ -835,6 +836,18 @@ class CUDAGraphEngine:
                 self.activations[nid] = inputs[0] * scale
             elif node.op_type == OpType.Mul and len(inputs) >= 2:
                 self.activations[nid] = inputs[0] * inputs[1]
+            elif node.op_type == OpType.Slice and len(inputs) >= 1:
+                starts = node.extra_attrs.get("starts", [0])
+                ends = node.extra_attrs.get("ends", [x.shape[0]])
+                axes = node.extra_attrs.get("axes", [0])
+                result = inputs[0]
+                for a, s, e in zip(axes, starts, ends):
+                    nhwc_axis = {0: 0, 1: 3, 2: 1, 3: 2}.get(a, a) if result.ndim == 4 else a
+                    dim_size = result.shape[nhwc_axis]
+                    e_c = min(e, dim_size) if e >= 0 else max(0, dim_size + e)
+                    s_c = max(0, s) if s >= 0 else max(0, dim_size + s)
+                    result = torch.narrow(result, nhwc_axis, s_c, e_c - s_c)
+                self.activations[nid] = result.contiguous()
             elif len(inputs) >= 1:
                 self.activations[nid] = inputs[0]
 
@@ -866,6 +879,62 @@ class CUDAGraphEngine:
                 # Input already has B first dim (T already collapsed upstream)
                 result = x
             self.activations[nid] = result
+
+        elif kv == KernelVariant.CUDAResize:
+            # Nearest-neighbor upsample: NHWC (N,H,W,C) → (N,OH,OW,C)
+            scales = node.extra_attrs.get("scales", [1, 1, 2, 2])
+            scale_h = int(scales[2]) if len(scales) > 2 else 2
+            scale_w = int(scales[3]) if len(scales) > 3 else 2
+            # NHWC → NCHW for F.interpolate → back to NHWC
+            x_nchw = x.permute(0, 3, 1, 2).contiguous()
+            result_nchw = F.interpolate(x_nchw, scale_factor=(scale_h, scale_w), mode='nearest')
+            self.activations[nid] = result_nchw.permute(0, 2, 3, 1).contiguous()
+
+        elif kv == KernelVariant.CUDAConcat:
+            # Channel concat: gather all predecessor activations, cat along C (last dim in NHWC)
+            self.activations[nid] = torch.cat(inputs, dim=-1)
+
+        elif kv == KernelVariant.CUDAVec4ILIF:
+            # I-LIF: mem = decay*(mem-spike) + x; spike = round(clamp(mem, 0, max_level))
+            mem = self.membranes.get(nid)
+            np_ = node.neuron_params
+            if mem is not None and np_ is not None:
+                decay = np_.decay
+                max_level = float(np_.max_level)
+                x_flat = x.reshape(-1, mem.shape[-1])
+                TB_val = x_flat.shape[0]
+                B_val = mem.shape[0] // (x_flat.shape[-1] // mem.shape[-1]) if mem.shape[-1] == x_flat.shape[-1] else max(TB_val // self.T, 1)
+                spatial = mem.shape[0]
+                out_flat = torch.empty_like(x_flat)
+                spike = torch.zeros(1, device='cuda')
+                for t in range(self.T):
+                    frame = x_flat[t * spatial:(t + 1) * spatial].float()
+                    v = mem.float()
+                    v = decay * (v - spike.expand_as(v)) + frame
+                    spike = torch.round(torch.clamp(v, 0, max_level))
+                    mem.copy_(v)
+                    out_flat[t * spatial:(t + 1) * spatial] = spike.to(x.dtype)
+                self.activations[nid] = out_flat.reshape(x.shape)
+            else:
+                self.activations[nid] = x
+
+        elif kv == KernelVariant.CUDASoftmax:
+            axis = node.extra_attrs.get("axis", -1)
+            self.activations[nid] = F.softmax(x, dim=axis)
+
+        elif node.op_type == OpType.Slice:
+            starts = node.extra_attrs.get("starts", [0])
+            ends = node.extra_attrs.get("ends", [x.shape[0]])
+            axes = node.extra_attrs.get("axes", [0])
+            result = x
+            for a, s, e in zip(axes, starts, ends):
+                # NCHW axis → NHWC axis: 0→0, 1→3, 2→1, 3→2
+                nhwc_axis = {0: 0, 1: 3, 2: 1, 3: 2}.get(a, a) if x.ndim == 4 else a
+                dim_size = result.shape[nhwc_axis]
+                e_c = min(e, dim_size) if e >= 0 else max(0, dim_size + e)
+                s_c = max(0, s) if s >= 0 else max(0, dim_size + s)
+                result = torch.narrow(result, nhwc_axis, s_c, e_c - s_c)
+            self.activations[nid] = result.contiguous()
 
         elif kv == KernelVariant.CuBLASGemm:
             w = self.weights.get(nid)

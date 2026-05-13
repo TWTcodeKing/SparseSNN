@@ -1,0 +1,5 @@
+arch: spike_yolo
+width_mult: 0.5
+depth_mult: 0.33
+decay: 0.25
+max_level: 4

@@ -29,6 +29,7 @@ from sengine.tdl.analysis import (
 from sengine.tdl.neuron_ops import (
     FusedLIFOp, FusedIFOp, FusedMSOp,
     FusedLIFPluginOp, FusedIFPluginOp, FusedMSPluginOp,
+    FusedILIFOp, FusedILIFPluginOp,
 )
 from sengine.tdl.dssa_4d import DSSA4D
 from sengine.tdl.ssa_4d import (
@@ -217,6 +218,15 @@ class TDLTransform:
                     return _fwd
                 module.forward = _make_ms(p, OpClass)
 
+            elif p['type'] == 'ILIF':
+                OpClass = FusedILIFOp if use_native else FusedILIFPluginOp
+                def _make_ilif(params, cls):
+                    def _fwd(x):
+                        return cls.apply(x, params['T'],
+                                         params['decay'], params['max_level'])
+                    return _fwd
+                module.forward = _make_ilif(p, OpClass)
+
     # ------------------------------------------------------------------
     # TDL-3: Temporal Attention Decomposition — replace with 4D variants
     # ------------------------------------------------------------------
@@ -289,6 +299,14 @@ class TDLTransform:
               and hasattr(model, 'sn_out')):
             # MS-ResNet104/Cifar pattern
             self._patch_msresnet104_forward()
+        elif (hasattr(model, 'backbone') and hasattr(model, 'neck')
+              and hasattr(model, 'detect')):
+            # Detection model pattern (ems_yolo)
+            self._patch_detection_forward()
+        elif (hasattr(model, 'stem') and hasattr(model, 'neck')
+              and hasattr(model, 'detect')):
+            # Detection model pattern (spike_yolo — no separate backbone)
+            self._patch_detection_forward()
         else:
             # Generic fallback — try to detect the pattern
             self._patch_generic_forward()
@@ -735,6 +753,146 @@ class TDLTransform:
 
         model.forward = forward_4d
 
+    def _patch_detection_forward(self):
+        """4D forward for detection models (ems_yolo, spike_yolo).
+
+        Original: (B,C,H,W) → repeat → (T,B,C,H,W) → backbone → neck → mean(T) per feature → detect
+        4D:       (B,C,H,W) → tile → (T*B,C,H,W) → backbone(4D) → neck(4D) → reshape+mean per feature → detect
+        """
+        T = self.T
+        model = self.model
+
+        # Replace TDBNContainer's BN3d with BN2d for 4D compatibility.
+        self._convert_tdbn_to_4d(model)
+
+        # Patch the neck's forward to work on 4D tensors
+        self._patch_neck_for_4d(model.neck)
+
+        has_backbone = hasattr(model, 'backbone')
+
+        # Patch C2fSpike blocks for 4D (they have T,B,C,H,W = x.shape unpack)
+        self._patch_c2fspike_for_4d(model)
+
+        def forward_4d(x):
+            # x: (B, C, H, W) → tile → (T*B, C, H, W)
+            x = x.repeat(T, 1, 1, 1)
+
+            if has_backbone:
+                # ems_yolo: backbone returns [p3, p4, p5]
+                features = model.backbone(x)
+            else:
+                # spike_yolo: stem + stages inline
+                x = model.stem_neuron(model.stem(x))
+                x = model.stage1(x)
+                x = model.stage2(x)
+                p3 = x
+                x = model.stage3(x)
+                p4 = x
+                x = model.stage4(x)
+                p5 = x
+                features = [p3, p4, p5]
+
+            # Neck (4D)
+            features = model.neck(features)
+
+            # Per-feature temporal mean: (T*B, C, H, W) → (B, C, H, W)
+            out_features = []
+            for f in features:
+                TB = f.shape[0]
+                B = TB // T
+                out_features.append(f.reshape(T, B, *f.shape[1:]).mean(0))
+            return model.detect(out_features)
+
+        model.forward = forward_4d
+
+    def _patch_c2fspike_for_4d(self, module):
+        """Patch C2fSpike blocks: replace 5D T,B,C,H,W unpack + dim=2 cat with 4D."""
+        try:
+            from models.spike_yolo import C2fSpike
+        except ImportError:
+            return
+        for name, child in module.named_modules():
+            if isinstance(child, C2fSpike):
+                self._originals[name] = child.forward
+                def _make_c2f_4d(blk):
+                    def _fwd(x):
+                        x = blk.cv1(x)
+                        C = x.shape[1]  # 4D: (TB, C, H, W)
+                        x0 = x[:, :C // 2]
+                        x1 = x[:, C // 2:]
+                        parts = [x0, x1]
+                        for block in blk.blocks:
+                            x1 = block(x1)
+                            parts.append(x1)
+                        out = torch.cat(parts, dim=1)  # dim=1 for 4D channel
+                        return blk.cv2(out)
+                    return _fwd
+                child.forward = _make_c2f_4d(child)
+
+    def _convert_tdbn_to_4d(self, module):
+        """Replace BN3d in TDBNContainer with BN2d, patch forward for 4D."""
+        from models.msresnet import TDBNContainer
+        for name, child in module.named_children():
+            if isinstance(child, TDBNContainer):
+                conv = child.module[0]
+                bn3d = child.module[1]
+                # Create BN2d with same weights as BN3d
+                bn2d = nn.BatchNorm2d(bn3d.num_features)
+                bn2d.weight = bn3d.weight
+                bn2d.bias = bn3d.bias
+                bn2d.running_mean = bn3d.running_mean
+                bn2d.running_var = bn3d.running_var
+                bn2d.num_batches_tracked = bn3d.num_batches_tracked
+                bn2d.eps = bn3d.eps
+                bn2d.momentum = bn3d.momentum
+                child.module[1] = bn2d
+                # Patch forward: just Conv2d + BN2d on (T*B, C, H, W)
+                def _make_4d_fwd(c, b):
+                    def _fwd(x):
+                        return b(c(x))
+                    return _fwd
+                child.forward = _make_4d_fwd(conv, bn2d)
+            else:
+                self._convert_tdbn_to_4d(child)
+
+    def _patch_neck_for_4d(self, neck):
+        """Patch FPN/PANet neck to accept list of 4D tensors.
+
+        Original necks expect (T,B,C,H,W) features, do flatten(0,1)/view(T,B,...).
+        In 4D mode, input is (T*B,C,H,W) — flatten is no-op, cat uses dim=1.
+        """
+        import torch.nn.functional as _F
+        # EMSFPN pattern (ems_yolo)
+        if hasattr(neck, 'lateral5') and hasattr(neck, 'smooth4'):
+            def _emsfpn_4d(features):
+                p3, p4, p5 = features
+                p5_up = neck.sn5(neck.lateral5(p5))
+                p5_up = _F.interpolate(p5_up, size=p4.shape[2:], mode='nearest')
+                p4 = neck.sn4(neck.smooth4(p4 + p5_up))
+                p4_up = neck.sn4_lat(neck.lateral4(p4))
+                p4_up = _F.interpolate(p4_up, size=p3.shape[2:], mode='nearest')
+                p3 = neck.sn3(neck.smooth3(p3 + p4_up))
+                return [p3, p4, p5]
+            neck.forward = _emsfpn_4d
+        # SpikePANet pattern (spike_yolo)
+        elif hasattr(neck, 'up5') and hasattr(neck, 'td4'):
+            def _spikepan_4d(features):
+                p3, p4, p5 = features
+                # Top-down
+                p5_up = neck.up5(p5)
+                p5_up = _F.interpolate(p5_up, size=p4.shape[2:], mode='nearest')
+                p4 = neck.td4(torch.cat([p4, p5_up], dim=1))  # dim=1 for NCHW 4D
+                p4_up = neck.up4(p4)
+                p4_up = _F.interpolate(p4_up, size=p3.shape[2:], mode='nearest')
+                p3 = neck.td3(torch.cat([p3, p4_up], dim=1))
+                # Bottom-up
+                p3_down = neck.down3(p3)
+                p4 = neck.bu4(torch.cat([p4, p3_down], dim=1))
+                p4_down = neck.down4(p4)
+                p5 = neck.bu5(torch.cat([p5, p4_down], dim=1))
+                return [p3, p4, p5]
+            neck.forward = _spikepan_4d
+
     def _patch_generic_forward(self):
         """Fallback: wrap original forward with 4D input handling."""
         T = self.T
@@ -933,9 +1091,11 @@ def export_with_fused_neurons(
         n_lif = sum(1 for p in neuron_params.values() if p['type'] == 'LIF')
         n_if = sum(1 for p in neuron_params.values() if p['type'] == 'IF')
         n_ms = sum(1 for p in neuron_params.values() if p['type'] == 'MS')
+        n_ilif = sum(1 for p in neuron_params.values() if p['type'] == 'ILIF')
         parts = [f"{n_lif} LIF"] if n_lif else []
         parts += [f"{n_if} IF"] if n_if else []
         parts += [f"{n_ms} MS"] if n_ms else []
+        parts += [f"{n_ilif} ILIF"] if n_ilif else []
         print(f"  Found {' + '.join(parts)} neurons")
 
     if flatten_temporal:

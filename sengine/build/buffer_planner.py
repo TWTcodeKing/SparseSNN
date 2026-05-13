@@ -464,6 +464,82 @@ def plan_buffers(ir: EngineIR, schedule: list[int],
                 membrane_buf=membrane_bufs.get(nid, -1),
                 params={"variant": node.attention_params.variant if node.attention_params else "unknown"}))
 
+        elif kv == KernelVariant.CUDAResize:
+            scales = node.extra_attrs.get("scales", [1, 1, 2, 2])
+            sh = int(scales[2]) if len(scales) > 2 else 2
+            sw = int(scales[3]) if len(scales) > 3 else 2
+            # Get input shape from buffer manifest
+            in_shape = ()
+            for bd in bufs:
+                if bd.buf_id == input_bid:
+                    in_shape = bd.shape; break
+            params = {"scale_h": sh, "scale_w": sw}
+            if len(in_shape) == 4:
+                params.update({"N": in_shape[0], "H": in_shape[1],
+                               "W": in_shape[2], "C": in_shape[3]})
+            nodes.append(NodeExecPlan(
+                nid=nid, kernel_type="resize",
+                input_bufs=[input_bid], output_buf=output_bid, params=params))
+
+        elif kv == KernelVariant.CUDAConcat:
+            # Concat needs multiple input buffers
+            input_bids = []
+            for pid in preds:
+                bid = buf_map.get(pid, -1)
+                if bid == -1: bid = _find_input_buf(nid, [pid])
+                if bid >= 0: input_bids.append(bid)
+            axis = node.extra_attrs.get("axis", 1)
+            nodes.append(NodeExecPlan(
+                nid=nid, kernel_type="concat",
+                input_bufs=input_bids, output_buf=output_bid,
+                params={"axis": axis}))
+
+        elif kv == KernelVariant.CUDAVec4ILIF:
+            total = 0
+            if node.output_shapes:
+                for d in node.output_shapes[0]: total = total * d if total else d
+            spatial = total // T if T > 0 else total
+            np_ = node.neuron_params
+            params = {"total_elems": total, "spatial_elems": spatial,
+                      "decay": np_.decay if np_ else 0.25,
+                      "max_level": float(np_.max_level if np_ else 4)}
+            nodes.append(NodeExecPlan(
+                nid=nid, kernel_type="ilif_neuron",
+                input_bufs=[input_bid], output_buf=output_bid,
+                membrane_buf=membrane_bufs.get(nid, -1), params=params))
+
+        elif node.op_type == OpType.Slice:
+            # Slice produces a subset of the input — needs own output buffer
+            nodes.append(NodeExecPlan(
+                nid=nid, kernel_type="alias",
+                input_bufs=[input_bid], output_buf=output_bid,
+                params=node.extra_attrs))
+
+        elif kv == KernelVariant.CUDASoftmax:
+            axis = node.extra_attrs.get("axis", -1)
+            in_shape = ()
+            for bd in bufs:
+                if bd.buf_id == input_bid:
+                    in_shape = bd.shape; break
+            # Compute outer/inner from shape and axis
+            ndim = len(in_shape)
+            ax = axis if axis >= 0 else ndim + axis
+            outer = 1
+            inner = 1
+            for i, d in enumerate(in_shape):
+                if i < ax: outer *= d
+                elif i == ax: inner = d
+                else: outer *= d  # flatten remaining dims into outer? No — inner is just the axis dim
+            # Actually: outer = product of all dims except axis dim
+            outer = 1
+            for i, d in enumerate(in_shape):
+                if i != ax: outer *= d
+            inner = in_shape[ax] if 0 <= ax < ndim else 1
+            nodes.append(NodeExecPlan(
+                nid=nid, kernel_type="softmax",
+                input_bufs=[input_bid], output_buf=output_bid,
+                params={"outer": outer, "inner": inner}))
+
         else:
             nodes.append(NodeExecPlan(nid=nid, kernel_type="skip"))
 

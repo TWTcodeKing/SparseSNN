@@ -208,7 +208,7 @@ def _find_neuron_through_transparent(ir: EngineIR, start_nid: int, max_depth: in
         s = ir.nodes.get(succs[0])
         if s is None:
             return None
-        if s.op_type in (OpType.IF, OpType.LIF, OpType.MS):
+        if s.op_type in (OpType.IF, OpType.LIF, OpType.MS, OpType.ILIF):
             return s
         if s.op_type in _TRANSPARENT_OPS:
             cur = s.id
@@ -565,7 +565,8 @@ def annotate_layout(ir: EngineIR):
     """
     for node in ir.nodes.values():
         if node.op_type in (OpType.Conv2d, OpType.IF, OpType.LIF, OpType.MS,
-                            OpType.Add, OpType.MaxPool, OpType.GlobalAvgPool):
+                            OpType.ILIF, OpType.Add, OpType.MaxPool,
+                            OpType.GlobalAvgPool, OpType.Resize, OpType.Concat):
             node.layout = TensorLayout.NHWC
         else:
             node.layout = TensorLayout.NCHW
@@ -994,8 +995,43 @@ def _compute_output_shape(node: Node, in_shapes: list[tuple], T: int) -> tuple:
             return (inp[0], inp[1], 1)
         return inp
 
-    if node.op_type in (OpType.IF, OpType.LIF, OpType.MS,
-                        OpType.Add, OpType.Mul, OpType.Sub, OpType.Scale):
+    if node.op_type in (OpType.IF, OpType.LIF, OpType.MS, OpType.ILIF,
+                        OpType.Add, OpType.Mul, OpType.Sub, OpType.Scale,
+                        OpType.Softmax):
+        return inp
+
+    if node.op_type == OpType.Resize:
+        scales = node.extra_attrs.get("scales")
+        sizes = node.extra_attrs.get("sizes")
+        if sizes and len(sizes) == 4:
+            return tuple(sizes)
+        if scales and len(scales) == 4 and len(inp) == 4:
+            N, C, H, W = inp
+            return (N, C, int(H * scales[2]), int(W * scales[3]))
+        return inp
+
+    if node.op_type == OpType.Slice:
+        starts = node.extra_attrs.get("starts", [])
+        ends = node.extra_attrs.get("ends", [])
+        axes = node.extra_attrs.get("axes", list(range(len(starts))))
+        out = list(inp)
+        for a, s, e in zip(axes, starts, ends):
+            if 0 <= a < len(out):
+                dim = out[a]
+                e_c = min(e, dim) if e >= 0 else max(0, dim + e)
+                s_c = max(0, s) if s >= 0 else max(0, dim + s)
+                out[a] = e_c - s_c
+        return tuple(out)
+
+    if node.op_type == OpType.Concat:
+        axis = node.extra_attrs.get("axis", 1)
+        if len(in_shapes) >= 2 and all(len(s) == len(in_shapes[0]) for s in in_shapes):
+            out = list(in_shapes[0])
+            ndim = len(out)
+            ax = axis if axis >= 0 else ndim + axis
+            if 0 <= ax < ndim:
+                out[ax] = sum(s[ax] for s in in_shapes)
+            return tuple(out)
         return inp
 
     if node.op_type == OpType.Flatten:
@@ -1039,9 +1075,12 @@ def _compute_output_shape(node: Node, in_shapes: list[tuple], T: int) -> tuple:
         return inp
 
     if node.op_type == OpType.TemporalMean:
+        if len(inp) == 5:
+            # (T, B, C, H, W) → (B, C, H, W) — drop T dimension
+            return inp[1:]
         if len(inp) >= 1:
             B = inp[0] // T if T > 0 else inp[0]
-            return (max(B, 1),) + inp[1:]  # clamp for dynamic dims
+            return (max(B, 1),) + inp[1:]  # (T*B, ...) → (B, ...)
         return inp
 
     if node.op_type == OpType.Transpose:
@@ -1130,13 +1169,14 @@ def _compute_output_shape(node: Node, in_shapes: list[tuple], T: int) -> tuple:
 # Pass 7: Bound Classification + TileLang Kernel Assignment
 # ============================================================
 
-_NEURON_OPS = {OpType.IF, OpType.LIF, OpType.MS}
+_NEURON_OPS = {OpType.IF, OpType.LIF, OpType.MS, OpType.ILIF}
 _COMPUTE_OPS = {OpType.Conv2d, OpType.Linear, OpType.MatMul, OpType.Gemm}
 _MEMORY_OPS = {OpType.Add, OpType.Mul, OpType.Sub, OpType.MaxPool,
-               OpType.GlobalAvgPool, OpType.TemporalMean, OpType.Scale}
+               OpType.GlobalAvgPool, OpType.TemporalMean, OpType.Scale,
+               OpType.Resize, OpType.Concat, OpType.Softmax, OpType.Slice}
 _ZERO_OPS = {OpType.Flatten, OpType.Reshape, OpType.Transpose, OpType.Identity,
              OpType.Tile, OpType.InputConvert, OpType.OutputConvert,
-             OpType.Concat, OpType.ReduceMean}
+             OpType.ReduceMean}
 
 
 def _is_sequential_context(ir: EngineIR, conv_nid: int) -> bool:
@@ -1247,8 +1287,8 @@ def classify_bound_and_assign_tilelang(ir: EngineIR, batch_size: int = 1):
                 # Grouped conv (not depthwise): use TileLang grouped kernel
                 node.assigned_kernel = KernelVariant.TileLangGroupedConvBN
                 n_decomposed += 1
-            elif cp.in_channels < 4 or K_red % 8 != 0:
-                # Stem conv (C_in<4) or misaligned dims: cuDNN fallback
+            elif cp.in_channels < 4 or cp.out_channels < 8 or K_red % 8 != 0:
+                # Stem conv (C_in<4), tiny output (C_out<8), or misaligned: cuDNN fallback
                 node.assigned_kernel = KernelVariant.CuDNNConv
             else:
                 # Compute M_per_timestep from output shapes
@@ -1276,6 +1316,11 @@ def classify_bound_and_assign_tilelang(ir: EngineIR, batch_size: int = 1):
         elif node.op_type in (OpType.LIF, OpType.MS):
             if node.assigned_kernel != KernelVariant.ZeroCost:
                 node.assigned_kernel = KernelVariant.CUDAVec4LIF
+            node.layout = TensorLayout.NHWC
+
+        elif node.op_type == OpType.ILIF:
+            if node.assigned_kernel != KernelVariant.ZeroCost:
+                node.assigned_kernel = KernelVariant.CUDAVec4ILIF
             node.layout = TensorLayout.NHWC
 
         elif node.op_type == OpType.Linear:

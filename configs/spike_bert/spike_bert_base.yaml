@@ -1,0 +1,8 @@
+arch: spike_bert
+vocab_size: 30522
+hidden_dim: 768
+num_heads: 12
+num_layers: 12
+max_seq_len: 512
+tau: 2.0
+mlp_ratio: 4

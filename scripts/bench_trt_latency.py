@@ -155,21 +155,25 @@ def main():
         tag = os.path.splitext(os.path.basename(args.onnx))[0]
         batch_sizes = [int(x) for x in args.batch_sizes.split(',')]
 
+        # Dynamic workspace based on available GPU memory
+        gpu_mem_bytes = torch.cuda.get_device_properties(device_id).total_memory
+        gpu_free_bytes = gpu_mem_bytes - torch.cuda.memory_reserved(device_id)
+        workspace_gb = max(1.0, (gpu_free_bytes / (1 << 30)) - 2.0)
+
         results = {}
         for B in batch_sizes:
             input_shape = (B, in_channels, img_size, img_size)
             engine_path = os.path.join(args.engine_dir,
                                        f"{tag}_b{B}.engine")
 
-            # Build TRT engine (re-export ONNX per batch not needed for
-            # dynamic batch engines, but we build fixed-batch for best perf)
             if not os.path.exists(engine_path):
-                print(f"\n  [B={B}] Building TRT engine (dense {'FP16' if args.fp16 else 'FP32'})...")
+                print(f"\n  [B={B}] Building TRT engine (dense {'FP16' if args.fp16 else 'FP32'}"
+                      f", workspace={workspace_gb:.1f}GB)...")
                 try:
                     build_engine(args.onnx, engine_path,
                                  sparse=args.sparse, fp16=args.fp16,
                                  min_batch=B, opt_batch=B, max_batch=B,
-                                 workspace_gb=4.0, verbose=False)
+                                 workspace_gb=workspace_gb, verbose=False)
                     print(f"          Saved: {engine_path}")
                 except Exception as e:
                     import traceback
@@ -226,6 +230,8 @@ def main():
     sparse_tag = '_sparse' if args.sparse else ''
     results = {}
 
+    # ── Phase 1: Export all ONNX files (model must be on GPU) ──
+
     # Dynamic batch: export once with B=1 + dynamic axis, reuse for all sizes
     if args.dynamic_batch:
         dyn_onnx = os.path.join(args.engine_dir, f"{tag}{sparse_tag}.onnx")
@@ -239,96 +245,104 @@ def main():
         else:
             print(f"\n  ONNX exists: {dyn_onnx}")
 
+    onnx_paths = {}
     for B in batch_sizes:
         if args.dynamic_batch:
-            onnx_path = dyn_onnx
+            onnx_paths[B] = dyn_onnx
         else:
             onnx_path = os.path.join(args.engine_dir, f"{tag}_b{B}{sparse_tag}.onnx")
+            onnx_paths[B] = onnx_path
+            if not os.path.exists(onnx_path):
+                print(f"\n  [B={B}] Exporting ONNX (standard torch.onnx.export)...")
+                reset_net(model)
+                export_onnx(model, onnx_path, input_shape=(B, in_channels, img_size, img_size),
+                            dynamic_batch=False, simplify=not args.no_simplify,
+                            verbose=False)
+                # Consolidate external data into single/minimal file(s)
+                if args.single_file:
+                    import onnx
+                    from onnx.external_data_helper import (
+                        convert_model_from_external_data,
+                        convert_model_to_external_data,
+                        write_external_data_tensors)
+                    onnx_dir = os.path.dirname(os.path.abspath(onnx_path)) or '.'
+                    onnx_model = onnx.load(onnx_path, load_external_data=False)
+                    ext_files = set()
+                    for tensor in onnx_model.graph.initializer:
+                        for entry in tensor.external_data:
+                            if entry.key == 'location':
+                                ext_files.add(entry.value)
+                    for node in onnx_model.graph.node:
+                        for attr in node.attribute:
+                            if attr.type == 4 and attr.t.data_location == 1:
+                                for entry in attr.t.external_data:
+                                    if entry.key == 'location':
+                                        ext_files.add(entry.value)
+                    onnx_model = onnx.load(onnx_path)
+                    convert_model_from_external_data(onnx_model)
+                    try:
+                        onnx.save(onnx_model, onnx_path)
+                        msg = "single file"
+                    except Exception:
+                        data_file = os.path.basename(onnx_path) + '.data'
+                        convert_model_to_external_data(
+                            onnx_model, all_tensors_to_one_file=True,
+                            location=data_file, size_threshold=0)
+                        write_external_data_tensors(onnx_model, onnx_dir)
+                        with open(onnx_path, 'wb') as f:
+                            f.write(onnx_model.SerializeToString())
+                        msg = f"onnx + {data_file} (model > 2GB)"
+                    keep = {os.path.basename(onnx_path) + '.data'}
+                    for f in ext_files:
+                        if f in keep:
+                            continue
+                        fpath = os.path.join(onnx_dir, f)
+                        if os.path.isfile(fpath):
+                            os.remove(fpath)
+                    print(f"          Saved ({msg}): {onnx_path}")
+                else:
+                    print(f"          Saved: {onnx_path}")
+            else:
+                print(f"\n  [B={B}] ONNX exists: {onnx_path}")
+
+    # Free model before TRT build — TRT builder needs maximum GPU memory
+    del model
+    torch.cuda.empty_cache()
+    import gc; gc.collect()
+
+    if args.export_only:
+        print(f"\n  Export complete. ONNX files in: {args.engine_dir}/")
+        return
+
+    # ── Phase 2+3: Build engines + benchmark (model freed, max GPU memory available) ──
+    # Compute workspace as available GPU memory minus headroom
+    gpu_mem_bytes = torch.cuda.get_device_properties(device_id).total_memory
+    gpu_free_bytes = gpu_mem_bytes - torch.cuda.memory_reserved(device_id)
+    workspace_gb = max(1.0, (gpu_free_bytes / (1 << 30)) - 2.0)
+
+    for B in batch_sizes:
+        onnx_path = onnx_paths[B]
         engine_path = os.path.join(args.engine_dir, f"{tag}_b{B}{sparse_tag}.engine")
         input_shape = (B, in_channels, img_size, img_size)
 
-        # Step 1: Export standard ONNX (no TDL, no custom ops)
-        if not args.dynamic_batch and not os.path.exists(onnx_path):
-            print(f"\n  [B={B}] Exporting ONNX (standard torch.onnx.export)...")
-            reset_net(model)
-            export_onnx(model, onnx_path, input_shape=input_shape,
-                        dynamic_batch=False, simplify=not args.no_simplify,
-                        verbose=False)
-            # Consolidate external data into single/minimal file(s)
-            if args.single_file:
-                import onnx
-                from onnx.external_data_helper import (
-                    convert_model_from_external_data,
-                    convert_model_to_external_data,
-                    write_external_data_tensors)
-                onnx_dir = os.path.dirname(os.path.abspath(onnx_path)) or '.'
-                onnx_model = onnx.load(onnx_path, load_external_data=False)
-                # Collect external data file names
-                ext_files = set()
-                for tensor in onnx_model.graph.initializer:
-                    for entry in tensor.external_data:
-                        if entry.key == 'location':
-                            ext_files.add(entry.value)
-                for node in onnx_model.graph.node:
-                    for attr in node.attribute:
-                        if attr.type == 4 and attr.t.data_location == 1:
-                            for entry in attr.t.external_data:
-                                if entry.key == 'location':
-                                    ext_files.add(entry.value)
-                # Reload with data and internalize
-                onnx_model = onnx.load(onnx_path)
-                convert_model_from_external_data(onnx_model)
-                # Try single-file save; if > 2GB, use one .data file
-                try:
-                    onnx.save(onnx_model, onnx_path)
-                    msg = "single file"
-                except Exception:
-                    # Model > 2GB: write all tensors to one .data file,
-                    # then serialize the small proto separately
-                    data_file = os.path.basename(onnx_path) + '.data'
-                    convert_model_to_external_data(
-                        onnx_model, all_tensors_to_one_file=True,
-                        location=data_file, size_threshold=0)
-                    # Write external data (clears raw_data from tensors)
-                    write_external_data_tensors(onnx_model, onnx_dir)
-                    # Now proto is small — write directly
-                    with open(onnx_path, 'wb') as f:
-                        f.write(onnx_model.SerializeToString())
-                    msg = f"onnx + {data_file} (model > 2GB)"
-                # Remove old per-tensor external data files
-                keep = {os.path.basename(onnx_path) + '.data'}
-                for f in ext_files:
-                    if f in keep:
-                        continue
-                    fpath = os.path.join(onnx_dir, f)
-                    if os.path.isfile(fpath):
-                        os.remove(fpath)
-                print(f"          Saved ({msg}): {onnx_path}")
-            else:
-                print(f"          Saved: {onnx_path}")
-        else:
-            print(f"\n  [B={B}] ONNX exists: {onnx_path}")
-
-        if args.export_only:
-            continue
-
-        # Step 2: Build TRT engine
+        # Build TRT engine
         if not os.path.exists(engine_path):
-            print(f"  [B={B}] Building TRT engine "
-                  f"({'sparse 2:4' if args.sparse else 'dense'} {'FP16' if args.fp16 else 'FP32'})...")
+            print(f"\n  [B={B}] Building TRT engine "
+                  f"({'sparse 2:4' if args.sparse else 'dense'} {'FP16' if args.fp16 else 'FP32'}"
+                  f", workspace={workspace_gb:.1f}GB)...")
             try:
                 build_engine(onnx_path, engine_path,
                              sparse=args.sparse, fp16=args.fp16,
                              min_batch=B, opt_batch=B, max_batch=B,
-                             workspace_gb=4.0, verbose=False)
+                             workspace_gb=workspace_gb, verbose=False)
                 print(f"          Saved: {engine_path}")
             except Exception as e:
                 print(f"          Build FAILED: {e}")
                 continue
         else:
-            print(f"  [B={B}] Engine exists: {engine_path}")
+            print(f"\n  [B={B}] Engine exists: {engine_path}")
 
-        # Step 3: Benchmark latency
+        # Benchmark latency
         try:
             with TRTRunner(engine_path, device=device_id) as runner:
                 result = runner.benchmark_latency(
@@ -341,13 +355,6 @@ def main():
                       f"({result['throughput_img_s']:.0f} img/s)")
         except Exception as e:
             print(f"  [B={B}] Benchmark FAILED: {e}")
-
-    del model
-    torch.cuda.empty_cache()
-
-    if args.export_only:
-        print(f"\n  Export complete. ONNX files in: {args.engine_dir}/")
-        return
 
     # Results table
     mode = "Sparse 2:4" if args.sparse else "Dense"

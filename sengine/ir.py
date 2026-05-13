@@ -39,12 +39,17 @@ class OpType(Enum):
     Concat = auto()
     ReduceMean = auto()
     FusedAttention = auto()      # Fused attention core (all variants)
+    Resize = auto()              # Spatial upsample (nearest/bilinear) — FPN necks
+    Softmax = auto()             # Softmax normalization — detection DFL head
+    ILIF = auto()                # Integer LIF neuron (multi-level spikes)
+    Slice = auto()               # Channel/spatial slice (C2fSpike split)
 
 
 class NeuronType(Enum):
     LIF = auto()
     IF = auto()
     MS = auto()
+    ILIF = auto()
     NoNeuron = auto()
 
 
@@ -74,6 +79,11 @@ class KernelVariant(Enum):
     TileLangLinearBNLIF = auto()   # Fused Linear+BN+LIF (MLP sequential chains)
     CUDAVec4IF = auto()            # Fast CUDA vec4 IF neuron (memory-bound)
     CUDAVec4LIF = auto()           # Fast CUDA vec4 LIF neuron (memory-bound)
+    CUDAVec4ILIF = auto()          # Fast CUDA vec4 I-LIF neuron (integer, multi-level spikes)
+    # Detection model ops (FPN/PANet neck, detection head)
+    CUDAResize = auto()            # Nearest-neighbor upsample (memory-bound)
+    CUDAConcat = auto()            # Channel concat (memory-bound)
+    CUDASoftmax = auto()           # Softmax normalization (DFL detection head)
     # Per-timestep fused Conv+BN+IF (T=1 per launch, correct, for large batch)
     TileLangFusedConvBNIF = auto() # Fused Conv+BN+IF epilogue (T_steps=1)
     TileLangFusedConv1x1BNIF = auto()  # Fused 1×1 Conv+BN+IF (T_steps=1)
@@ -160,6 +170,11 @@ KERNEL_CONTRACTS: dict = {
     # Neuron kernels: flatten internally but preserve predecessor layout
     KernelVariant.CUDAVec4IF:                None,
     KernelVariant.CUDAVec4LIF:               None,
+    KernelVariant.CUDAVec4ILIF:              None,
+    # Detection ops: NHWC spatial ops
+    KernelVariant.CUDAResize:                KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.CUDAConcat:                KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.CUDASoftmax:               None,
     # Layout-transparent (inherit from predecessor)
     KernelVariant.Elementwise:               None,
     KernelVariant.ZeroCost:                  None,
@@ -199,6 +214,9 @@ class NeuronParams:
     v_threshold: float = 1.0
     v_reset: float = 0.0
     hard_reset: bool = True
+    # I-LIF specific (integer LIF with multi-level spikes)
+    decay: float = 0.25
+    max_level: int = 4
 
 
 @dataclass

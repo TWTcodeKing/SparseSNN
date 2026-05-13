@@ -29,11 +29,15 @@ def collect_neuron_params(model: nn.Module) -> OrderedDict:
     """
     from models.neurons import MultiStepLIFNeuron, MultiStepIFNeuron
 
-    # MSNeuron may not exist in all configs
+    # Optional neuron types (not in all configs)
     try:
         from models.msresnet import MSNeuron
     except ImportError:
         MSNeuron = None
+    try:
+        from models.neurons import MultiStepILIFNeuron
+    except ImportError:
+        MultiStepILIFNeuron = None
 
     params = OrderedDict()
     T = getattr(model, 'T', 4)
@@ -74,6 +78,13 @@ def collect_neuron_params(model: nn.Module) -> OrderedDict:
                 'decay': float(module.decay),
                 'thresh': float(module.thresh),
             }
+        elif MultiStepILIFNeuron is not None and isinstance(module, MultiStepILIFNeuron):
+            params[name] = {
+                'type': 'ILIF',
+                'T': T,
+                'decay': float(module.decay),
+                'max_level': int(module.max_level),
+            }
 
     return params
 
@@ -90,6 +101,12 @@ def is_neuron(module: nn.Module) -> bool:
     try:
         from models.msresnet import MSNeuron
         if isinstance(module, MSNeuron):
+            return True
+    except ImportError:
+        pass
+    try:
+        from models.neurons import MultiStepILIFNeuron
+        if isinstance(module, MultiStepILIFNeuron):
             return True
     except ImportError:
         pass

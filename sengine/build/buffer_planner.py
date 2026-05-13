@@ -139,6 +139,21 @@ def plan_buffers(ir: EngineIR, schedule: list[int],
                               weight_key=f"__bn_bias_{nid}")
                 weight_bufs[f"bias_{nid}"] = bbid
 
+        # Fused MatMul+LIF (uses conv1x1_bn_if/lif template with identity BN)
+        elif node.assigned_kernel == KernelVariant.TileLangFusedMatMulLIF:
+            if node.output_shapes:
+                N_out = node.output_shapes[0][-1]
+                # Weight is the second input predecessor — tracked as activation
+                # buffer, not weight buffer. The plan Phase 4 will resolve it
+                # from the second predecessor's activation buffer.
+                # We still need dummy identity BN scale (ones) and bias (zeros).
+                sbid = _alloc((N_out,), "fp32", "1d", "bn_scale", nid,
+                              weight_key=f"__matmul_lif_scale_{nid}")
+                weight_bufs[f"scale_{nid}"] = sbid
+                bbid = _alloc((N_out,), "fp32", "1d", "bn_bias", nid,
+                              weight_key=f"__matmul_lif_bias_{nid}")
+                weight_bufs[f"bias_{nid}"] = bbid
+
     # ── Phase 2: Allocate membrane buffers ──
     for nid in ir.topo_order:
         node = ir.nodes.get(nid)
@@ -153,6 +168,11 @@ def plan_buffers(ir: EngineIR, schedule: list[int],
             N, C, H, W = shape
             Bm = max(N // T, 1)
             mem_shape = (Bm * H * W, C)
+        elif len(shape) == 3:
+            # 3D: (TB, spatial, channels) — from MatMul outputs
+            TB_val, spatial, channels = shape
+            Bm = max(TB_val // T, 1)
+            mem_shape = (Bm * spatial, channels)
         elif len(shape) == 2:
             M, N_dim = shape
             spatial = max(M // T, 1)
@@ -297,12 +317,26 @@ def plan_buffers(ir: EngineIR, schedule: list[int],
 
         elif kv in (KernelVariant.TileLangFusedConvBNIF,
                     KernelVariant.TileLangFusedConv1x1BNIF,
-                    KernelVariant.TileLangLinearBNLIF,
-                    KernelVariant.TileLangFusedMatMulLIF):
+                    KernelVariant.TileLangLinearBNLIF):
             nodes.append(NodeExecPlan(
                 nid=nid, kernel_type="tilelang_6", so_key=so_key,
                 input_bufs=[input_bid], output_buf=output_bid,
                 weight_buf=w_bid, scale_buf=s_bid, bias_buf=b_bid,
+                membrane_buf=mem_bid))
+
+        elif kv == KernelVariant.TileLangFusedMatMulLIF:
+            # MatMul+LIF uses conv1x1_bn_if/lif template with identity BN.
+            # Weight is the second predecessor's activation buffer (constant weight).
+            # Scale/bias are identity (allocated in Phase 1 above).
+            matmul_w_bid = -1
+            if len(preds) >= 2:
+                matmul_w_bid = buf_map.get(preds[1], -1)
+                if matmul_w_bid < 0:
+                    matmul_w_bid = _find_input_buf(nid, [preds[1]])
+            nodes.append(NodeExecPlan(
+                nid=nid, kernel_type="tilelang_6", so_key=so_key,
+                input_bufs=[input_bid], output_buf=output_bid,
+                weight_buf=matmul_w_bid, scale_buf=s_bid, bias_buf=b_bid,
                 membrane_buf=mem_bid))
 
         elif kv in (KernelVariant.TileLangMatMul, KernelVariant.TileLangMatMulScale):

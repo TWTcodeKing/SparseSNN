@@ -204,6 +204,16 @@ class CUDAGraphEngine:
         w_dtype = self.io_np_dtype
         for nid in self.ir.topo_order:
             node = self.ir.nodes[nid]
+
+            # Fused MatMul+LIF: identity BN (scale=ones, bias=zeros).
+            # These nodes have no weight_info (weight comes from predecessor),
+            # so handle before the weight_info guard below.
+            if node.assigned_kernel == KernelVariant.TileLangFusedMatMulLIF:
+                if node.output_shapes:
+                    N_out = node.output_shapes[0][-1]
+                    self.bn_scales[nid] = torch.ones(N_out, dtype=torch.float32, device='cuda')
+                    self.bn_biases[nid] = torch.zeros(N_out, dtype=torch.float32, device='cuda')
+
             if node.weight_info is None or node.weight_info.name not in self.ir.weights:
                 continue
 
@@ -377,6 +387,12 @@ class CUDAGraphEngine:
                 B = max(N // self.T, 1)  # clamp for post-temporal-mean nodes
                 # 2D membrane: (B*H*W, C) for temporal-safe CUDA IF kernel
                 self.membranes[nid] = torch.zeros(B * H * W, C,
+                                                  dtype=torch.float32, device='cuda')
+            elif len(shape) == 3:
+                # 3D: (TB, spatial, channels) — from MatMul outputs
+                TB_val, spatial, channels = shape
+                B = max(TB_val // self.T, 1)
+                self.membranes[nid] = torch.zeros(B * spatial, channels,
                                                   dtype=torch.float32, device='cuda')
             elif len(shape) == 2:
                 M, N_dim = shape
@@ -599,7 +615,9 @@ class CUDAGraphEngine:
 
         elif kv in (KernelVariant.TileLangFusedConvBNIF,
                     KernelVariant.TileLangFusedConv1x1BNIF):
-            # Per-timestep fused Conv+BN+IF: call T times, once per timestep
+            # Interleaved fused Conv+BN+IF: single call with full TB input.
+            # The kernel loops over T internally per-CTA, membrane persists
+            # in registers across timesteps.
             kern = self.kernels.get(nid)
             w = self.weights.get(nid)
             if kv == KernelVariant.TileLangFusedConv1x1BNIF:
@@ -615,24 +633,14 @@ class CUDAGraphEngine:
                     break
             if kern is not None and w is not None and sc is not None and bi is not None:
                 if mem is not None:
-                    # Reshape membrane from 2D to 4D for fused kernel
-                    cp = node.conv_params
-                    if cp and node.output_shapes:
-                        TB_out, C_out, OH_out, OW_out = node.output_shapes[0]
-                        B_out = TB_out // self.T
-                        mem_4d = mem.reshape(B_out, OH_out, OW_out, C_out)
-                        # Call T times — each processes one timestep
-                        spk_frames = []
-                        for t in range(self.T):
-                            frame = x[t*B_out:(t+1)*B_out]
-                            spk_t = kern(frame, w, mem_4d, sc, bi)
-                            spk_frames.append(spk_t)
-                        result = torch.cat(spk_frames, dim=0)  # (TB, OH, OW, C)
-                        self.activations[nid] = result
-                    else:
-                        # No membrane — just run as Conv+BN
-                        result = kern(x, w, sc, bi)
-                        self.activations[nid] = result
+                    # Interleaved kernel expects 2D membrane (B*OH*OW, F)
+                    # and full TB input — one call processes all T timesteps
+                    result = kern(x, w, mem, sc, bi)
+                    self.activations[nid] = result
+                else:
+                    # No membrane — just run as Conv+BN
+                    result = kern(x, w, sc, bi)
+                    self.activations[nid] = result
 
         elif kv == KernelVariant.TileLangDWConvBN:
             kern = self.kernels.get(nid)
@@ -775,8 +783,9 @@ class CUDAGraphEngine:
                 self.activations[nid] = result
 
         elif kv == KernelVariant.TileLangFusedMatMulLIF:
-            # Per-timestep fused MatMul+LIF: call T times, once per timestep
-            # Same pattern as TileLangFusedConvBNIF (lines above)
+            # Interleaved fused MatMul+LIF: single call with full TB input.
+            # The kernel is conv1x1_bn_if/lif (reused for MatMul), which expects
+            # (data, weight, state, bn_scale, bn_bias) with identity BN.
             kern = self.kernels.get(nid)
             if len(inputs) >= 2:
                 A, B_mat = inputs[0], inputs[1]
@@ -788,15 +797,18 @@ class CUDAGraphEngine:
                         mem = self.membranes[s]
                         break
                 if kern is not None and mem is not None:
-                    M_full = A.shape[0]
-                    M_per_t = M_full // self.T
-                    spk_frames = []
-                    for t in range(self.T):
-                        a_t = A[t * M_per_t : (t + 1) * M_per_t]
-                        b_t = B_mat[t * M_per_t : (t + 1) * M_per_t]
-                        spk_t = kern(a_t, b_t, mem)
-                        spk_frames.append(spk_t)
-                    result = torch.cat(spk_frames, dim=0)
+                    # Identity BN: scale=ones, bias=zeros
+                    N_out = B_mat.shape[-1]
+                    if not hasattr(self, '_matmul_lif_bn'):
+                        self._matmul_lif_bn = {}
+                    if N_out not in self._matmul_lif_bn:
+                        self._matmul_lif_bn[N_out] = (
+                            torch.ones(N_out, dtype=torch.float32, device='cuda'),
+                            torch.zeros(N_out, dtype=torch.float32, device='cuda'),
+                        )
+                    sc, bi = self._matmul_lif_bn[N_out]
+                    # Interleaved kernel: full TB input, 2D membrane, one call
+                    result = kern(A, B_mat, mem, sc, bi)
                     self.activations[nid] = result
                 else:
                     # Fallback: torch.matmul (no membrane or no kernel)

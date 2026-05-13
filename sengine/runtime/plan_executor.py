@@ -130,6 +130,51 @@ def setup_executor_from_plan(
                 s_ptr = p(node_plan.scale_buf)
                 b_ptr = p(node_plan.bias_buf)
                 out_ptr = p(node_plan.output_buf)
+                # Fused MatMul+LIF: weight comes from ir.weights via ZeroCost chain
+                if not w_ptr and node_plan.weight_buf < 0:
+                    node = ir.nodes.get(nid)
+                    if node:
+                        import numpy as np
+                        for pid in ir.predecessors(nid):
+                            pn = ir.nodes.get(pid)
+                            if pn and pn.op_type in (OpType.Transpose, OpType.Reshape):
+                                for iname in pn.input_names:
+                                    w = ir.weights.get(iname)
+                                    if w is not None:
+                                        _w_dtype = torch.float32 if ir.precision == "fp32" else torch.float16
+                                        wt = torch.from_numpy(w.copy()).to(_w_dtype).cuda() if isinstance(w, np.ndarray) else w.to(_w_dtype).cuda()
+                                        perm = pn.extra_attrs.get("perm")
+                                        if perm and len(perm) == wt.ndim:
+                                            wt = wt.permute(*perm).contiguous()
+                                        if not hasattr(py_engine, '_weight_keepalive'):
+                                            py_engine._weight_keepalive = []
+                                        py_engine._weight_keepalive.append(wt)
+                                        w_ptr = wt.data_ptr()
+                                        break
+                                # Also check deeper: Reshape → Transpose chain
+                                if not w_ptr:
+                                    for gpid in ir.predecessors(pid):
+                                        gpn = ir.nodes.get(gpid)
+                                        if gpn:
+                                            for iname in gpn.input_names:
+                                                w = ir.weights.get(iname)
+                                                if w is not None:
+                                                    _w_dtype = torch.float32 if ir.precision == "fp32" else torch.float16
+                                                    wt = torch.from_numpy(w.copy()).to(_w_dtype).cuda() if isinstance(w, np.ndarray) else w.to(_w_dtype).cuda()
+                                                    # Apply grandparent's perm first, then parent's
+                                                    gp_perm = gpn.extra_attrs.get("perm")
+                                                    if gp_perm and len(gp_perm) == wt.ndim:
+                                                        wt = wt.permute(*gp_perm).contiguous()
+                                                    perm = pn.extra_attrs.get("perm")
+                                                    if perm and len(perm) == wt.ndim:
+                                                        wt = wt.permute(*perm).contiguous()
+                                                    if not hasattr(py_engine, '_weight_keepalive'):
+                                                        py_engine._weight_keepalive = []
+                                                    py_engine._weight_keepalive.append(wt)
+                                                    w_ptr = wt.data_ptr()
+                                                    break
+                                if w_ptr:
+                                    break
                 if w_ptr and m_ptr and s_ptr and b_ptr:
                     exe.set_tilelang_6(nid, tl_idx, in_ptr, w_ptr, m_ptr, s_ptr, b_ptr, out_ptr)
                 else:

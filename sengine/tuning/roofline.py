@@ -100,7 +100,7 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
     # FP32 can't vectorize as wide as FP16 — TileLang's T.copy() generates
     # float32xN vector types that CUDA doesn't support when N>8.
     # Constraint: bM * bK / threads <= 8 for fp32 (and bN * bK / threads too).
-    bK_choices = [32, 64] if bpe == 2 else [32]
+    bK_choices = [32, 64, 128] if bpe == 2 else [32, 64]
     for bM in [16, 32, 64, 128]:
         for bN in [32, 64, 128]:
             for bK in bK_choices:
@@ -115,9 +115,9 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
                     if smem > hw['max_smem_per_sm']:
                         continue
                     grid = math.ceil(M_per_t / bM) * math.ceil(N / bN)
-                    if grid < sm_count // 8:
-                        continue
                     occ = _occupancy(bM, bN, bK, ns, thr, n_membranes, bpe)
+                    if grid < max(sm_count // 8, 1):
+                        continue
                     tile_area = bM * bN
                     cfg = dict(block_M=bM, block_N=bN, block_K=bK,
                                num_stages=ns, threads=thr)
@@ -127,16 +127,20 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
         return [dict(block_M=32, block_N=64, block_K=min(32, K),
                      num_stages=2, threads=128)]
 
-    # Unified ranking: balance tile area (TC efficiency) with grid size
-    # (SM parallelism). A tile is "good" if area >= 2048 AND grid >= SM/2.
-    # Penalize configs that fail either condition.
+    # Ranking: balance tile area (TC efficiency), grid coverage (SM parallelism),
+    # and K-loop depth (pipeline efficiency for large K reductions).
     sm_half = hw['sm_count'] // 2
     def _rank(cfg_tuple):
         cfg, grid, occ, area = cfg_tuple
-        # Prefer: large area (up to 4096), sufficient grid (>= SM/2)
+        # Tile area score: larger tiles = better tensor core utilization
         area_score = min(area, 4096)
-        grid_ok = 1 if grid >= sm_half else 0.5
-        return -(area_score * grid_ok)
+        # Grid coverage: prefer configs that fill the GPU
+        grid_ok = 1.0 if grid >= sm_half else 0.5
+        # K-loop depth penalty: deep K-loops (>256 iters) stall the pipeline.
+        # Larger block_K reduces iterations and improves data reuse.
+        k_iters = math.ceil(K / cfg['block_K'])
+        k_eff = min(1.0, 256.0 / k_iters) if k_iters > 256 else 1.0
+        return -(area_score * grid_ok * k_eff)
 
     all_cfgs.sort(key=_rank)
 

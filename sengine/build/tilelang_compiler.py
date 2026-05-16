@@ -73,10 +73,16 @@ def _load_cuda_if():
     # Auto-detect CUDA home and GPU arch
     import torch
     if 'CUDA_HOME' not in os.environ:
-        for p in ['/usr/local/cuda', '/usr/local/cuda-12.8', '/usr/local/cuda-12']:
+        for p in ['/usr/local/cuda-12.8', '/usr/local/cuda-12.6', '/usr/local/cuda-12', '/usr/local/cuda']:
             if os.path.exists(os.path.join(p, 'bin', 'nvcc')):
                 os.environ['CUDA_HOME'] = p
                 break
+    # Ensure CUDA_HOME/bin is on PATH so TileLang's nvcc finds the right version
+    cuda_home = os.environ.get('CUDA_HOME', '')
+    if cuda_home:
+        cuda_bin = os.path.join(cuda_home, 'bin')
+        if cuda_bin not in os.environ.get('PATH', ''):
+            os.environ['PATH'] = cuda_bin + ':' + os.environ.get('PATH', '')
     if 'TORCH_CUDA_ARCH_LIST' not in os.environ:
         props = torch.cuda.get_device_properties(0)
         os.environ['TORCH_CUDA_ARCH_LIST'] = f'{props.major}.{props.minor}'
@@ -450,7 +456,9 @@ class TileLangCompiler:
                 kern, is_new = self._get_fused_pool_lif(node)
                 kernels[nid] = kern
             elif kv in (KernelVariant.CUDAVec4IF, KernelVariant.CUDAVec4LIF):
-                kernels[nid] = get_cuda_if()
+                # Native CUDA IF/LIF kernels are in cpp_executor.cu — no compilation needed.
+                # The Python runtime loads the torch extension lazily only if needed.
+                kernels[nid] = None
                 is_new = False
             elif kv == KernelVariant.TileLangLinearBN:
                 kern, is_new = self._get_linear_bn(node)

@@ -15,6 +15,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cudnn.h>
 #include <dlfcn.h>
 #include <cstdio>
 #include <cstdlib>
@@ -466,6 +467,28 @@ __global__ void reduce_sum_head_dim_kernel(
     output[o_idx * N + n_idx] = __float2half(sum);
 }
 
+// ─── BN epilogue (channel-wise scale+bias on NHWC tensor) ───
+__global__ void bn_epilogue_fp16_kernel(
+    half* __restrict__ data, const float* __restrict__ scale,
+    const float* __restrict__ bias, int total, int C
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int c = idx % C;
+    float val = __half2float(data[idx]) * scale[c] + bias[c];
+    data[idx] = __float2half(val);
+}
+
+__global__ void bn_epilogue_fp32_kernel(
+    float* __restrict__ data, const float* __restrict__ scale,
+    const float* __restrict__ bias, int total, int C
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int c = idx % C;
+    data[idx] = data[idx] * scale[c] + bias[c];
+}
+
 // ─── Detection model kernels ───
 
 // Nearest-neighbor upsample (NHWC): (N,H,W,C) → (N,OH,OW,C)
@@ -622,7 +645,8 @@ enum KernelType {
     KT_RESIZE = 14,      // Nearest-neighbor upsample (FPN)
     KT_CONCAT = 15,      // Channel concat (FPN/PANet)
     KT_ILIF = 16,        // Integer LIF neuron (spike_yolo)
-    KT_SOFTMAX = 17      // Softmax (DFL detection head)
+    KT_SOFTMAX = 17,     // Softmax (DFL detection head)
+    KT_CUDNN_CONV = 18   // cuDNN Conv2d+BN (for validator-REVERT'd large 3×3 convs)
 };
 
 // ─── TileLang standalone kernel (loaded via dlopen) ───
@@ -732,6 +756,15 @@ struct NodeDesc {
     // For softmax (KT_SOFTMAX)
     void *sm_in, *sm_out;
     int sm_outer, sm_inner;
+
+    // For cuDNN Conv2d+BN (KT_CUDNN_CONV)
+    cudnnTensorDescriptor_t cudnn_in_desc, cudnn_out_desc;
+    cudnnFilterDescriptor_t cudnn_filt_desc;
+    cudnnConvolutionDescriptor_t cudnn_conv_desc;
+    cudnnConvolutionFwdAlgo_t cudnn_algo;
+    void *cudnn_workspace;
+    size_t cudnn_ws_size;
+    int cudnn_initialized;
 };
 
 // ─── Executor ───
@@ -750,6 +783,7 @@ struct SEngineExecutor {
     cudaGraphExec_t exec;
     int captured;
     cublasHandle_t cublas;
+    cudnnHandle_t cudnn;
     int is_fp32;  // global precision flag: 0=fp16, 1=fp32
 };
 
@@ -761,6 +795,7 @@ SEngineExecutor* sengine_create() {
     memset(e, 0, sizeof(SEngineExecutor));
     cudaStreamCreate(&e->stream);
     cublasCreate(&e->cublas);
+    e->cudnn = nullptr;  // lazy init — created on first cuDNN conv node
     cublasSetStream(e->cublas, e->stream);
     cublasSetMathMode(e->cublas, CUBLAS_TENSOR_OP_MATH);
     return e;
@@ -1079,6 +1114,72 @@ void sengine_set_softmax_node(SEngineExecutor* e, int nid,
     nd.type = KT_SOFTMAX;
     nd.sm_in = input; nd.sm_out = output;
     nd.sm_outer = outer; nd.sm_inner = inner;
+}
+
+// ─── cuDNN Conv2d+BN node (for validator-REVERT'd large convolutions) ───
+void sengine_set_cudnn_conv_node(SEngineExecutor* e, int nid,
+                                  void* input, void* weight,
+                                  float* bn_scale, float* bn_bias, void* output,
+                                  int N, int H, int W, int C_in, int C_out,
+                                  int KH, int KW, int stride, int pad,
+                                  int OH, int OW, int groups) {
+    auto& nd = e->nodes[nid];
+    nd.type = KT_CUDNN_CONV;
+    // Reuse naive_conv fields for pointers and params
+    nd.nc_in = (half*)input; nd.nc_w = (half*)weight;
+    nd.nc_sc = bn_scale; nd.nc_bi = bn_bias;
+    nd.nc_out = (half*)output;
+    nd.nc_N = N; nd.nc_H = H; nd.nc_W = W;
+    nd.nc_Cin = C_in; nd.nc_Cout = C_out;
+    nd.nc_KH = KH; nd.nc_KW = KW;
+    nd.nc_stride = stride; nd.nc_pad = pad;
+    nd.nc_OH = OH; nd.nc_OW = OW;
+    nd.nc_groups = groups > 0 ? groups : 1;
+
+    // Lazy-init cuDNN handle on first use
+    if (!e->cudnn) {
+        cudnnCreate(&e->cudnn);
+        cudnnSetStream(e->cudnn, e->stream);
+    }
+
+    // Create cuDNN descriptors
+    cudnnDataType_t dt = e->is_fp32 ? CUDNN_DATA_FLOAT : CUDNN_DATA_HALF;
+
+    cudnnCreateTensorDescriptor(&nd.cudnn_in_desc);
+    cudnnSetTensor4dDescriptor(nd.cudnn_in_desc, CUDNN_TENSOR_NHWC, dt, N, C_in, H, W);
+
+    cudnnCreateTensorDescriptor(&nd.cudnn_out_desc);
+    cudnnSetTensor4dDescriptor(nd.cudnn_out_desc, CUDNN_TENSOR_NHWC, dt, N, C_out, OH, OW);
+
+    cudnnCreateFilterDescriptor(&nd.cudnn_filt_desc);
+    cudnnSetFilter4dDescriptor(nd.cudnn_filt_desc, dt, CUDNN_TENSOR_NCHW,
+                                C_out, C_in / nd.nc_groups, KH, KW);
+
+    cudnnCreateConvolutionDescriptor(&nd.cudnn_conv_desc);
+    cudnnSetConvolution2dDescriptor(nd.cudnn_conv_desc, pad, pad, stride, stride, 1, 1,
+                                     CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT);
+    if (nd.nc_groups > 1)
+        cudnnSetConvolutionGroupCount(nd.cudnn_conv_desc, nd.nc_groups);
+    cudnnSetConvolutionMathType(nd.cudnn_conv_desc, CUDNN_TENSOR_OP_MATH);
+
+    // Get best algorithm via heuristic (instant, no GPU benchmarking)
+    int n_algos = 0;
+    cudnnConvolutionFwdAlgoPerf_t perf[8];
+    cudnnSetStream(e->cudnn, e->stream);
+    cudnnGetConvolutionForwardAlgorithm_v7(e->cudnn,
+        nd.cudnn_in_desc, nd.cudnn_filt_desc, nd.cudnn_conv_desc, nd.cudnn_out_desc,
+        8, &n_algos, perf);
+    nd.cudnn_algo = (n_algos > 0) ? perf[0].algo : CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
+
+    // Get workspace size
+    cudnnGetConvolutionForwardWorkspaceSize(e->cudnn,
+        nd.cudnn_in_desc, nd.cudnn_filt_desc, nd.cudnn_conv_desc, nd.cudnn_out_desc,
+        nd.cudnn_algo, &nd.cudnn_ws_size);
+    if (nd.cudnn_ws_size > 0)
+        cudaMalloc(&nd.cudnn_workspace, nd.cudnn_ws_size);
+    else
+        nd.cudnn_workspace = nullptr;
+    nd.cudnn_initialized = 1;
 }
 
 void sengine_add_membrane(SEngineExecutor* e, float* ptr, int size) {
@@ -1446,6 +1547,31 @@ void sengine_execute(SEngineExecutor* e) {
             else
                 softmax_fp16_kernel<<<blk, thr, 0, s>>>(
                     (half*)nd.sm_in, (half*)nd.sm_out, nd.sm_outer, nd.sm_inner);
+            break;
+        }
+        case KT_CUDNN_CONV: {
+            // cuDNN convolution (NHWC) then BN epilogue (element-wise scale+bias)
+            cudnnSetStream(e->cudnn, s);
+            {
+                const float alpha = 1.0f, beta = 0.0f;
+                cudnnConvolutionForward(e->cudnn, &alpha,
+                    nd.cudnn_in_desc, nd.nc_in,
+                    nd.cudnn_filt_desc, nd.nc_w,
+                    nd.cudnn_conv_desc, nd.cudnn_algo,
+                    nd.cudnn_workspace, nd.cudnn_ws_size,
+                    &beta, nd.cudnn_out_desc, nd.nc_out);
+            }
+            // BN epilogue: output = output * bn_scale + bn_bias (in-place, per-channel)
+            if (nd.nc_sc && nd.nc_bi) {
+                int total = nd.nc_N * nd.nc_OH * nd.nc_OW * nd.nc_Cout;
+                int thr = 256, blk = (total + thr - 1) / thr;
+                if (e->is_fp32)
+                    bn_epilogue_fp32_kernel<<<blk, thr, 0, s>>>(
+                        (float*)nd.nc_out, nd.nc_sc, nd.nc_bi, total, nd.nc_Cout);
+                else
+                    bn_epilogue_fp16_kernel<<<blk, thr, 0, s>>>(
+                        nd.nc_out, nd.nc_sc, nd.nc_bi, total, nd.nc_Cout);
+            }
             break;
         }
         case KT_SKIP:

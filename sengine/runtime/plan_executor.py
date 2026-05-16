@@ -399,6 +399,29 @@ def setup_executor_from_plan(
                 exe.set_skip_node(nid)
                 logger.warning("  Plan executor: fused_attn #%d skipped (no handler)", nid)
 
+        elif kt == "cudnn_conv":
+            in_ptr = p(node_plan.input_bufs[0]) if node_plan.input_bufs else 0
+            w_ptr = p(node_plan.weight_buf)
+            s_ptr = p(node_plan.scale_buf)
+            b_ptr = p(node_plan.bias_buf)
+            out_ptr = p(node_plan.output_buf)
+            node = ir.nodes.get(nid)
+            if node and node.conv_params and in_ptr and w_ptr and out_ptr:
+                cp = node.conv_params
+                for bd in plan.buffers:
+                    if bd.buf_id == (node_plan.input_bufs[0] if node_plan.input_bufs else -1):
+                        s = bd.shape; break
+                else:
+                    s = (0, 0, 0, 0)
+                OH = (s[1] + 2*cp.pad_h - cp.kernel_h) // cp.stride_h + 1 if len(s) == 4 else 0
+                OW = (s[2] + 2*cp.pad_w - cp.kernel_w) // cp.stride_w + 1 if len(s) == 4 else 0
+                exe.set_cudnn_conv_node(nid, in_ptr, w_ptr, s_ptr or 0, b_ptr or 0, out_ptr,
+                                         s[0], s[1], s[2], cp.in_channels, cp.out_channels,
+                                         cp.kernel_h, cp.kernel_w, cp.stride_h, cp.pad_h,
+                                         OH, OW, cp.groups)
+            else:
+                exe.set_skip_node(nid)
+
         elif kt == "resize":
             in_ptr = p(node_plan.input_bufs[0]) if node_plan.input_bufs else 0
             out_ptr = p(node_plan.output_buf)

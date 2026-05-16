@@ -85,15 +85,8 @@ class CUDAGraphEngine:
         self._allocate_membranes()
         self._allocate_activations()
 
-        # Load CUDA IF/LIF extension if any neuron nodes exist.
-        # Skip for fp32 — the CUDA extension is fp16-only; fp32 uses PyTorch fallback.
-        if self.precision != "fp32":
-            for nid in self.schedule:
-                node = self.ir.nodes[nid]
-                if node.assigned_kernel in (KernelVariant.CUDAVec4IF, KernelVariant.CUDAVec4LIF):
-                    from sengine.build.tilelang_compiler import get_cuda_if
-                    self._ext_if = get_cuda_if()
-                    break
+        # CUDA IF/LIF extension loaded lazily only when Python runtime dispatches neurons.
+        # The C++ executor has native IF/LIF kernels — no torch extension needed.
 
         logger.phase("ENGINE", "Built: %d schedule ops, %d weights, %d membranes, %d buffers",
                      len(schedule), len(self.weights) + len(self.weights_1x1),
@@ -105,13 +98,7 @@ class CUDAGraphEngine:
         For transformer models with dynamic ZeroCost ops, CUDA Graph
         capture may fail. In that case, fall back to raw dispatch mode.
         """
-        if self._ext_if is None:
-            for nid in self.schedule:
-                node = self.ir.nodes[nid]
-                if node.assigned_kernel in (KernelVariant.CUDAVec4IF, KernelVariant.CUDAVec4LIF):
-                    from sengine.build.tilelang_compiler import get_cuda_if
-                    self._ext_if = get_cuda_if()
-                    break
+        # IF/LIF extension loaded lazily only in Python dispatch path (not for C++ executor)
 
         try:
             # Dry run

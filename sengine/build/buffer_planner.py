@@ -419,8 +419,14 @@ def plan_buffers(ir: EngineIR, schedule: list[int],
                 weight_buf=w_bid))
 
         elif kv == KernelVariant.CuDNNConv:
+            # Use cuDNN for large convolutions (validator-REVERT'd),
+            # naive kernel for small/stem convolutions (C_in < 8 or non-standard)
+            cp_node = node.conv_params if node else None
+            use_cudnn = (cp_node and cp_node.in_channels >= 8
+                         and cp_node.kernel_h <= 7 and cp_node.groups <= 1)
+            kt = "cudnn_conv" if use_cudnn else "naive_conv"
             nodes.append(NodeExecPlan(
-                nid=nid, kernel_type="naive_conv",
+                nid=nid, kernel_type=kt,
                 input_bufs=[input_bid], output_buf=output_bid,
                 weight_buf=w_bid, scale_buf=s_bid, bias_buf=b_bid))
 

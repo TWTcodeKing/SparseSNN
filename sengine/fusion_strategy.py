@@ -114,6 +114,8 @@ def _apply_slicer(ir: EngineIR, batch_size: int,
             _, _, OH, OW = anchor.output_shapes[0]
             rec_key = f"{cp.in_channels}_{cp.out_channels}_K{cp.kernel_h}_S{cp.stride_h}_{OH}x{OW}"
             if rec_key in rec and rec[rec_key].get('decision') == 'revert':
+                # Validator proved cuDNN is faster — use cuDNN decomposed path
+                anchor.assigned_kernel = KernelVariant.CuDNNConv
                 n_decomposed += 1
                 n_rec_reverted += 1
                 continue
@@ -153,6 +155,8 @@ def _apply_slicer(ir: EngineIR, batch_size: int,
             N_out = out_shape[-1] if out_shape else 0
             rec_key = f"{K_in}_{N_out}_MatMul"
             if rec_key in rec and rec[rec_key].get('decision') == 'revert':
+                # Validator proved cuBLAS is faster — use cuBLAS decomposed path
+                anchor.assigned_kernel = KernelVariant.CuBLASGemm
                 n_decomposed += 1
                 n_rec_reverted += 1
                 continue

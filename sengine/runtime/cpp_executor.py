@@ -74,6 +74,9 @@ def _setup_signatures(lib):
         VP, VP,           # scale1_ptr, scale2_ptr
         CI, CI, CI, CI,   # ws_gemm1_out, ws_perm_q, ws_perm_k, ws_perm_v
     ]
+    # cuDNN Conv2d+BN (for validator-REVERT'd large convolutions)
+    lib.sengine_set_cudnn_conv_node.argtypes = [VP, CI, VP, VP, VP, VP, VP,
+                                                  CI, CI, CI, CI, CI, CI, CI, CI, CI, CI, CI, CI]
     # Detection model ops
     lib.sengine_set_resize_node.argtypes = [VP, CI, VP, VP, CI, CI, CI, CI, CI, CI, CI, CI]
     lib.sengine_set_concat_node.argtypes = [VP, CI, VP, VP, VP, CI, CI, CI]
@@ -234,6 +237,15 @@ class CppExecutor:
             needs_permute,
             scale1_ptr, scale2_ptr,
             ws_gemm1_out, ws_perm_q, ws_perm_k, ws_perm_v)
+
+    def set_cudnn_conv_node(self, nid, in_ptr, w_ptr, sc_ptr, bi_ptr, out_ptr,
+                            N, H, W, Cin, Cout, KH, KW, stride, pad, OH, OW, groups=1):
+        self._lib.sengine_set_cudnn_conv_node(
+            self._handle, nid,
+            ctypes.c_void_p(in_ptr), ctypes.c_void_p(w_ptr),
+            ctypes.c_void_p(sc_ptr), ctypes.c_void_p(bi_ptr),
+            ctypes.c_void_p(out_ptr),
+            N, H, W, Cin, Cout, KH, KW, stride, pad, OH, OW, groups)
 
     # ─── Detection model ops ───
 

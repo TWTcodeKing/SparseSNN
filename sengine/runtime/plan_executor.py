@@ -415,6 +415,16 @@ def setup_executor_from_plan(
                     s = (0, 0, 0, 0)
                 OH = (s[1] + 2*cp.pad_h - cp.kernel_h) // cp.stride_h + 1 if len(s) == 4 else 0
                 OW = (s[2] + 2*cp.pad_w - cp.kernel_w) // cp.stride_w + 1 if len(s) == 4 else 0
+                # cuDNN expects NCHW filter (C_out, C_in/g, K, K).
+                # Our weight is NHWC (K, K, C_in/g, C_out). Transpose to NCHW.
+                w_tensor = py_engine.weights.get(nid)
+                if w_tensor is not None and w_tensor.ndim == 4:
+                    # (K, K, C_in/g, C_out) → (C_out, C_in/g, K, K)
+                    w_nchw = w_tensor.permute(3, 2, 0, 1).contiguous()
+                    if not hasattr(py_engine, '_cudnn_weight_keepalive'):
+                        py_engine._cudnn_weight_keepalive = []
+                    py_engine._cudnn_weight_keepalive.append(w_nchw)
+                    w_ptr = w_nchw.data_ptr()
                 exe.set_cudnn_conv_node(nid, in_ptr, w_ptr, s_ptr or 0, b_ptr or 0, out_ptr,
                                          s[0], s[1], s[2], cp.in_channels, cp.out_channels,
                                          cp.kernel_h, cp.kernel_w, cp.stride_h, cp.pad_h,

@@ -469,6 +469,9 @@ class TileLangCompiler:
             elif kv == KernelVariant.TileLangGroupedConvBN:
                 kern, is_new = self._get_grouped_conv_bn(node)
                 kernels[nid] = kern
+            elif kv == KernelVariant.TileLangFusedGroupedConvBNLIF:
+                kern, is_new = self._get_fused_grouped_conv_bn_lif(node)
+                kernels[nid] = kern
             elif kv == KernelVariant.TileLangMatMul:
                 kern, is_new = self._get_matmul(node)
                 kernels[nid] = kern
@@ -1300,6 +1303,68 @@ class TileLangCompiler:
         )
         cfg = self._resolve_config(key, M, K_red, C_out_per_g,
                                     compile_fn=_compile, profile_args=_profile_args)
+
+        try:
+            kern = _compile(cfg)
+        except Exception:
+            kern = None
+
+        self._kernel_cache[key] = kern
+        self._config_cache[key] = cfg
+        node.tilelang_config = cfg
+        node.est_latency_us = cfg.get('latency_us', 0.0)
+        return kern, kern is not None
+
+    def _get_fused_grouped_conv_bn_lif(self, node: Node) -> tuple[object, bool]:
+        """Compile interleaved Grouped Conv+BN+LIF kernel."""
+        cp = node.conv_params
+        H, W = self._get_spatial(node)
+        key = f"fused_gconv_lif_{cp.in_channels}_{cp.out_channels}_{cp.kernel_h}x{cp.kernel_w}" \
+              f"_s{cp.stride_h}_g{cp.groups}_{H}x{W}_B{self.B}_{self.precision}"
+
+        if key in self._kernel_cache:
+            node.tilelang_config = self._config_cache.get(key, {})
+            return self._kernel_cache[key], False
+
+        C_in_per_g = cp.in_channels // cp.groups
+        C_out_per_g = cp.out_channels // cp.groups
+        K_red = cp.kernel_h * cp.kernel_w * C_in_per_g
+        OH = (H + 2 * cp.pad_h - cp.dilation_h * (cp.kernel_h - 1) - 1) // cp.stride_h + 1
+        OW = (W + 2 * cp.pad_w - cp.dilation_w * (cp.kernel_w - 1) - 1) // cp.stride_w + 1
+        M_per_t = self.B * OH * OW
+
+        # Detect neuron params from absorbed nodes
+        absorbed = node.extra_attrs.get("absorbed_nids", [])
+        lif_node = next((self.ir.nodes[a] for a in absorbed
+                         if self.ir.nodes.get(a) and self.ir.nodes[a].op_type == OpType.LIF), None)
+        np_ = lif_node.neuron_params if lif_node else None
+        recip_tau = 1.0 / np_.tau if (np_ and np_.tau and np_.tau > 0) else 0.5
+
+        from sengine.kernels.grouped_conv_bn import grouped_conv_bn_lif_kernel
+
+        def _compile(cfg):
+            return grouped_conv_bn_lif_kernel(
+                B=self.B, C_in=cp.in_channels, H=H, W=W,
+                C_out=cp.out_channels, K=cp.kernel_h,
+                S=cp.stride_h, D=cp.dilation_h, P=cp.pad_h,
+                groups=cp.groups, T_steps=self.T,
+                recip_tau=recip_tau,
+                io_dtype=self.io_dtype_tl,
+                **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K',
+                                        'num_stages', 'threads')})
+
+        _state = torch.zeros(M_per_t, cp.out_channels, dtype=torch.float32, device='cuda')
+        _profile_args = (
+            torch.empty(self.TB, H, W, cp.in_channels, dtype=self.io_dtype_torch, device='cuda'),
+            torch.empty(cp.kernel_h, cp.kernel_w, C_in_per_g, cp.out_channels,
+                        dtype=self.io_dtype_torch, device='cuda'),
+            _state,
+            torch.ones(cp.out_channels, dtype=torch.float32, device='cuda'),
+            torch.zeros(cp.out_channels, dtype=torch.float32, device='cuda'),
+        )
+        cfg = self._resolve_config(key, M_per_t, K_red, C_out_per_g,
+                                    compile_fn=_compile, profile_args=_profile_args,
+                                    interleaved=True, n_membranes=1)
 
         try:
             kern = _compile(cfg)

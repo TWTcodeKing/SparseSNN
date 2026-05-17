@@ -1551,7 +1551,7 @@ void sengine_execute(SEngineExecutor* e) {
         }
         case KT_CUDNN_CONV: {
             // cuDNN convolution (NHWC) then BN epilogue (element-wise scale+bias)
-            cudnnSetStream(e->cudnn, s);
+            // Note: cudnnSetStream already called once at setup time.
             {
                 const float alpha = 1.0f, beta = 0.0f;
                 cudnnConvolutionForward(e->cudnn, &alpha,
@@ -1655,6 +1655,10 @@ void sengine_execute_checked(SEngineExecutor* e) {
 }
 
 void sengine_capture_graph(SEngineExecutor* e) {
+    // Ensure cuDNN stream is set before capture (if cuDNN was initialized)
+    if (e->cudnn) {
+        cudnnSetStream(e->cudnn, e->stream);
+    }
     // Warm up with error checking
     cudaGetLastError(); // clear any prior errors
     sengine_execute_checked(e);

@@ -317,7 +317,8 @@ def plan_buffers(ir: EngineIR, schedule: list[int],
 
         elif kv in (KernelVariant.TileLangFusedConvBNIF,
                     KernelVariant.TileLangFusedConv1x1BNIF,
-                    KernelVariant.TileLangLinearBNLIF):
+                    KernelVariant.TileLangLinearBNLIF,
+                    KernelVariant.TileLangFusedGroupedConvBNLIF):
             nodes.append(NodeExecPlan(
                 nid=nid, kernel_type="tilelang_6", so_key=so_key,
                 input_bufs=[input_bid], output_buf=output_bid,

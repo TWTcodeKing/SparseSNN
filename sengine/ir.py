@@ -92,6 +92,7 @@ class KernelVariant(Enum):
     TileLangFusedDWConvBNIF = auto()   # Fused DW Conv+BN+IF (T_steps=1)
     # Grouped Conv kernel (for SpikingResFormer GWFFN)
     TileLangGroupedConvBN = auto()     # Grouped Conv+BN (groups > 1, groups != C_in)
+    TileLangFusedGroupedConvBNLIF = auto()  # Fused Grouped Conv+BN+LIF (interleaved T-loop)
     # Fused memory-bound op + LIF (single kernel, per-CTA T-loop)
     TileLangFusedAddLIF = auto()       # Add(a,b)+LIF → single launch
     TileLangFusedPoolLIF = auto()      # MaxPool+LIF → single launch
@@ -152,6 +153,7 @@ KERNEL_CONTRACTS: dict = {
     KernelVariant.TileLangDWConvBN:           KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
     KernelVariant.TileLangFusedDWConvBNIF:    KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
     KernelVariant.TileLangGroupedConvBN:     KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
+    KernelVariant.TileLangFusedGroupedConvBNLIF: KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
     # cuDNN Conv/Pool: dispatch wrapper handles NHWC→NCHW internally
     KernelVariant.CuDNNConv:                  KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),
     KernelVariant.CuDNNPool:                  KernelLayoutContract(TensorLayout.NHWC, TensorLayout.NHWC),

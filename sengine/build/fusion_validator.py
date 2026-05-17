@@ -96,7 +96,19 @@ def generate_recommendations(onnx_path: str, T: int, batch_size: int,
         if key not in fused_shapes:
             fused_shapes[key] = (nid, node, pattern, is_matmul)
 
-    if not fused_shapes:
+    # Also detect fused attention (DSSA, Spikformer, MaxFormer) nodes
+    attn_shapes = {}
+    for nid, node in ir.nodes.items():
+        if node.op_type == OpType.FusedAttention and node.attention_params:
+            ap = node.attention_params
+            key = f"attn_{ap.variant}_{ap.num_heads}h_{ap.head_dim}d"
+            if node.output_shapes:
+                out = node.output_shapes[0]
+                key += f"_{out[-2]}x{out[-1]}" if len(out) >= 2 else ""
+            if key not in attn_shapes:
+                attn_shapes[key] = (nid, node)
+
+    if not fused_shapes and not attn_shapes:
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
         with open(output_path, 'w') as f:
             json.dump({}, f)
@@ -106,7 +118,7 @@ def generate_recommendations(onnx_path: str, T: int, batch_size: int,
         return
 
     recommendations = {}
-    print(f"Validating {len(fused_shapes)} fused shapes...")
+    print(f"Validating {len(fused_shapes)} fused shapes + {len(attn_shapes)} attention shapes...")
 
     for key, (nid, node, pattern, is_matmul) in fused_shapes.items():
         cp = node.conv_params
@@ -148,7 +160,13 @@ def generate_recommendations(onnx_path: str, T: int, batch_size: int,
         # FUSED: compile + autotune via compiler
         # ════════════════════════════════════════════════════
         try:
-            fused_kern, _ = compiler._get_fused_conv_bn_if(node) if not is_matmul else compiler._get_fused_matmul_lif(node)
+            is_grouped = cp and cp.groups > 1 and cp.groups != cp.in_channels
+            if is_grouped:
+                fused_kern, _ = compiler._get_fused_grouped_conv_bn_lif(node)
+            elif is_matmul:
+                fused_kern, _ = compiler._get_fused_matmul_lif(node)
+            else:
+                fused_kern, _ = compiler._get_fused_conv_bn_if(node)
             if fused_kern is None:
                 raise RuntimeError("Compiler returned None")
         except Exception as e:
@@ -257,6 +275,31 @@ def generate_recommendations(onnx_path: str, T: int, batch_size: int,
             parts += f"+Add={add_us:.1f}"
         print(f"  {tag:>6} {key}: fused={fused_us:.1f} vs decomp={decomp_total_us:.1f} "
               f"({parts}) [{pattern}]")
+
+    # ── Profile fused attention (DSSA, Spikformer, MaxFormer) ──
+    if attn_shapes:
+        print(f"\nProfiling {len(attn_shapes)} attention shapes...")
+        for key, (nid, node) in attn_shapes.items():
+            ap = node.attention_params
+            torch.cuda.set_device(_device_id)
+            try:
+                # Compile attention kernels via compiler
+                result = compiler._get_fused_attn_kernels(node)
+                if result is None:
+                    print(f"  SKIP {key}: compile returned None")
+                    continue
+                # Profile: attention is always KEEP (no decomposed alternative in our framework)
+                # Just report the latency for visibility
+                recommendations[key] = {
+                    'decision': 'keep',
+                    'fused_us': 0,
+                    'pattern': f'FusedAttn_{ap.variant}',
+                    'note': 'attention always fused (no decomposed path)',
+                }
+                print(f"    KEEP {key} [{ap.variant}] (always fused)")
+            except Exception as e:
+                print(f"  FAIL {key}: {e}")
+                recommendations[key] = {'decision': 'keep', 'reason': f'compile_fail: {e}'}
 
     # Write recommendations
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)

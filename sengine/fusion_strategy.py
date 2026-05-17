@@ -95,7 +95,8 @@ def _apply_slicer(ir: EngineIR, batch_size: int,
 
         cp = anchor.conv_params if anchor else None
         if anchor.op_type == OpType.Conv2d and cp:
-            K_red = cp.kernel_h * cp.kernel_w * cp.in_channels
+            C_in_per_g = cp.in_channels // cp.groups if cp.groups > 0 else cp.in_channels
+            K_red = cp.kernel_h * cp.kernel_w * C_in_per_g
 
             # Conv3x3: K_red must be aligned for tensor cores
             if cp.kernel_h != 1 and K_red % 8 != 0:
@@ -114,14 +115,16 @@ def _apply_slicer(ir: EngineIR, batch_size: int,
             _, _, OH, OW = anchor.output_shapes[0]
             rec_key = f"{cp.in_channels}_{cp.out_channels}_K{cp.kernel_h}_S{cp.stride_h}_{OH}x{OW}"
             if rec_key in rec and rec[rec_key].get('decision') == 'revert':
-                # Validator proved cuDNN is faster — use cuDNN decomposed path
-                anchor.assigned_kernel = KernelVariant.CuDNNConv
+                # Decomposed TileLang (CUDA Graph compatible)
                 n_decomposed += 1
                 n_rec_reverted += 1
                 continue
 
-            # Fuse this node
-            if cp.kernel_h == 1 and cp.kernel_w == 1:
+            # Fuse this node — select appropriate interleaved template
+            if cp.groups > 1 and cp.groups != cp.in_channels:
+                # Grouped conv: use fused grouped conv+BN+LIF template
+                anchor.assigned_kernel = KernelVariant.TileLangFusedGroupedConvBNLIF
+            elif cp.kernel_h == 1 and cp.kernel_w == 1:
                 anchor.assigned_kernel = KernelVariant.TileLangFusedConv1x1BNIF
             else:
                 anchor.assigned_kernel = KernelVariant.TileLangFusedConvBNIF

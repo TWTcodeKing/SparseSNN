@@ -46,14 +46,19 @@ def benchmark(fn, warmup=100, iters=500):
     return s.elapsed_time(e) / iters  # ms
 
 
-# SpikingResFormer-M bottleneck shapes (GWFFN grouped conv)
+# SpikingResFormer bottleneck shapes (GWFFN grouped conv)
 SHAPES = [
     # (TB, C_in, H, W, C_out, K, S, P, groups, name)
-    (16, 256,  56, 56, 256,  3, 1, 1, 4, "256_256_K3_S1_56x56_g4 (stage1)"),
-    (16, 1536, 28, 28, 1536, 3, 1, 1, 4, "1536_1536_K3_S1_28x28_g4 (stage2)"),
-    (16, 3072, 14, 14, 3072, 3, 1, 1, 4, "3072_3072_K3_S1_14x14_g4 (stage3)"),
-    # Also test non-grouped versions for comparison
-    (16, 1536, 28, 28, 1536, 3, 1, 1, 1, "1536_1536_K3_S1_28x28_g1 (standard)"),
+    # SpikingResFormer-M
+    (16, 256,  56, 56, 256,  3, 1, 1, 4, "M: 256_256_K3_g4_56x56"),
+    (16, 1536, 28, 28, 1536, 3, 1, 1, 4, "M: 1536_1536_K3_g4_28x28"),
+    (16, 3072, 14, 14, 3072, 3, 1, 1, 4, "M: 3072_3072_K3_g4_14x14"),
+    # SpikingResFormer-L (larger channels)
+    (16, 512,  56, 56, 512,  3, 1, 1, 4, "L: 512_512_K3_g4_56x56"),
+    (16, 2048, 28, 28, 2048, 3, 1, 1, 4, "L: 2048_2048_K3_g4_28x28"),
+    (16, 4096, 14, 14, 4096, 3, 1, 1, 4, "L: 4096_4096_K3_g4_14x14"),
+    # Standard conv comparison (the g=1 bottleneck)
+    (16, 2048, 28, 28, 2048, 3, 1, 1, 1, "L: 2048_2048_K3_g1_28x28 (standard)"),
 ]
 
 
@@ -151,6 +156,21 @@ def main():
         cos = F.cosine_similarity(out_tl.float().flatten(), ref_nhwc.float().flatten(), dim=0)
         maxdiff = (out_tl.float() - ref_nhwc.float()).abs().max().item()
         print(f"     Cosine: {cos.item():.6f}, MaxDiff: {maxdiff:.4f}")
+
+        # ── 5. block_K sweep (find if larger K helps) ──
+        if K_red > 512:
+            print(f"\n  5. block_K sweep (bM=64 bN=64 fixed):")
+            for bK in [32, 64, 128]:
+                if bK > K_red:
+                    continue
+                try:
+                    cfg_k = {'block_M': 64, 'block_N': 64, 'block_K': bK, 'num_stages': 2, 'threads': 128}
+                    kern_k = _compile(cfg_k)
+                    ms_k = benchmark(lambda: kern_k(data, weight, bn_s, bn_b))
+                    k_iters = (K_red + bK - 1) // bK
+                    print(f"     bK={bK:>3}: {ms_k:.3f} ms (K_iters={k_iters})")
+                except Exception as e:
+                    print(f"     bK={bK:>3}: FAILED ({e})")
 
         # ── Summary ──
         print(f"\n  Summary:")

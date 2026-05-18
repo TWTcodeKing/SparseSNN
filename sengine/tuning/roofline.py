@@ -89,81 +89,110 @@ def classify_shape(M_per_t, K, N, T_steps, bpe=2):
 def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
     """Generate top-K tile config candidates using roofline classification.
 
+    Architecture-adaptive: expands search space for GPUs with larger shared
+    memory (A100: 164KB), higher bandwidth (A100: 2TB/s), or more pipeline
+    depth capability. Explores threads=256 and num_stages=4/5 on Ampere+.
+
     Args:
         bpe: bytes per element (2 for fp16, 4 for fp32).
     """
     hw = _detect_gpu()
     bound, ai, _ = classify_shape(M_per_t, K, N, T_steps, bpe)
     sm_count = hw['sm_count']
+    max_smem = hw['max_smem_per_sm']
+
+    # Architecture-adaptive search space
+    is_ampere_plus = max_smem >= 160 * 1024  # A100: 164KB, RTX 4090: ~100KB
+
+    bM_choices = [16, 32, 64, 128]
+    bN_choices = [32, 64, 128]
+    bK_choices = [32, 64, 128] if bpe == 2 else [32, 64]
+    ns_choices = [2, 3, 4] if is_ampere_plus else [2, 3]
+    thr_choices = [128, 256] if is_ampere_plus else [128]
 
     all_cfgs = []
-    # FP32 can't vectorize as wide as FP16 — TileLang's T.copy() generates
-    # float32xN vector types that CUDA doesn't support when N>8.
-    # Constraint: bM * bK / threads <= 8 for fp32 (and bN * bK / threads too).
-    bK_choices = [32, 64, 128] if bpe == 2 else [32, 64]
-    for bM in [16, 32, 64, 128]:
-        for bN in [32, 64, 128]:
+    for bM in bM_choices:
+        for bN in bN_choices:
             for bK in bK_choices:
                 if bK > K:
                     continue
-                for ns in [2, 3]:
-                    thr = 128
-                    # FP32: skip configs where T.copy vectorization exceeds float32x8
-                    if bpe == 4 and (bM * bK // thr > 8 or bN * bK // thr > 8):
-                        continue
-                    smem = _smem_bytes(bM, bN, bK, ns, bpe)
-                    if smem > hw['max_smem_per_sm']:
-                        continue
-                    grid = math.ceil(M_per_t / bM) * math.ceil(N / bN)
-                    occ = _occupancy(bM, bN, bK, ns, thr, n_membranes, bpe)
-                    if grid < max(sm_count // 8, 1):
-                        continue
-                    tile_area = bM * bN
-                    cfg = dict(block_M=bM, block_N=bN, block_K=bK,
-                               num_stages=ns, threads=thr)
-                    all_cfgs.append((cfg, grid, occ, tile_area))
+                for ns in ns_choices:
+                    for thr in thr_choices:
+                        # FP32: T.copy vectorization constraint
+                        if bpe == 4 and (bM * bK // thr > 8 or bN * bK // thr > 8):
+                            continue
+                        # Tile must be large enough for warp-level MMA
+                        if bM * bN < thr:
+                            continue
+                        smem = _smem_bytes(bM, bN, bK, ns, bpe)
+                        if smem > max_smem:
+                            continue
+                        grid = math.ceil(M_per_t / bM) * math.ceil(N / bN)
+                        occ = _occupancy(bM, bN, bK, ns, thr, n_membranes, bpe)
+                        # Relaxed grid filter: allow smaller grids on GPUs with
+                        # fewer SMs (A100: 108) as long as occupancy compensates
+                        min_grid = max(sm_count // 16, 1) if is_ampere_plus else max(sm_count // 8, 1)
+                        if grid < min_grid:
+                            continue
+                        tile_area = bM * bN
+                        cfg = dict(block_M=bM, block_N=bN, block_K=bK,
+                                   num_stages=ns, threads=thr)
+                        all_cfgs.append((cfg, grid, occ, tile_area))
 
     if not all_cfgs:
         return [dict(block_M=32, block_N=64, block_K=min(32, K),
                      num_stages=2, threads=128)]
 
-    # Ranking: balance tile area (TC efficiency), grid coverage (SM parallelism),
-    # and K-loop depth (pipeline efficiency for large K reductions).
-    sm_half = hw['sm_count'] // 2
+    # Ranking: balance tile area, grid coverage, K-loop depth, AND occupancy.
+    sm_half = sm_count // 2
     def _rank(cfg_tuple):
         cfg, grid, occ, area = cfg_tuple
-        # Tile area score: larger tiles = better tensor core utilization
-        area_score = min(area, 4096)
+        # Tile area: larger tiles = better tensor core utilization
+        area_score = min(area, 8192 if is_ampere_plus else 4096)
         # Grid coverage: prefer configs that fill the GPU
-        grid_ok = 1.0 if grid >= sm_half else 0.5
-        # K-loop depth penalty: deep K-loops (>256 iters) stall the pipeline.
-        # Larger block_K reduces iterations and improves data reuse.
+        grid_ok = 1.0 if grid >= sm_half else (0.7 if grid >= sm_count // 4 else 0.4)
+        # K-loop depth penalty
         k_iters = math.ceil(K / cfg['block_K'])
         k_eff = min(1.0, 256.0 / k_iters) if k_iters > 256 else 1.0
-        return -(area_score * grid_ok * k_eff)
+        # Occupancy bonus: higher occupancy helps hide memory latency,
+        # especially on high-bandwidth GPUs (A100: 2TB/s)
+        occ_score = 1.0 + 0.15 * min(occ, 4) if is_ampere_plus else 1.0
+        return -(area_score * grid_ok * k_eff * occ_score)
 
     all_cfgs.sort(key=_rank)
 
-    # Deduplicate by (bM, bN)
+    # Deduplicate by (bM, bN, bK) — keep different bK variants since they
+    # have very different K-loop depths and pipeline behavior
     seen = set()
     pruned = []
     for cfg, grid, occ, tile_area in all_cfgs:
-        key = (cfg['block_M'], cfg['block_N'])
+        key = (cfg['block_M'], cfg['block_N'], cfg['block_K'])
         if key not in seen:
             seen.add(key)
             pruned.append(cfg)
         if len(pruned) >= top_k:
             break
 
-    # Always include known-good configs
-    known_good = [
-        dict(block_M=64, block_N=64, block_K=32, num_stages=2, threads=128),
-        dict(block_M=32, block_N=64, block_K=32, num_stages=2, threads=128),
-    ]
+    # Architecture-specific known-good configs
+    if is_ampere_plus:
+        known_good = [
+            dict(block_M=64, block_N=128, block_K=64, num_stages=3, threads=128),
+            dict(block_M=128, block_N=64, block_K=64, num_stages=3, threads=128),
+            dict(block_M=64, block_N=64, block_K=64, num_stages=4, threads=128),
+        ]
+    else:
+        known_good = [
+            dict(block_M=64, block_N=64, block_K=32, num_stages=2, threads=128),
+            dict(block_M=32, block_N=64, block_K=32, num_stages=2, threads=128),
+        ]
     for kg in known_good:
         if kg['block_K'] > K:
             continue
-        key = (kg['block_M'], kg['block_N'])
+        smem = _smem_bytes(kg['block_M'], kg['block_N'], kg['block_K'],
+                           kg['num_stages'], bpe)
+        if smem > max_smem:
+            continue
+        key = (kg['block_M'], kg['block_N'], kg['block_K'])
         if key not in seen:
             seen.add(key)
             pruned.append(kg)
@@ -175,7 +204,7 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
 
 def select_config_roofline(M_per_t, K, N, T_steps,
                             compile_fn, profile_args,
-                            n_membranes=1, top_k=5,
+                            n_membranes=1, top_k=7,
                             n_profile=100,
                             compile_timeout=10.0,
                             bpe=2):

@@ -51,11 +51,17 @@ def wino_forward(data_nchw, U, P, tile_h, tile_w, C_in, C_out, TB, OH, OW):
                        dtype=torch.float32, device=data_nchw.device)
     B = BT.t()
     AT = torch.tensor([[1,1,1,0],[0,1,-1,-1]], dtype=torch.float32, device=data_nchw.device)
-    M = TB * tile_h * tile_w
 
     # Input transform (vectorized)
     x = F.pad(data_nchw.float(), (P, P, P, P))
-    patches = x.unfold(2, 4, 2).unfold(3, 4, 2)[:, :, :tile_h, :tile_w]
+    patches = x.unfold(2, 4, 2).unfold(3, 4, 2)
+    # Actual tile counts from unfold (may differ from ceil calculation for small spatial)
+    actual_th = patches.shape[2]
+    actual_tw = patches.shape[3]
+    tile_h = min(tile_h, actual_th)
+    tile_w = min(tile_w, actual_tw)
+    patches = patches[:, :, :tile_h, :tile_w]
+    M = TB * tile_h * tile_w
     d0 = patches[:,:,:,:,0,:]; d1 = patches[:,:,:,:,1,:]
     d2 = patches[:,:,:,:,2,:]; d3 = patches[:,:,:,:,3,:]
     r0 = d0 - d2; r1 = d1 + d2; r2 = d2 - d1; r3 = d1 - d3
@@ -121,8 +127,10 @@ SHAPES = [
 
 
 def main():
-    device = torch.device('cuda:0')
-    props = torch.cuda.get_device_properties(0)
+    device_id = torch.cuda.current_device()
+    device = torch.device(f'cuda:{device_id}')
+    torch.cuda.set_device(device_id)
+    props = torch.cuda.get_device_properties(device_id)
     print(f"GPU: {props.name} (sm_{props.major}{props.minor}, {props.multi_processor_count} SMs)")
     print(f"Comparing im2col TileLang vs Winograd vs cuDNN for 3×3 stride=1 Conv+BN")
     print()
@@ -135,7 +143,9 @@ def main():
         OH, OW = H, W  # stride=1, pad=1
         K_red = 9 * C_in
         M = TB * OH * OW
-        tile_h, tile_w = (OH + 1) // 2, (OW + 1) // 2
+        # Winograd tile count: actual tiles from unfold(size=4, step=2) on padded (H+2)
+        tile_h = (H + 2 * P - 4) // 2 + 1  # = (H + 2P - 4) // 2 + 1
+        tile_w = (W + 2 * P - 4) // 2 + 1
         M_tiles = TB * tile_h * tile_w
 
         print(f"{'='*70}")
@@ -159,15 +169,18 @@ def main():
 
         profile_args = (data_nhwc, w_nhwc, bn_s, bn_b)
         try:
+            torch.cuda.set_device(device_id)
             cfg = select_config_roofline(
                 M_per_t=M, K=K_red, N=C_out, T_steps=1,
                 compile_fn=_compile_imcol, profile_args=profile_args,
                 top_k=5, n_profile=200, bpe=2)
+            torch.cuda.set_device(device_id)
             kern_imcol = _compile_imcol(cfg)
             ms_imcol = benchmark(lambda: kern_imcol(data_nhwc, w_nhwc, bn_s, bn_b))
         except Exception as e:
             print(f"  im2col FAILED: {e}")
             ms_imcol = float('inf')
+            cfg = {}
         print(f"  im2col TileLang:   {ms_imcol:.3f} ms (bK={cfg.get('block_K','?')})")
 
         # ── 2. Winograd transform-separate ──
@@ -180,13 +193,14 @@ def main():
             ms_wino = float('inf')
         print(f"  Winograd (xform+bmm): {ms_wino:.3f} ms")
 
-        # ── 2b. Winograd GEMM only (ceiling) ──
+        # ── 2b. Winograd GEMM only (ceiling for fused kernel) ──
         try:
-            V_pre = torch.randn(16, M_tiles, C_in, dtype=torch.float16, device=device)
-            ms_gemm = benchmark(lambda: torch.bmm(V_pre, U))
+            V_pre = torch.randn(16, M_tiles, C_in, dtype=torch.float16, device=device).contiguous()
+            U_local = U.contiguous()
+            ms_gemm = benchmark(lambda: torch.bmm(V_pre, U_local))
         except Exception as e:
             ms_gemm = float('inf')
-        print(f"  Winograd GEMM only:   {ms_gemm:.3f} ms")
+        print(f"  Winograd GEMM only:   {ms_gemm:.3f} ms (16× {M_tiles}×{C_in}×{C_out})")
 
         # ── 3. cuDNN reference ──
         bn_s4 = bn_s.view(1, -1, 1, 1)
@@ -195,9 +209,12 @@ def main():
         print(f"  cuDNN:                {ms_cudnn:.3f} ms")
 
         # ── Correctness ──
-        out_wino = wino_forward(data_nchw, U, P, tile_h, tile_w, C_in, C_out, TB, OH, OW)
-        ref = (F.conv2d(data_nchw.float(), w_nchw.float(), padding=P) * bn_s4 + bn_b4).half()
-        cos = F.cosine_similarity(out_wino.float().flatten(), ref.float().flatten(), dim=0)
+        try:
+            out_wino = wino_forward(data_nchw, U, P, tile_h, tile_w, C_in, C_out, TB, OH, OW)
+            ref = (F.conv2d(data_nchw.float(), w_nchw.float(), padding=P) * bn_s4 + bn_b4).half()
+            cos = F.cosine_similarity(out_wino.float().flatten(), ref.float().flatten(), dim=0)
+        except Exception:
+            cos = torch.tensor(0.0)
 
         # ── Summary ──
         best = min(ms_imcol, ms_wino, ms_cudnn)

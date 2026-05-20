@@ -279,7 +279,12 @@ def _autotune_config(compile_fn, profile_args: tuple, M: int, K_red: int, F: int
     candidates = []
     bm_choices = [32, 64, 128, 256]
     bn_choices = [32, 64, 128, 256]
-    bk_choices = [32, 64, 128]
+    # K-divisibility-aware block_K choices
+    bk_base = {32, 64, 128}
+    for bk in [48, 96]:
+        if K_red > 0 and K_red % bk == 0 and bk <= K_red:
+            bk_base.add(bk)
+    bk_choices = sorted(bk_base)
     ns_choices = [2, 3, 4] if is_high_bw else [2, 3]
     thr_choices = [128, 256, 512] if is_high_bw else [128, 256]
 
@@ -350,7 +355,12 @@ def _autotune_interleaved(compile_fn, profile_args: tuple,
     candidates = []
     bm_choices = [16, 32, 64, 128, 256]
     bn_choices = [32, 64, 128, 256]
-    bk_choices = [32, 64, 128]
+    # K-divisibility-aware block_K choices
+    bk_base = {32, 64, 128}
+    for bk in [48, 96]:
+        if K_red > 0 and K_red % bk == 0 and bk <= K_red:
+            bk_base.add(bk)
+    bk_choices = sorted(bk_base)
     ns_choices = [2, 3, 4] if is_high_bw else [2, 3]
     thr_choices = [128, 256, 512] if is_high_bw else [128]
 
@@ -917,13 +927,21 @@ class TileLangCompiler:
             return None, False
 
         _load_linear_kernels()
-        cfg = self._resolve_config(key, M, K, N)
 
-        try:
-            kern = _matmul_kernel(
+        def _compile_ms(cfg):
+            return _matmul_kernel(
                 M=M, K=K, N=N, scale=scale,
                 io_dtype=self.io_dtype_tl,
                 **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
+        _profile_args = (
+            torch.empty(M, K, dtype=self.io_dtype_torch, device='cuda'),
+            torch.empty(K, N, dtype=self.io_dtype_torch, device='cuda'),
+        )
+        cfg = self._resolve_config(key, M, K, N,
+                                    compile_fn=_compile_ms, profile_args=_profile_args)
+
+        try:
+            kern = _compile_ms(cfg)
         except Exception:
             kern = None
 
@@ -1076,35 +1094,54 @@ class TileLangCompiler:
             from sengine.kernels.fused_attention_kernels import (
                 maxformer_kTv_kernel, maxformer_qkv_kernel)
 
+            C = heads * hd
             key1 = f"maxformer_kTv_{TB}_{heads}_{hd}_{N}_{H}_{W}_{self.precision}"
             key2 = f"maxformer_qkv_lif_{TB}_{heads}_{hd}_{N}_{H}_{W}_s{ap.scale}_{self.precision}"
 
             gemm1 = self._kernel_cache.get(key1)
             if gemm1 is None:
-                cfg1 = self._resolve_config(key1, hd, N, hd)
-                try:
-                    gemm1 = maxformer_kTv_kernel(
+                def _compile_mf_g1(cfg):
+                    return maxformer_kTv_kernel(
                         TB=TB, heads=heads, hd=hd, N=N, H=H, W=W,
                         io_dtype=self.io_dtype_tl,
-                        **{k: cfg1[k] for k in ('block_M', 'block_N', 'block_K',
-                                                 'num_stages', 'threads')})
+                        **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K',
+                                                'num_stages', 'threads')})
+                _profile_mf_g1 = (
+                    torch.empty(TB * N, C, dtype=self.io_dtype_torch, device='cuda'),
+                    torch.empty(TB * N, C, dtype=self.io_dtype_torch, device='cuda'),
+                )
+                cfg1 = self._resolve_config(key1, hd, N, hd,
+                                            compile_fn=_compile_mf_g1,
+                                            profile_args=_profile_mf_g1)
+                try:
+                    gemm1 = _compile_mf_g1(cfg1)
                 except Exception:
                     gemm1 = None
                 self._kernel_cache[key1] = gemm1
+                self._config_cache[key1] = cfg1
 
             gemm2 = self._kernel_cache.get(key2)
             if gemm2 is None:
-                cfg2 = self._resolve_config(key2, N, hd, hd)
-                try:
-                    gemm2 = maxformer_qkv_kernel(
+                def _compile_mf_g2(cfg):
+                    return maxformer_qkv_kernel(
                         TB=TB, heads=heads, hd=hd, N=N, H=H, W=W,
                         scale=ap.scale,
                         io_dtype=self.io_dtype_tl,
-                        **{k: cfg2[k] for k in ('block_M', 'block_N', 'block_K',
-                                                 'num_stages', 'threads')})
+                        **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K',
+                                                'num_stages', 'threads')})
+                _profile_mf_g2 = (
+                    torch.empty(TB * N, C, dtype=self.io_dtype_torch, device='cuda'),
+                    torch.empty(batch * hd, hd, dtype=self.io_dtype_torch, device='cuda'),
+                )
+                cfg2 = self._resolve_config(key2, N, hd, hd,
+                                            compile_fn=_compile_mf_g2,
+                                            profile_args=_profile_mf_g2)
+                try:
+                    gemm2 = _compile_mf_g2(cfg2)
                 except Exception:
                     gemm2 = None
                 self._kernel_cache[key2] = gemm2
+                self._config_cache[key2] = cfg2
 
         elif ap.variant == "spikformer":
             from sengine.kernels.spikformer_kernels import (
@@ -1113,30 +1150,48 @@ class TileLangCompiler:
             key1 = f"batched_mm_bt_{batch}_{g1_M}_{g1_K}_{g1_N}_s{g1_scale}_{self.precision}"
             gemm1 = self._kernel_cache.get(key1)
             if gemm1 is None:
-                cfg1 = self._resolve_config(key1, g1_M, g1_K, g1_N)
-                try:
-                    gemm1 = batched_matmul_bt_kernel(
+                def _compile_sf_g1(cfg):
+                    return batched_matmul_bt_kernel(
                         batch=batch, M=g1_M, K=g1_K, N=g1_N, scale=g1_scale,
                         io_dtype=self.io_dtype_tl,
-                        **{k: cfg1[k] for k in ('block_M', 'block_N', 'block_K',
-                                                 'num_stages', 'threads')})
+                        **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K',
+                                                'num_stages', 'threads')})
+                _profile_sf_g1 = (
+                    torch.empty(batch * g1_M, g1_K, dtype=self.io_dtype_torch, device='cuda'),
+                    torch.empty(batch * g1_N, g1_K, dtype=self.io_dtype_torch, device='cuda'),
+                )
+                cfg1 = self._resolve_config(key1, g1_M, g1_K, g1_N,
+                                            compile_fn=_compile_sf_g1,
+                                            profile_args=_profile_sf_g1)
+                try:
+                    gemm1 = _compile_sf_g1(cfg1)
                 except Exception:
                     gemm1 = None
                 self._kernel_cache[key1] = gemm1
+                self._config_cache[key1] = cfg1
 
             key2 = f"batched_mm_{batch}_{g2_M}_{g2_K}_{g2_N}_s{g2_scale}_{self.precision}"
             gemm2 = self._kernel_cache.get(key2)
             if gemm2 is None:
-                cfg2 = self._resolve_config(key2, g2_M, g2_K, g2_N)
-                try:
-                    gemm2 = batched_matmul_kernel(
+                def _compile_sf_g2(cfg):
+                    return batched_matmul_kernel(
                         batch=batch, M=g2_M, K=g2_K, N=g2_N, scale=g2_scale,
                         io_dtype=self.io_dtype_tl,
-                        **{k: cfg2[k] for k in ('block_M', 'block_N', 'block_K',
-                                                 'num_stages', 'threads')})
+                        **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K',
+                                                'num_stages', 'threads')})
+                _profile_sf_g2 = (
+                    torch.empty(batch * g2_M, g2_K, dtype=self.io_dtype_torch, device='cuda'),
+                    torch.empty(batch * g2_K, g2_N, dtype=self.io_dtype_torch, device='cuda'),
+                )
+                cfg2 = self._resolve_config(key2, g2_M, g2_K, g2_N,
+                                            compile_fn=_compile_sf_g2,
+                                            profile_args=_profile_sf_g2)
+                try:
+                    gemm2 = _compile_sf_g2(cfg2)
                 except Exception:
                     gemm2 = None
                 self._kernel_cache[key2] = gemm2
+                self._config_cache[key2] = cfg2
         elif ap.variant == "dssa":
             from sengine.kernels.fused_attention_kernels import (
                 dssa_kTq_kernel, dssa_v_attn_kernel)

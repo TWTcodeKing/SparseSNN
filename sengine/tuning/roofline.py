@@ -106,7 +106,16 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
 
     bM_choices = [16, 32, 64, 128, 256]
     bN_choices = [32, 64, 128, 256]
-    bK_choices = [32, 64, 128] if bpe == 2 else [32, 64]
+    # K-divisibility-aware: include block_K values that evenly divide C_in
+    # to avoid wasted tail iterations in the K-loop
+    bK_base = [32, 64, 128] if bpe == 2 else [32, 64]
+    bK_divisors = set()
+    for bk in [32, 48, 64, 96, 128]:
+        if bpe == 4 and bk > 64:
+            continue
+        if K > 0 and K % bk == 0 and bk <= K:
+            bK_divisors.add(bk)
+    bK_choices = sorted(set(bK_base) | bK_divisors)
     ns_choices = [2, 3, 4, 5] if is_ampere_plus else [2, 3]
     thr_choices = [128, 256, 512] if is_ampere_plus else [128, 256]
 
@@ -181,7 +190,7 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
     # Architecture-specific known-good configs (cuBLAS-inspired tile shapes)
     if is_ampere_plus:
         known_good = [
-            # cuBLAS A100 typical configs
+            # cuBLAS A100 typical configs — square & rectangular
             dict(block_M=128, block_N=128, block_K=64, num_stages=3, threads=256),
             dict(block_M=128, block_N=128, block_K=32, num_stages=4, threads=256),
             dict(block_M=64, block_N=128, block_K=64, num_stages=4, threads=256),
@@ -189,9 +198,18 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
             dict(block_M=64, block_N=64, block_K=64, num_stages=4, threads=128),
             dict(block_M=256, block_N=64, block_K=64, num_stages=3, threads=256),
             dict(block_M=64, block_N=256, block_K=64, num_stages=3, threads=256),
+            # Asymmetric tiles for M>>N or M<<N shapes
+            dict(block_M=32, block_N=128, block_K=64, num_stages=4, threads=128),
+            dict(block_M=128, block_N=32, block_K=64, num_stages=4, threads=128),
+            dict(block_M=256, block_N=128, block_K=64, num_stages=3, threads=256),
+            dict(block_M=128, block_N=256, block_K=64, num_stages=3, threads=256),
             # Deeper pipeline variants
             dict(block_M=64, block_N=128, block_K=64, num_stages=5, threads=128),
             dict(block_M=128, block_N=64, block_K=64, num_stages=5, threads=128),
+            # K-divisibility configs for common C_in values (96, 192, 384, 768)
+            dict(block_M=64, block_N=128, block_K=96, num_stages=3, threads=256),
+            dict(block_M=128, block_N=64, block_K=96, num_stages=3, threads=256),
+            dict(block_M=64, block_N=64, block_K=48, num_stages=4, threads=128),
         ]
     else:
         known_good = [
@@ -200,6 +218,10 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
             dict(block_M=64, block_N=64, block_K=64, num_stages=2, threads=128),
             dict(block_M=64, block_N=128, block_K=32, num_stages=2, threads=128),
             dict(block_M=128, block_N=64, block_K=32, num_stages=2, threads=128),
+            # Asymmetric tiles for narrow GEMM shapes
+            dict(block_M=32, block_N=128, block_K=32, num_stages=2, threads=128),
+            dict(block_M=128, block_N=32, block_K=32, num_stages=2, threads=128),
+            dict(block_M=64, block_N=64, block_K=64, num_stages=3, threads=128),
         ]
     for kg in known_good:
         if kg['block_K'] > K:

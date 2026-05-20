@@ -102,13 +102,13 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
     max_smem = hw['max_smem_per_sm']
 
     # Architecture-adaptive search space
-    is_ampere_plus = max_smem >= 160 * 1024  # A100: 164KB, RTX 4090: ~100KB
+    is_ampere_plus = max_smem >= 160 * 1024  # A100: 164KB, H100: 228KB
 
-    bM_choices = [16, 32, 64, 128]
-    bN_choices = [32, 64, 128]
+    bM_choices = [16, 32, 64, 128, 256]
+    bN_choices = [32, 64, 128, 256]
     bK_choices = [32, 64, 128] if bpe == 2 else [32, 64]
-    ns_choices = [2, 3, 4] if is_ampere_plus else [2, 3]
-    thr_choices = [128, 256] if is_ampere_plus else [128]
+    ns_choices = [2, 3, 4, 5] if is_ampere_plus else [2, 3]
+    thr_choices = [128, 256, 512] if is_ampere_plus else [128, 256]
 
     all_cfgs = []
     for bM in bM_choices:
@@ -148,7 +148,9 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
     def _rank(cfg_tuple):
         cfg, grid, occ, area = cfg_tuple
         # Tile area: larger tiles = better tensor core utilization
-        area_score = min(area, 8192 if is_ampere_plus else 4096)
+        # A100+ benefits from much larger tiles than consumer GPUs
+        area_cap = 16384 if is_ampere_plus else 4096
+        area_score = min(area, area_cap)
         # Grid coverage: prefer configs that fill the GPU
         grid_ok = 1.0 if grid >= sm_half else (0.7 if grid >= sm_count // 4 else 0.4)
         # K-loop depth penalty
@@ -157,42 +159,59 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
         # Occupancy bonus: higher occupancy helps hide memory latency,
         # especially on high-bandwidth GPUs (A100: 2TB/s)
         occ_score = 1.0 + 0.15 * min(occ, 4) if is_ampere_plus else 1.0
-        return -(area_score * grid_ok * k_eff * occ_score)
+        # Pipeline depth bonus: deeper pipeline on high-BW GPUs
+        ns_bonus = 1.0 + 0.05 * (cfg['num_stages'] - 2) if is_ampere_plus else 1.0
+        return -(area_score * grid_ok * k_eff * occ_score * ns_bonus)
 
     all_cfgs.sort(key=_rank)
 
-    # Deduplicate by (bM, bN, bK) — keep different bK variants since they
-    # have very different K-loop depths and pipeline behavior
+    # Deduplicate by (bM, bN, bK, num_stages, threads) — keep distinct
+    # stage/thread variants since they have very different pipeline behavior
     seen = set()
     pruned = []
     for cfg, grid, occ, tile_area in all_cfgs:
-        key = (cfg['block_M'], cfg['block_N'], cfg['block_K'])
+        key = (cfg['block_M'], cfg['block_N'], cfg['block_K'],
+               cfg['num_stages'], cfg['threads'])
         if key not in seen:
             seen.add(key)
             pruned.append(cfg)
         if len(pruned) >= top_k:
             break
 
-    # Architecture-specific known-good configs
+    # Architecture-specific known-good configs (cuBLAS-inspired tile shapes)
     if is_ampere_plus:
         known_good = [
-            dict(block_M=64, block_N=128, block_K=64, num_stages=3, threads=128),
-            dict(block_M=128, block_N=64, block_K=64, num_stages=3, threads=128),
+            # cuBLAS A100 typical configs
+            dict(block_M=128, block_N=128, block_K=64, num_stages=3, threads=256),
+            dict(block_M=128, block_N=128, block_K=32, num_stages=4, threads=256),
+            dict(block_M=64, block_N=128, block_K=64, num_stages=4, threads=256),
+            dict(block_M=128, block_N=64, block_K=64, num_stages=4, threads=256),
             dict(block_M=64, block_N=64, block_K=64, num_stages=4, threads=128),
+            dict(block_M=256, block_N=64, block_K=64, num_stages=3, threads=256),
+            dict(block_M=64, block_N=256, block_K=64, num_stages=3, threads=256),
+            # Deeper pipeline variants
+            dict(block_M=64, block_N=128, block_K=64, num_stages=5, threads=128),
+            dict(block_M=128, block_N=64, block_K=64, num_stages=5, threads=128),
         ]
     else:
         known_good = [
             dict(block_M=64, block_N=64, block_K=32, num_stages=2, threads=128),
             dict(block_M=32, block_N=64, block_K=32, num_stages=2, threads=128),
+            dict(block_M=64, block_N=64, block_K=64, num_stages=2, threads=128),
+            dict(block_M=64, block_N=128, block_K=32, num_stages=2, threads=128),
+            dict(block_M=128, block_N=64, block_K=32, num_stages=2, threads=128),
         ]
     for kg in known_good:
         if kg['block_K'] > K:
+            continue
+        if kg['block_M'] * kg['block_N'] < kg['threads']:
             continue
         smem = _smem_bytes(kg['block_M'], kg['block_N'], kg['block_K'],
                            kg['num_stages'], bpe)
         if smem > max_smem:
             continue
-        key = (kg['block_M'], kg['block_N'], kg['block_K'])
+        key = (kg['block_M'], kg['block_N'], kg['block_K'],
+               kg['num_stages'], kg['threads'])
         if key not in seen:
             seen.add(key)
             pruned.append(kg)

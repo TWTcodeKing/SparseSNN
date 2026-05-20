@@ -135,9 +135,12 @@ def estimate_occupancy(block_M, block_N, block_K, num_stages, threads,
                        n_membranes=1):
     """Estimate max CTAs per SM for an interleaved kernel.
 
-    Uses SM 8.9 (RTX 4090) resource limits. The estimate is conservative —
-    actual occupancy may differ due to compiler register allocation.
+    Auto-detects GPU resource limits — works on any arch (A100, RTX 4090, etc.).
+    The estimate is conservative — actual occupancy may differ due to compiler
+    register allocation.
     """
+    hw = _get_hw_info()
+
     # Shared memory: pipeline buffers + output staging
     smem_pipeline = (block_M * block_K + block_K * block_N) * 2 * num_stages
     smem_output = block_M * block_N * 2  # output shared buffer
@@ -150,11 +153,20 @@ def estimate_occupancy(block_M, block_N, block_K, num_stages, threads,
     regs_tmp = 10                     # BN, spike, h, indices, etc.
     regs_per_thread = regs_acc + regs_mem + regs_tmp
 
-    # SM 8.9 (Ada Lovelace / RTX 4090) limits
-    max_smem_per_sm = 100 * 1024   # 100 KB configurable shared memory
-    max_regs_per_sm = 65536        # 64K 32-bit registers per SM
-    max_threads_per_sm = 1536      # max resident threads
-    max_blocks_per_sm = 16         # max resident blocks
+    # Read limits from detected hardware
+    max_smem_per_sm = hw.get('max_smem', 100 * 1024)
+    max_regs_per_sm = 65536  # same for all SM 8.x+
+    max_blocks_per_sm = 16   # same for SM 8.x, 32 for SM 9.x
+
+    # max_threads_per_sm: read from calibration cache if available
+    try:
+        from sengine.tuning.hw_calibrate import calibrate
+        cal = calibrate()
+        max_threads_per_sm = cal.get('max_threads_per_sm', 1536)
+        max_regs_per_sm = cal.get('max_regs_per_sm', 65536)
+        max_blocks_per_sm = cal.get('max_blocks_per_sm', 16)
+    except Exception:
+        max_threads_per_sm = 1536
 
     ctas_by_smem = max_smem_per_sm // max(smem_total, 1)
     ctas_by_regs = max_regs_per_sm // max(regs_per_thread * threads, 1)
@@ -170,33 +182,55 @@ def _pick_interleaved_config(M: int, K_red: int, F: int,
                               n_membranes: int = 1) -> dict:
     """Pick tile config optimized for interleaved kernels.
 
-    Balances GEMM efficiency (larger tiles) with occupancy (more CTAs/SM).
-    Empirically: bM=32,bN=64 is the sweet spot — enough tile size for
-    good tensor core utilization, while achieving ~1.6 CTAs/SM for overlap.
-    Smaller tiles (bM=16) hurt GEMM efficiency more than they help overlap.
+    Architecture-adaptive: uses larger tiles, deeper pipeline, and more threads
+    on GPUs with higher bandwidth and shared memory (A100, H100).
     """
-    # Prefer bM=32 over bM=64 for slightly better occupancy,
-    # but never go below bM=32 (too small for tensor cores).
-    for bm in [32, 64]:
-        for bn in [64, 32]:
-            bk = min(32, K_red)
-            grid = ((M + bm - 1) // bm) * ((F + bn - 1) // bn)
-            if grid >= sm_count:  # at least 1 CTA/SM
-                return dict(block_M=bm, block_N=bn, block_K=bk,
-                            num_stages=2, threads=128)
+    hw = _get_hw_info()
+    max_smem = hw.get('max_smem', 100 * 1024)
+    is_high_bw = max_smem >= 160 * 1024  # A100 (164KB) / H100 (228KB)
+
+    if is_high_bw:
+        # A100+: prefer larger tiles + deeper pipeline for high BW utilization
+        tile_prefs = [(64, 128), (128, 64), (64, 64), (32, 64)]
+        bk = min(64, K_red)
+        ns = 3
+        thr = 128
+    else:
+        # RTX 4090 / consumer: moderate tiles, 2-stage pipeline
+        tile_prefs = [(32, 64), (64, 64), (64, 32)]
+        bk = min(32, K_red)
+        ns = 2
+        thr = 128
+
+    for bm, bn in tile_prefs:
+        if bn > max(F, 32):
+            continue
+        smem = (bm * bk + bk * bn) * 2 * ns + bm * bn * 2
+        if smem > max_smem:
+            continue
+        grid = ((M + bm - 1) // bm) * ((F + bn - 1) // bn)
+        if grid >= sm_count:
+            return dict(block_M=bm, block_N=bn, block_K=bk,
+                        num_stages=ns, threads=thr)
 
     return dict(block_M=32, block_N=64, block_K=min(32, K_red),
-                num_stages=2, threads=128)
+                num_stages=ns, threads=128)
 
 
 def _pick_config(M: int, K_red: int, F: int, bpe: int = 2) -> dict:
     """Pick a reasonable default tile config for a GEMM problem.
+
+    Architecture-adaptive: A100+ gets larger tiles, deeper pipeline, wider threads.
 
     Args:
         bpe: bytes per element (2 for fp16, 4 for fp32).
 
     Returns dict with block_M, block_N, block_K, num_stages, threads.
     """
+    hw = _get_hw_info()
+    max_smem = hw.get('max_smem', 100 * 1024)
+    is_high_bw = max_smem >= 160 * 1024
+
     if M >= 100000:
         bm = 128
     elif M >= 10000:
@@ -205,14 +239,15 @@ def _pick_config(M: int, K_red: int, F: int, bpe: int = 2) -> dict:
         bm = 32
 
     bn = min(64, F) if F > 0 else 64
-    bk = min(32, K_red) if K_red > 0 else 32
-    ns = 2
+    bk = min(64 if is_high_bw else 32, K_red) if K_red > 0 else 32
+    ns = 3 if is_high_bw else 2
     thr = 128
 
+    # On high-BW GPUs, prefer wider output tile
+    if is_high_bw and F >= 128 and bpe == 2:
+        bn = min(128, F)
+
     # FP32: TileLang can't generate float32xN vector types for N>8.
-    # Cap tile sizes so each thread copies at most 8 elements per shared tile.
-    # data_shared = (bm, bk): max vectorization = bm*bk/thr
-    # weight_shared = (bk, bn): max vectorization = bk*bn/thr
     if bpe == 4:
         while (bm * bk // thr > 8 or bn * bk // thr > 8) and bn > 32:
             bn //= 2
@@ -220,6 +255,12 @@ def _pick_config(M: int, K_red: int, F: int, bpe: int = 2) -> dict:
             bm //= 2
         while bm * bk // thr > 8 and bk > 16:
             bk //= 2
+
+    # Verify smem fits
+    smem = (bm * bk + bk * bn) * bpe * ns + bm * bn * bpe
+    if smem > max_smem:
+        ns = 2
+        bk = min(32, K_red) if K_red > 0 else 32
 
     return dict(block_M=bm, block_N=bn, block_K=bk, num_stages=ns, threads=thr)
 
@@ -231,26 +272,31 @@ def _autotune_config(compile_fn, profile_args: tuple, M: int, K_red: int, F: int
     Hardware-adaptive: uses detected SM count and max smem to prune config space.
     """
     hw = _get_hw_info()
-    smem_limit = min(hw['max_smem'], 100 * 1024)  # conservative
+    smem_limit = hw['max_smem']  # use real limit, no artificial cap
     sm_count = hw['sm_count']
+    is_high_bw = smem_limit >= 160 * 1024
 
     candidates = []
-    for bm in [32, 64, 128, 256]:
-        for bn in [32, 64, 128]:
-            for bk in [32, 64]:
-                for ns in [2, 3]:
-                    for thr in [128, 256]:
+    bm_choices = [32, 64, 128, 256]
+    bn_choices = [32, 64, 128, 256]
+    bk_choices = [32, 64, 128]
+    ns_choices = [2, 3, 4] if is_high_bw else [2, 3]
+    thr_choices = [128, 256, 512] if is_high_bw else [128, 256]
+
+    for bm in bm_choices:
+        for bn in bn_choices:
+            for bk in bk_choices:
+                for ns in ns_choices:
+                    for thr in thr_choices:
                         if bk > K_red or bn > F * 2 or bm > M:
+                            continue
+                        if bm * bn < thr:
                             continue
                         smem = (bm * bk + bk * bn) * 2 * ns
                         if smem > smem_limit:
                             continue
-                        # Require minimum parallelism: at least sm_count/4 tiles
                         n_tiles = ((M + bm - 1) // bm) * ((F + bn - 1) // bn)
                         if n_tiles < sm_count // 4:
-                            continue
-                        min_threads = max(bm, bn) // 2
-                        if thr < min_threads:
                             continue
                         candidates.append(dict(block_M=bm, block_N=bn, block_K=bk,
                                                num_stages=ns, threads=thr))
@@ -297,17 +343,25 @@ def _autotune_interleaved(compile_fn, profile_args: tuple,
     Configs with ≥2 CTAs/SM get a bonus; configs with <1 CTA/SM are penalized.
     """
     hw = _get_hw_info()
-    smem_limit = min(hw['max_smem'], 100 * 1024)
+    smem_limit = hw['max_smem']  # use real limit
     sm_count = hw['sm_count']
+    is_high_bw = smem_limit >= 160 * 1024
 
     candidates = []
-    # Expanded search: include smaller tiles for higher occupancy
-    for bm in [16, 32, 64, 128]:
-        for bn in [32, 64, 128]:
-            for bk in [32, 64]:
-                for ns in [2, 3]:
-                    for thr in [128]:
+    bm_choices = [16, 32, 64, 128, 256]
+    bn_choices = [32, 64, 128, 256]
+    bk_choices = [32, 64, 128]
+    ns_choices = [2, 3, 4] if is_high_bw else [2, 3]
+    thr_choices = [128, 256, 512] if is_high_bw else [128]
+
+    for bm in bm_choices:
+        for bn in bn_choices:
+            for bk in bk_choices:
+                for ns in ns_choices:
+                    for thr in thr_choices:
                         if bk > K_red or bn > F * 2 or bm > M:
+                            continue
+                        if bm * bn < thr:
                             continue
                         smem = (bm * bk + bk * bn) * 2 * ns + bm * bn * 2
                         if smem > smem_limit:

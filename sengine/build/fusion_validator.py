@@ -276,6 +276,33 @@ def generate_recommendations(onnx_path: str, T: int, batch_size: int,
         print(f"  {tag:>6} {key}: fused={fused_us:.1f} vs decomp={decomp_total_us:.1f} "
               f"({parts}) [{pattern}]")
 
+    # ── Also compile decomposed TileLang kernels for REVERT'd shapes ──
+    # The build phase uses different kernel+key for decomposed (e.g. _get_conv1x1_bn
+    # vs _get_fused_conv_bn_if). Pre-compile those so their configs also land in rec.json.
+    n_decomp = 0
+    for key, rec in recommendations.items():
+        if rec.get('decision') != 'revert':
+            continue
+        info = fused_shapes.get(key)
+        if not info:
+            continue
+        nid, node, pattern, is_matmul = info
+        torch.cuda.set_device(_device_id)
+        try:
+            if is_matmul:
+                compiler._get_matmul(node)
+            elif node.conv_params and node.conv_params.kernel_h == 1:
+                compiler._get_conv1x1_bn(node)
+            elif node.conv_params and node.conv_params.groups > 1 and node.conv_params.groups != node.conv_params.in_channels:
+                compiler._get_grouped_conv_bn(node)
+            elif node.conv_params:
+                compiler._get_conv_bn(node)
+            n_decomp += 1
+        except Exception as e:
+            logger.debug("  Decomposed compile for %s failed: %s", key, e)
+    if n_decomp:
+        print(f"  Pre-compiled {n_decomp} decomposed kernels for REVERT'd shapes")
+
     # ── Profile fused attention (DSSA, Spikformer, MaxFormer) ──
     if attn_shapes:
         print(f"\nProfiling {len(attn_shapes)} attention shapes...")
@@ -301,12 +328,34 @@ def generate_recommendations(onnx_path: str, T: int, batch_size: int,
                 print(f"  FAIL {key}: {e}")
                 recommendations[key] = {'decision': 'keep', 'reason': f'compile_fail: {e}'}
 
-    # Write recommendations
+    # Embed autotuned tile configs from the compiler's internal cache.
+    # The build phase loads these directly into TuningCache, avoiding re-tuning.
+    hw_name = torch.cuda.get_device_properties(_device_id).name
+    tuning_configs = {}
+    for cache_key, cfg in compiler._config_cache.items():
+        if cfg:  # skip empty configs
+            tuning_configs[cache_key] = {
+                k: cfg[k] for k in ('block_M', 'block_N', 'block_K',
+                                     'num_stages', 'threads', 'latency_us')
+                if k in cfg
+            }
+
+    output_data = {
+        'recommendations': recommendations,
+        'tuning_configs': tuning_configs,
+        'gpu_name': hw_name,
+        'gpu_arch': f"sm_{torch.cuda.get_device_properties(_device_id).major}"
+                    f"{torch.cuda.get_device_properties(_device_id).minor}",
+        'T': T,
+        'batch_size': batch_size,
+    }
+
+    # Write recommendations + embedded configs
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     with open(output_path, 'w') as f:
-        json.dump(recommendations, f, indent=2)
+        json.dump(output_data, f, indent=2)
 
-    # Save autotuning cache so the build subprocess reuses configs
+    # Also save to standalone tuning cache file (backup)
     tuning_cache.save()
 
     n_keep = sum(1 for r in recommendations.values() if r.get('decision') == 'keep')
@@ -322,7 +371,33 @@ def load_recommendations(path: str) -> dict:
     if not path or not os.path.exists(path):
         return {}
     with open(path) as f:
-        return json.load(f)
+        data = json.load(f)
+    # New format: {'recommendations': {...}, 'tuning_configs': {...}, ...}
+    if 'recommendations' in data:
+        return data['recommendations']
+    # Old format: flat dict of shape_key → {decision, ...}
+    return data
+
+
+def load_tuning_configs(path: str) -> tuple[dict, str, str, int, int]:
+    """Load embedded tuning configs from fusion rec JSON.
+
+    Returns:
+        (configs_dict, gpu_name, gpu_arch, T, batch_size)
+        configs_dict maps compiler cache_key → tile config dict.
+        Returns empty dict if no configs embedded.
+    """
+    if not path or not os.path.exists(path):
+        return {}, "", "", 0, 0
+    with open(path) as f:
+        data = json.load(f)
+    if 'tuning_configs' not in data:
+        return {}, "", "", 0, 0
+    return (data['tuning_configs'],
+            data.get('gpu_name', ''),
+            data.get('gpu_arch', ''),
+            data.get('T', 0),
+            data.get('batch_size', 0))
 
 
 def _profile(kern_or_fn, args=None, reset_fn=None, n_warmup=50, n_iter=200):

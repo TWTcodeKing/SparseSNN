@@ -77,7 +77,33 @@ class EngineBuilder:
 
         # 4. Compile TileLang kernels on the final IR
         logger.phase("BUILD", "Compiling TileLang kernels (TB=%d)", self.T * self.batch_size)
-        tuning_cache = TuningCache() if autotune else None
+
+        # Pre-load tile configs from fusion rec.json (avoids re-tuning).
+        # Create TuningCache if autotune=True OR if rec.json has embedded configs.
+        tuning_cache = None
+        rec_preloaded = 0
+        if fusion_rec:
+            from sengine.build.fusion_validator import load_tuning_configs
+            rec_configs, rec_gpu, rec_arch, rec_T, rec_B = load_tuning_configs(fusion_rec)
+            if rec_configs:
+                import torch
+                gpu_name = torch.cuda.get_device_properties(
+                    torch.cuda.current_device()).name
+                if gpu_name == rec_gpu:
+                    tuning_cache = TuningCache()
+                    for cache_key, cfg in rec_configs.items():
+                        tuning_cache.put(cache_key, gpu_name, cfg,
+                                         rec_arch, rec_T, rec_B)
+                    rec_preloaded = len(rec_configs)
+                    logger.phase("BUILD", "Pre-loaded %d tuning configs from %s",
+                                 rec_preloaded, fusion_rec)
+                else:
+                    logger.phase("BUILD", "Skipping rec.json configs: GPU mismatch "
+                                 "(%s vs %s)", rec_gpu, gpu_name)
+
+        if tuning_cache is None and autotune:
+            tuning_cache = TuningCache()
+
         compiler = TileLangCompiler(
             self._ir, T=self.T, batch_size=self.batch_size,
             autotune=autotune, tuning_cache=tuning_cache,

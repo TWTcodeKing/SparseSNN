@@ -203,15 +203,22 @@ def main():
         print(f"  Phase 2: Fusion validation pre-pass")
         print(f"{'='*70}")
 
-        from sengine.build.fusion_validator import generate_recommendations
+        from sengine.build.fusion_validator import generate_recommendations, load_tuning_configs
 
         for B in batch_sizes:
             rec_path = os.path.join('.cache', f'fusion_rec_{tag}_{args.dataset}_T{args.T}_B{B}.json')
             if os.path.exists(rec_path):
-                print(f"\n  [B={B}] Recommendations exist: {rec_path}")
-                rec_files[('slicer', B)] = rec_path
-                continue
-            print(f"\n  [B={B}] Validating fused shapes...")
+                # Check if rec.json has embedded tuning configs (new format)
+                cfgs, _, _, _, _ = load_tuning_configs(rec_path)
+                if cfgs:
+                    print(f"\n  [B={B}] Recommendations exist ({len(cfgs)} cached configs): {rec_path}")
+                    rec_files[('slicer', B)] = rec_path
+                    continue
+                else:
+                    # Old format without configs — regenerate
+                    print(f"\n  [B={B}] Regenerating (old format without cached configs)...")
+            else:
+                print(f"\n  [B={B}] Validating fused shapes...")
             t0 = time.time()
             generate_recommendations(plugin_onnx, args.T, B, rec_path, precision=args.precision)
             print(f"  Done in {time.time()-t0:.0f}s")
@@ -244,16 +251,20 @@ def main():
 import os, sys, time, json; sys.path.insert(0, '{os.path.dirname(os.path.dirname(__file__))}')
 os.environ['CUDA_HOME']='{os.environ.get("CUDA_HOME","")}'
 os.environ['PATH']='{os.environ.get("PATH","")}'
-import shutil
-cache = '{cache_dir}'
-if os.path.exists(cache): shutil.rmtree(cache)
 import sengine
 from sengine.ir import KernelVariant
 try:
+    # Check how many configs are pre-loaded from rec.json
+    n_preloaded = 0
+    rec_path = {repr(rec_path)}
+    if rec_path:
+        from sengine.build.fusion_validator import load_tuning_configs
+        cfgs, _, _, _, _ = load_tuning_configs(rec_path)
+        n_preloaded = len(cfgs)
     t0 = time.time()
     e = sengine.build('{plugin_onnx}', T={args.T}, batch_size={B},
                        fusion='{fusion}', autotune={args.autotune},
-                       fusion_rec={repr(rec_path)},
+                       fusion_rec=rec_path,
                        precision='{args.precision}')
     build_s = time.time() - t0
     mode = 'C++' if not e._use_python_runtime else 'Python'
@@ -263,7 +274,8 @@ try:
     ms = e.benchmark(warmup={args.warmup}, iters={args.iters})
     fps = 1000.0 / ms * {B} if ms > 0 else 0
     json.dump({{'ms': ms, 'fps': fps, 'mode': mode, 'fused': n_fused,
-                'build_s': build_s, 'validated': {rec_path is not None},
+                'build_s': build_s, 'validated': rec_path is not None,
+                'preloaded': n_preloaded,
                 'precision': '{args.precision}'}},
               open('{result_file}', 'w'))
 except Exception as ex:
@@ -286,9 +298,14 @@ except Exception as ex:
                 else:
                     all_results[(fusion, B)] = r
                     v = 'yes' if r.get('validated') else 'no'
+                    extra = ""
+                    if r.get('validated'):
+                        extra += " | validated"
+                    if r.get('preloaded', 0) > 0:
+                        extra += f" | {r['preloaded']} cached configs"
                     print(f"  [{label}] {r['ms']:.3f} ms | {r['fps']:.0f} img/s | "
                           f"fused={r['fused']} | {r['mode']} | build={r['build_s']:.0f}s"
-                          + (" | validated" if r.get('validated') else ""))
+                          + extra)
                 os.remove(result_file)
             else:
                 print(f"  [{label}] FAILED: subprocess crashed")
@@ -307,16 +324,16 @@ except Exception as ex:
     print(f"  Autotune: {args.autotune} | Precision: {args.precision}")
     print(f"{'='*80}")
     print(f"  {'Fusion':<10} {'Batch':<6} {'Latency':>10} {'Throughput':>12} "
-          f"{'Fused':>6} {'Runtime':>8} {'Build':>8} {'Valid':>6}")
-    print(f"  {'-'*10} {'-'*6} {'-'*10} {'-'*12} {'-'*6} {'-'*8} {'-'*8} {'-'*6}")
+          f"{'Fused':>6} {'Runtime':>8} {'Build':>8} {'Cached':>7}")
+    print(f"  {'-'*10} {'-'*6} {'-'*10} {'-'*12} {'-'*6} {'-'*8} {'-'*8} {'-'*7}")
     for fusion in fusion_modes:
         for B in batch_sizes:
             r = all_results.get((fusion, B))
             if r:
-                v = 'yes' if r.get('validated') else 'no'
+                cached = str(r.get('preloaded', 0)) if r.get('preloaded', 0) > 0 else '-'
                 print(f"  {fusion:<10} B={B:<4} {r['ms']:>8.3f}ms "
                       f"{r['fps']:>10.0f}/s {r['fused']:>6} "
-                      f"{r['mode']:>8} {r['build_s']:>6.0f}s {v:>6}")
+                      f"{r['mode']:>8} {r['build_s']:>6.0f}s {cached:>7}")
             else:
                 print(f"  {fusion:<10} B={B:<4} {'FAIL':>10}")
     print(f"{'='*80}")

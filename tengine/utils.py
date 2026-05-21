@@ -264,6 +264,7 @@ _DATASET_CONFIG = {
     'gen1':       {'num_classes': 2,    'img_size': 320, 'in_channels': 3, 'task': 'detection'},
     'sst2':       {'num_classes': 2,    'img_size': 1,   'in_channels': 1, 'task': 'nlp', 'seq_len': 128},
     'mrpc':       {'num_classes': 2,    'img_size': 1,   'in_channels': 1, 'task': 'nlp', 'seq_len': 128},
+    'ntufi_humanid': {'num_classes': 14, 'img_size': 32, 'in_channels': 3},
 }
 
 
@@ -317,6 +318,12 @@ def build_dataloaders(dataset_name, data_root, batch_size, img_size=None,
         return gen1_dataloaders(
             data_root, batch_size, img_size=img_size,
             num_workers=num_workers, distributed=distributed, **kwargs)
+    elif dataset_name == 'ntufi_humanid':
+        from datasets import ntufi_humanid_dataloaders
+        T = kwargs.pop('T', kwargs.pop('frames_number', 4))
+        return ntufi_humanid_dataloaders(
+            data_root, batch_size, T=T, spatial_size=(img_size, img_size),
+            num_workers=num_workers, distributed=distributed)
     elif dataset_name in ('sst2', 'mrpc', 'cola', 'qnli'):
         from datasets import glue_dataloaders
         seq_len = kwargs.pop('seq_len', cfg.get('seq_len', 128))

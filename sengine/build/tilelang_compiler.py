@@ -1081,8 +1081,8 @@ class TileLangCompiler:
             # GEMM1: attn = K^T @ Q: (spatial_kv, hd) @ (hd, spatial_q) = (spatial_kv, spatial_q)
             g1_batch, g1_M, g1_K, g1_N = batch, spatial_kv, hd, spatial_q
             g1_scale = 1.0  # scale1 is a tensor, applied separately
-            # GEMM2: out = V @ attn: (hd, spatial_kv) @ (spatial_kv, spatial_q) = (hd, spatial_q)
-            g2_batch, g2_M, g2_K, g2_N = batch, hd, spatial_kv, spatial_q
+            # GEMM2 (restructured): out = attn^T @ V: (spatial_q, spatial_kv) @ (spatial_kv, hd) = (spatial_q, hd)
+            g2_batch, g2_M, g2_K, g2_N = batch, spatial_q, spatial_kv, hd
             g2_scale = 1.0  # scale2 is a tensor, applied separately
         elif ap.variant == "token_qk":
             # TokenQK: no matmul, only sum+mul. No TileLang GEMM needed.
@@ -1236,7 +1236,7 @@ class TileLangCompiler:
                     torch.empty(TB * spatial_kv, 2 * C_full, dtype=self.io_dtype_torch, device='cuda'),
                     torch.empty(batch * spatial_kv, spatial_q, dtype=self.io_dtype_torch, device='cuda'),
                 )
-                cfg2 = self._resolve_config(key2, hd, spatial_kv, spatial_q,
+                cfg2 = self._resolve_config(key2, spatial_q, spatial_kv, hd,
                                             compile_fn=_compile_g2, profile_args=_profile_g2)
                 try:
                     gemm2 = _compile_g2(cfg2)

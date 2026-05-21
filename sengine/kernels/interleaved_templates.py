@@ -45,9 +45,11 @@ def conv1x1_bn_if(
         bn_bias:  T.Tensor((F,), T.float32),
         output:   T.Tensor((TB, OH, OW, F), io_dtype),
     ):
+        d = T.Tensor((TB * OH * OW, C_in), io_dtype, data.data)
         o = T.Tensor((TB * OH * OW, F), io_dtype, output.data)
         with T.Kernel(T.ceildiv(F, block_N), T.ceildiv(M, block_M),
                       threads=threads) as (bx, by):
+            T.annotate_l2_hit_ratio({weight: 1.0})
             ds = T.alloc_shared((block_M, block_K), io_dtype)
             ws = T.alloc_shared((block_K, block_N), io_dtype)
             acc = T.alloc_fragment((block_M, block_N), T.float32)
@@ -60,14 +62,9 @@ def conv1x1_bn_if(
             for t in range(T_steps):
                 T.clear(acc)
                 for ki in T.Pipelined(T.ceildiv(C_in, block_K), num_stages=num_stages):
-                    for i, j in T.Parallel(block_M, block_K):
-                        c = ki * block_K + j; m = by * block_M + i
-                        n = t * B + m // (OH * OW); hw = m % (OH * OW)
-                        oh = hw // OW; ow = hw % OW
-                        ds[i, j] = T.if_then_else(
-                            (m < M) and (c < C_in),
-                            data[n, oh * S, ow * S, c], io_dtype(0))
-                    T.copy(weight[ki * block_K, bx * block_N], ws)
+                    T.copy(d[t * M + by * block_M, ki * block_K], ds)
+                    T.copy(weight[ki * block_K, bx * block_N], ws,
+                           eviction_policy="evict_last")
                     T.gemm(ds, ws, acc)
                 for i, j in T.Parallel(block_M, block_N):
                     m = by * block_M + i; f = bx * block_N + j
@@ -78,7 +75,8 @@ def conv1x1_bn_if(
                                             T.float32(1), T.float32(0))
                         mem[i, j] = (T.float32(1) - sp) * h + sp * T.float32(v_reset)
                         os_[i, j] = T.cast(sp, io_dtype)
-                T.copy(os_, o[t * M + by * block_M, bx * block_N])
+                T.copy(os_, o[t * M + by * block_M, bx * block_N],
+                       eviction_policy="evict_first")
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i; f = bx * block_N + j
                 if m < M and f < F: state[m, f] = mem[i, j]
@@ -113,9 +111,11 @@ def conv1x1_bn_lif(
         bn_bias:  T.Tensor((F,), T.float32),
         output:   T.Tensor((TB, OH, OW, F), io_dtype),
     ):
+        d = T.Tensor((TB * OH * OW, C_in), io_dtype, data.data)
         o = T.Tensor((TB * OH * OW, F), io_dtype, output.data)
         with T.Kernel(T.ceildiv(F, block_N), T.ceildiv(M, block_M),
                       threads=threads) as (bx, by):
+            T.annotate_l2_hit_ratio({weight: 1.0})
             ds = T.alloc_shared((block_M, block_K), io_dtype)
             ws = T.alloc_shared((block_K, block_N), io_dtype)
             acc = T.alloc_fragment((block_M, block_N), T.float32)
@@ -128,14 +128,9 @@ def conv1x1_bn_lif(
             for t in range(T_steps):
                 T.clear(acc)
                 for ki in T.Pipelined(T.ceildiv(C_in, block_K), num_stages=num_stages):
-                    for i, j in T.Parallel(block_M, block_K):
-                        c = ki * block_K + j; m = by * block_M + i
-                        n = t * B + m // (OH * OW); hw = m % (OH * OW)
-                        oh = hw // OW; ow = hw % OW
-                        ds[i, j] = T.if_then_else(
-                            (m < M) and (c < C_in),
-                            data[n, oh * S, ow * S, c], io_dtype(0))
-                    T.copy(weight[ki * block_K, bx * block_N], ws)
+                    T.copy(d[t * M + by * block_M, ki * block_K], ds)
+                    T.copy(weight[ki * block_K, bx * block_N], ws,
+                           eviction_policy="evict_last")
                     T.gemm(ds, ws, acc)
                 for i, j in T.Parallel(block_M, block_N):
                     m = by * block_M + i; f = bx * block_N + j
@@ -147,7 +142,8 @@ def conv1x1_bn_lif(
                                             T.float32(1), T.float32(0))
                         mem[i, j] = (T.float32(1) - sp) * h + sp * T.float32(v_reset)
                         os_[i, j] = T.cast(sp, io_dtype)
-                T.copy(os_, o[t * M + by * block_M, bx * block_N])
+                T.copy(os_, o[t * M + by * block_M, bx * block_N],
+                       eviction_policy="evict_first")
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i; f = bx * block_N + j
                 if m < M and f < F: state[m, f] = mem[i, j]
@@ -180,10 +176,12 @@ def conv1x1_bn_add_lif(
         residual: T.Tensor((TB, OH, OW, F), io_dtype),
         output:   T.Tensor((TB, OH, OW, F), io_dtype),
     ):
+        d = T.Tensor((TB * OH * OW, C_in), io_dtype, data.data)
         o = T.Tensor((TB * OH * OW, F), io_dtype, output.data)
         r = T.Tensor((TB * OH * OW, F), io_dtype, residual.data)
         with T.Kernel(T.ceildiv(F, block_N), T.ceildiv(M, block_M),
                       threads=threads) as (bx, by):
+            T.annotate_l2_hit_ratio({weight: 1.0})
             ds = T.alloc_shared((block_M, block_K), io_dtype)
             ws = T.alloc_shared((block_K, block_N), io_dtype)
             acc = T.alloc_fragment((block_M, block_N), T.float32)
@@ -196,13 +194,9 @@ def conv1x1_bn_add_lif(
             for t in range(T_steps):
                 T.clear(acc)
                 for ki in T.Pipelined(T.ceildiv(C_in, block_K), num_stages=num_stages):
-                    for i, j in T.Parallel(block_M, block_K):
-                        c = ki * block_K + j; m = by * block_M + i
-                        n = t * B + m // (OH * OW); hw = m % (OH * OW)
-                        ds[i, j] = T.if_then_else(
-                            (m < M) and (c < C_in),
-                            data[n, hw // OW, hw % OW, c], io_dtype(0))
-                    T.copy(weight[ki * block_K, bx * block_N], ws)
+                    T.copy(d[t * M + by * block_M, ki * block_K], ds)
+                    T.copy(weight[ki * block_K, bx * block_N], ws,
+                           eviction_policy="evict_last")
                     T.gemm(ds, ws, acc)
                 for i, j in T.Parallel(block_M, block_N):
                     m = by * block_M + i; f = bx * block_N + j
@@ -214,7 +208,8 @@ def conv1x1_bn_add_lif(
                                             T.float32(1), T.float32(0))
                         mem[i, j] = (T.float32(1) - sp) * h + sp * T.float32(v_reset)
                         os_[i, j] = T.cast(sp, io_dtype)
-                T.copy(os_, o[t * M + by * block_M, bx * block_N])
+                T.copy(os_, o[t * M + by * block_M, bx * block_N],
+                       eviction_policy="evict_first")
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i; f = bx * block_N + j
                 if m < M and f < F: state[m, f] = mem[i, j]
@@ -247,10 +242,12 @@ def conv1x1_bn_if_add(
         residual: T.Tensor((TB, OH, OW, F), io_dtype),
         output:   T.Tensor((TB, OH, OW, F), io_dtype),
     ):
+        d = T.Tensor((TB * OH * OW, C_in), io_dtype, data.data)
         o = T.Tensor((TB * OH * OW, F), io_dtype, output.data)
         r = T.Tensor((TB * OH * OW, F), io_dtype, residual.data)
         with T.Kernel(T.ceildiv(F, block_N), T.ceildiv(M, block_M),
                       threads=threads) as (bx, by):
+            T.annotate_l2_hit_ratio({weight: 1.0})
             ds = T.alloc_shared((block_M, block_K), io_dtype)
             ws = T.alloc_shared((block_K, block_N), io_dtype)
             acc = T.alloc_fragment((block_M, block_N), T.float32)
@@ -263,13 +260,9 @@ def conv1x1_bn_if_add(
             for t in range(T_steps):
                 T.clear(acc)
                 for ki in T.Pipelined(T.ceildiv(C_in, block_K), num_stages=num_stages):
-                    for i, j in T.Parallel(block_M, block_K):
-                        c = ki * block_K + j; m = by * block_M + i
-                        n = t * B + m // (OH * OW); hw = m % (OH * OW)
-                        ds[i, j] = T.if_then_else(
-                            (m < M) and (c < C_in),
-                            data[n, hw // OW, hw % OW, c], io_dtype(0))
-                    T.copy(weight[ki * block_K, bx * block_N], ws)
+                    T.copy(d[t * M + by * block_M, ki * block_K], ds)
+                    T.copy(weight[ki * block_K, bx * block_N], ws,
+                           eviction_policy="evict_last")
                     T.gemm(ds, ws, acc)
                 for i, j in T.Parallel(block_M, block_N):
                     m = by * block_M + i; f = bx * block_N + j
@@ -281,7 +274,8 @@ def conv1x1_bn_if_add(
                         mem[i, j] = (T.float32(1) - sp) * h + sp * T.float32(v_reset)
                         rv = T.cast(r[t * M + m, f], T.float32)
                         os_[i, j] = T.cast(sp + rv, io_dtype)
-                T.copy(os_, o[t * M + by * block_M, bx * block_N])
+                T.copy(os_, o[t * M + by * block_M, bx * block_N],
+                       eviction_policy="evict_first")
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i; f = bx * block_N + j
                 if m < M and f < F: state[m, f] = mem[i, j]
@@ -315,10 +309,12 @@ def conv1x1_bn_if_add_lif(
         residual: T.Tensor((TB, OH, OW, F), io_dtype),
         output:   T.Tensor((TB, OH, OW, F), io_dtype),
     ):
+        d = T.Tensor((TB * OH * OW, C_in), io_dtype, data.data)
         o = T.Tensor((TB * OH * OW, F), io_dtype, output.data)
         r = T.Tensor((TB * OH * OW, F), io_dtype, residual.data)
         with T.Kernel(T.ceildiv(F, block_N), T.ceildiv(M, block_M),
                       threads=threads) as (bx, by):
+            T.annotate_l2_hit_ratio({weight: 1.0})
             ds = T.alloc_shared((block_M, block_K), io_dtype)
             ws = T.alloc_shared((block_K, block_N), io_dtype)
             acc = T.alloc_fragment((block_M, block_N), T.float32)
@@ -334,13 +330,9 @@ def conv1x1_bn_if_add_lif(
             for t in range(T_steps):
                 T.clear(acc)
                 for ki in T.Pipelined(T.ceildiv(C_in, block_K), num_stages=num_stages):
-                    for i, j in T.Parallel(block_M, block_K):
-                        c = ki * block_K + j; m = by * block_M + i
-                        n = t * B + m // (OH * OW); hw = m % (OH * OW)
-                        ds[i, j] = T.if_then_else(
-                            (m < M) and (c < C_in),
-                            data[n, hw // OW, hw % OW, c], io_dtype(0))
-                    T.copy(weight[ki * block_K, bx * block_N], ws)
+                    T.copy(d[t * M + by * block_M, ki * block_K], ds)
+                    T.copy(weight[ki * block_K, bx * block_N], ws,
+                           eviction_policy="evict_last")
                     T.gemm(ds, ws, acc)
                 for i, j in T.Parallel(block_M, block_N):
                     m = by * block_M + i; f = bx * block_N + j
@@ -356,7 +348,8 @@ def conv1x1_bn_if_add_lif(
                                              T.float32(1), T.float32(0))
                         m2[i, j] = (T.float32(1) - sp2) * h2 + sp2 * T.float32(v_reset)
                         os_[i, j] = T.cast(sp2, io_dtype)
-                T.copy(os_, o[t * M + by * block_M, bx * block_N])
+                T.copy(os_, o[t * M + by * block_M, bx * block_N],
+                       eviction_policy="evict_first")
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i; f = bx * block_N + j
                 if m < M and f < F:

@@ -400,21 +400,24 @@ def conv1x1_bn_if_t4_kernel(
             for k_iter in T.Pipelined(
                 T.ceildiv(C_in, block_K), num_stages=num_stages,
             ):
-                # 1×1 gather: data[n, oh*S, ow*S, cin]
-                for i, j in T.Parallel(block_M, block_K):
-                    cin = k_iter * block_K + j
-                    m = by * block_M + i
-                    n_idx = m // (OH * OW)
-                    hw = m % (OH * OW)
-                    oh = hw // OW
-                    ow = hw % OW
-                    in_bound = (m < M) and (cin < C_in)
-                    data_shared[i, j] = T.if_then_else(
-                        in_bound,
-                        data[n_idx, oh * S, ow * S, cin],
-                        io_dtype(0),
-                    )
-
+                if S == 1:
+                    data_flat = T.Tensor((M, C_in), io_dtype, data.data)
+                    T.copy(data_flat[by * block_M, k_iter * block_K],
+                           data_shared)
+                else:
+                    for i, j in T.Parallel(block_M, block_K):
+                        cin = k_iter * block_K + j
+                        m = by * block_M + i
+                        n_idx = m // (OH * OW)
+                        hw = m % (OH * OW)
+                        oh = hw // OW
+                        ow = hw % OW
+                        in_bound = (m < M) and (cin < C_in)
+                        data_shared[i, j] = T.if_then_else(
+                            in_bound,
+                            data[n_idx, oh * S, ow * S, cin],
+                            io_dtype(0),
+                        )
                 T.copy(weight[k_iter * block_K, bx * block_N],
                        weight_shared)
                 T.gemm(data_shared, weight_shared, acc)
@@ -650,16 +653,21 @@ def conv1x1_bn_t4_kernel(
             for k_iter in T.Pipelined(
                 T.ceildiv(C_in, block_K), num_stages=num_stages,
             ):
-                for i, j in T.Parallel(block_M, block_K):
-                    cin = k_iter * block_K + j
-                    m = by * block_M + i
-                    n_idx = m // (OH * OW)
-                    hw = m % (OH * OW)
-                    oh = hw // OW
-                    ow = hw % OW
-                    ib = (m < M) and (cin < C_in)
-                    data_shared[i, j] = T.if_then_else(
-                        ib, data[n_idx, oh * S, ow * S, cin], io_dtype(0))
+                if S == 1:
+                    data_flat = T.Tensor((M, C_in), io_dtype, data.data)
+                    T.copy(data_flat[by * block_M, k_iter * block_K],
+                           data_shared)
+                else:
+                    for i, j in T.Parallel(block_M, block_K):
+                        cin = k_iter * block_K + j
+                        m = by * block_M + i
+                        n_idx = m // (OH * OW)
+                        hw = m % (OH * OW)
+                        oh = hw // OW
+                        ow = hw % OW
+                        ib = (m < M) and (cin < C_in)
+                        data_shared[i, j] = T.if_then_else(
+                            ib, data[n_idx, oh * S, ow * S, cin], io_dtype(0))
                 T.copy(weight[k_iter * block_K, bx * block_N], weight_shared)
                 T.gemm(data_shared, weight_shared, acc)
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)
@@ -769,17 +777,21 @@ def conv1x1_bn_if_add_t4_kernel(
             for k_iter in T.Pipelined(
                 T.ceildiv(C_in, block_K), num_stages=num_stages,
             ):
-                for i, j in T.Parallel(block_M, block_K):
-                    cin = k_iter * block_K + j
-                    m = by * block_M + i
-                    n_idx = m // (OH * OW)
-                    hw = m % (OH * OW)
-                    oh = hw // OW
-                    ow = hw % OW
-                    ib = (m < M) and (cin < C_in)
-                    data_shared[i, j] = T.if_then_else(
-                        ib, data[n_idx, oh * S, ow * S, cin], io_dtype(0))
-
+                if S == 1:
+                    data_flat = T.Tensor((M, C_in), io_dtype, data.data)
+                    T.copy(data_flat[by * block_M, k_iter * block_K],
+                           data_shared)
+                else:
+                    for i, j in T.Parallel(block_M, block_K):
+                        cin = k_iter * block_K + j
+                        m = by * block_M + i
+                        n_idx = m // (OH * OW)
+                        hw = m % (OH * OW)
+                        oh = hw // OW
+                        ow = hw % OW
+                        ib = (m < M) and (cin < C_in)
+                        data_shared[i, j] = T.if_then_else(
+                            ib, data[n_idx, oh * S, ow * S, cin], io_dtype(0))
                 T.copy(weight[k_iter * block_K, bx * block_N], weight_shared)
                 T.gemm(data_shared, weight_shared, acc)
 

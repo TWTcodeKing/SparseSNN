@@ -19,6 +19,15 @@ import tilelang
 import tilelang.language as T
 
 
+def _warp_policy(bM, bN):
+    """Select GemmWarpPolicy based on tile aspect ratio."""
+    if bM >= 4 * bN:
+        return T.GemmWarpPolicy.FullRow
+    elif bN >= 4 * bM:
+        return T.GemmWarpPolicy.FullCol
+    return T.GemmWarpPolicy.Square
+
+
 # ---------------------------------------------------------------------------
 # MaxFormer Linear Attention: K^T@V → Q@kv*scale → merge → LIF
 # Two GEMM kernels that read/write NHWC directly.
@@ -65,7 +74,7 @@ def maxformer_kTv_kernel(
                     if d < hd and n < N:
                         A_shared[i, j] = K_nhwc[tb * N + n, head * hd + d]
                     else:
-                        A_shared[i, j] = io_dtype(0)
+                        A_shared[i, j] = T.cast(0, io_dtype)
 
                 # B = V: B[n, d] = V_nhwc[tb*N + n, head*hd + d]
                 for i, j in T.Parallel(block_K, block_N):
@@ -74,9 +83,9 @@ def maxformer_kTv_kernel(
                     if n < N and d < hd:
                         B_shared[i, j] = V_nhwc[tb * N + n, head * hd + d]
                     else:
-                        B_shared[i, j] = io_dtype(0)
+                        B_shared[i, j] = T.cast(0, io_dtype)
 
-                T.gemm(A_shared, B_shared, acc)
+                T.gemm(A_shared, B_shared, acc, policy=_warp_policy(block_M, block_N))
 
             # Output: contiguous (batch*hd, hd) → T.copy
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)
@@ -132,12 +141,12 @@ def maxformer_qkv_kernel(
                     if n < N and d < hd:
                         A_shared[i, j] = Q_nhwc[tb * N + n, head * hd + d]
                     else:
-                        A_shared[i, j] = io_dtype(0)
+                        A_shared[i, j] = T.cast(0, io_dtype)
 
                 # B = kv: contiguous → T.copy
                 T.copy(kv_in[bz * hd + k_iter * block_K, bx * block_N], B_shared)
 
-                T.gemm(A_shared, B_shared, acc)
+                T.gemm(A_shared, B_shared, acc, policy=_warp_policy(block_M, block_N))
 
             # Output: write to NHWC (per-head channels contiguous within row,
             # but spatial tiles may cross batch boundary → bounds-checked)
@@ -205,7 +214,7 @@ def dssa_kTq_kernel(
                     if n_kv < spatial_kv and d < hd:
                         A_shared[i, j] = y_kv_nhwc[tb * spatial_kv + n_kv, head * 2 * hd + d]
                     else:
-                        A_shared[i, j] = io_dtype(0)
+                        A_shared[i, j] = T.cast(0, io_dtype)
 
                 # B = Q: Q[n_q, d] from x_q (bounds-checked, loaded for transpose_B)
                 for i, j in T.Parallel(block_N, block_K):
@@ -214,10 +223,10 @@ def dssa_kTq_kernel(
                     if n_q < spatial_q and d < hd:
                         B_shared[i, j] = x_q_nhwc[tb * spatial_q + n_q, head * hd + d]
                     else:
-                        B_shared[i, j] = io_dtype(0)
+                        B_shared[i, j] = T.cast(0, io_dtype)
 
                 # acc(spatial_kv, spatial_q) += K(spatial_kv, hd) @ Q(spatial_q, hd)^T
-                T.gemm(A_shared, B_shared, acc, transpose_B=True)
+                T.gemm(A_shared, B_shared, acc, transpose_B=True, policy=_warp_policy(block_M, block_N))
 
             # Output: bounds-checked write (spatial tiles may be partial)
             for i, j in T.Parallel(block_M, block_N):
@@ -277,7 +286,7 @@ def dssa_v_attn_kernel(
                     if n_kv < spatial_kv and n_q < spatial_q:
                         attn_shared[i, j] = attn_in[bz * spatial_kv + n_kv, n_q]
                     else:
-                        attn_shared[i, j] = io_dtype(0)
+                        attn_shared[i, j] = T.cast(0, io_dtype)
 
                 # V tile: V[n_kv, d] from y_kv second-half channels — bounds-checked
                 for i, j in T.Parallel(block_K, block_N):
@@ -287,10 +296,10 @@ def dssa_v_attn_kernel(
                         V_shared[i, j] = y_kv_nhwc[tb * spatial_kv + n_kv,
                                                      head * 2 * hd + hd + d]
                     else:
-                        V_shared[i, j] = io_dtype(0)
+                        V_shared[i, j] = T.cast(0, io_dtype)
 
                 # acc(spatial_q, hd) += attn^T(spatial_q, spatial_kv) @ V(spatial_kv, hd)
-                T.gemm(attn_shared, V_shared, acc, transpose_A=True)
+                T.gemm(attn_shared, V_shared, acc, transpose_A=True, policy=_warp_policy(block_M, block_N))
 
             # Write to NHWC: out[tb*spatial_q + n_q, head*hd + d]
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)

@@ -175,11 +175,18 @@ def generate_recommendations(onnx_path: str, T: int, batch_size: int,
             continue
 
         # Build profile args matching the kernel signature
+        # Stem conv (C_in < 4): data uses real C_in, weight uses padded C_in (16)
+        is_stem = cp and cp.in_channels < 4 and not is_matmul
+        C_in_kern = 16 if is_stem else C_in
         data_fused = torch.randn(TB, H, W, C_in, dtype=io_torch_dtype, device=_device)
         if is_matmul or (cp and cp.kernel_h == 1):
             w_fused = torch.randn(C_in, C_out, dtype=io_torch_dtype, device=_device)
+        elif is_grouped:
+            C_in_per_g = cp.in_channels // cp.groups
+            w_fused = torch.randn(cp.kernel_h, cp.kernel_w, C_in_per_g, C_out,
+                                   dtype=io_torch_dtype, device=_device)
         else:
-            w_fused = torch.randn(cp.kernel_h, cp.kernel_w, C_in, C_out,
+            w_fused = torch.randn(cp.kernel_h, cp.kernel_w, C_in_kern, C_out,
                                    dtype=io_torch_dtype, device=_device)
         st_fused = torch.zeros(M_per_t, C_out, dtype=torch.float32, device=_device)
         bn_s = torch.ones(C_out, dtype=torch.float32, device=_device)

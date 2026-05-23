@@ -138,9 +138,12 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
                             continue
                         grid = math.ceil(M_per_t / bM) * math.ceil(N / bN)
                         occ = _occupancy(bM, bN, bK, ns, thr, n_membranes, bpe)
-                        # Relaxed grid filter: allow smaller grids on GPUs with
-                        # fewer SMs (A100: 108) as long as occupancy compensates
+                        # Grid filter: prefer configs that fill the GPU, but
+                        # allow small grids for tiny GEMMs (e.g., attention hd×hd)
+                        # where the problem size itself limits parallelism.
+                        max_possible_grid = math.ceil(M_per_t / bM_choices[0]) * math.ceil(N / bN_choices[0])
                         min_grid = max(sm_count // 16, 1) if is_ampere_plus else max(sm_count // 8, 1)
+                        min_grid = min(min_grid, max_possible_grid)
                         if grid < min_grid:
                             continue
                         tile_area = bM * bN
@@ -149,7 +152,7 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
                         all_cfgs.append((cfg, grid, occ, tile_area))
 
     if not all_cfgs:
-        return [dict(block_M=32, block_N=64, block_K=min(32, K),
+        return [dict(block_M=32, block_N=64, block_K=max(16, min(32, K)),
                      num_stages=2, threads=128)]
 
     # Ranking: balance tile area, grid coverage, K-loop depth, AND occupancy.

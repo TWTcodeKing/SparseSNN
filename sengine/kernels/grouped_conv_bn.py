@@ -17,6 +17,15 @@ import tilelang
 import tilelang.language as T
 
 
+def _warp_policy(bM, bN):
+    """Select GemmWarpPolicy based on tile aspect ratio."""
+    if bM >= 4 * bN:
+        return T.GemmWarpPolicy.FullRow
+    elif bN >= 4 * bM:
+        return T.GemmWarpPolicy.FullCol
+    return T.GemmWarpPolicy.Square
+
+
 @tilelang.jit(out_idx=[-1])
 def grouped_conv_bn_kernel(
     TB, C_in, H, W, C_out, K, S, D, P, groups,
@@ -111,7 +120,7 @@ def grouped_conv_bn_kernel(
                         ib, weight[kh_val, kw_val, cin_local, co_global],
                         io_dtype(0))
 
-                T.gemm(data_shared, weight_shared, acc)
+                T.gemm(data_shared, weight_shared, acc, policy=_warp_policy(block_M, block_N))
 
             # BN epilogue — write to correct output channel offset
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)
@@ -235,7 +244,7 @@ def grouped_conv_bn_lif_kernel(
                             ib, weight[kh_val, kw_val, cin_local, co_global],
                             io_dtype(0))
 
-                    T.gemm(data_shared, weight_shared, acc)
+                    T.gemm(data_shared, weight_shared, acc, policy=_warp_policy(block_M, block_N))
 
                 # BN + LIF epilogue with membrane update
                 for i, j in T.Parallel(block_M, block_N):

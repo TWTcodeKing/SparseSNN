@@ -14,6 +14,15 @@ import tilelang
 import tilelang.language as T
 
 
+def _warp_policy(bM, bN):
+    """Select GemmWarpPolicy based on tile aspect ratio."""
+    if bM >= 4 * bN:
+        return T.GemmWarpPolicy.FullRow
+    elif bN >= 4 * bM:
+        return T.GemmWarpPolicy.FullCol
+    return T.GemmWarpPolicy.Square
+
+
 # ─── Kernel 1: Linear + BN + LIF (T-batched, shared membrane) ───
 
 @tilelang.jit(out_idx=[-1])
@@ -52,7 +61,7 @@ def linear_bn_lif_t4_kernel(
             ):
                 T.copy(inp[by * block_M, k_iter * block_K], A_shared)
                 T.copy(weight[k_iter * block_K, bx * block_N], B_shared)
-                T.gemm(A_shared, B_shared, acc)
+                T.gemm(A_shared, B_shared, acc, policy=_warp_policy(block_M, block_N))
 
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
@@ -103,7 +112,7 @@ def linear_bn_kernel(
             ):
                 T.copy(inp[by * block_M, k_iter * block_K], A_shared)
                 T.copy(weight[k_iter * block_K, bx * block_N], B_shared)
-                T.gemm(A_shared, B_shared, acc)
+                T.gemm(A_shared, B_shared, acc, policy=_warp_policy(block_M, block_N))
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
@@ -151,7 +160,7 @@ def matmul_kernel(
             ):
                 T.copy(A[by * block_M, k_iter * block_K], A_shared)
                 T.copy(B[k_iter * block_K, bx * block_N], B_shared)
-                T.gemm(A_shared, B_shared, acc)
+                T.gemm(A_shared, B_shared, acc, policy=_warp_policy(block_M, block_N))
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
@@ -203,7 +212,7 @@ def batched_matmul_kernel(
             ):
                 T.copy(A[a_base + by * block_M, k_iter * block_K], A_shared)
                 T.copy(B[b_base + k_iter * block_K, bx * block_N], B_shared)
-                T.gemm(A_shared, B_shared, acc)
+                T.gemm(A_shared, B_shared, acc, policy=_warp_policy(block_M, block_N))
 
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             c_base = bz * M
@@ -258,7 +267,7 @@ def batched_matmul_bt_kernel(
                 T.copy(A[a_base + by * block_M, k_iter * block_K], A_shared)
                 T.copy(B[b_base + bx * block_N, k_iter * block_K], B_shared)
                 # GEMM: A_shared(M,K) @ B_shared(N,K)^T = A_shared @ B_shared^T
-                T.gemm(A_shared, B_shared, acc, transpose_B=True)
+                T.gemm(A_shared, B_shared, acc, transpose_B=True, policy=_warp_policy(block_M, block_N))
 
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             c_base = bz * M
@@ -312,7 +321,7 @@ def matmul_lif_kernel(
             ):
                 T.copy(A[by * block_M, k_iter * block_K], A_shared)
                 T.copy(B_mat[k_iter * block_K, bx * block_N], B_shared)
-                T.gemm(A_shared, B_shared, acc)
+                T.gemm(A_shared, B_shared, acc, policy=_warp_policy(block_M, block_N))
 
             # LIF epilogue: integrate GEMM output into membrane, fire spikes
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)

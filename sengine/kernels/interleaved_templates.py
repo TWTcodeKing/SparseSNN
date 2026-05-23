@@ -19,6 +19,15 @@ import tilelang
 import tilelang.language as T
 
 
+def _warp_policy(bM, bN):
+    """Select GemmWarpPolicy based on tile aspect ratio."""
+    if bM >= 4 * bN:
+        return T.GemmWarpPolicy.FullRow
+    elif bN >= 4 * bM:
+        return T.GemmWarpPolicy.FullCol
+    return T.GemmWarpPolicy.Square
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Template 1: Conv1x1 + BN + IF
 # Pattern: Conv → BN → IF(membrane) → spike
@@ -65,7 +74,7 @@ def conv1x1_bn_if(
                     T.copy(d[t * M + by * block_M, ki * block_K], ds)
                     T.copy(weight[ki * block_K, bx * block_N], ws,
                            eviction_policy="evict_last")
-                    T.gemm(ds, ws, acc)
+                    T.gemm(ds, ws, acc, policy=_warp_policy(block_M, block_N))
                 for i, j in T.Parallel(block_M, block_N):
                     m = by * block_M + i; f = bx * block_N + j
                     if m < M and f < F:
@@ -131,7 +140,7 @@ def conv1x1_bn_lif(
                     T.copy(d[t * M + by * block_M, ki * block_K], ds)
                     T.copy(weight[ki * block_K, bx * block_N], ws,
                            eviction_policy="evict_last")
-                    T.gemm(ds, ws, acc)
+                    T.gemm(ds, ws, acc, policy=_warp_policy(block_M, block_N))
                 for i, j in T.Parallel(block_M, block_N):
                     m = by * block_M + i; f = bx * block_N + j
                     if m < M and f < F:
@@ -197,7 +206,7 @@ def conv1x1_bn_add_lif(
                     T.copy(d[t * M + by * block_M, ki * block_K], ds)
                     T.copy(weight[ki * block_K, bx * block_N], ws,
                            eviction_policy="evict_last")
-                    T.gemm(ds, ws, acc)
+                    T.gemm(ds, ws, acc, policy=_warp_policy(block_M, block_N))
                 for i, j in T.Parallel(block_M, block_N):
                     m = by * block_M + i; f = bx * block_N + j
                     if m < M and f < F:
@@ -263,7 +272,7 @@ def conv1x1_bn_if_add(
                     T.copy(d[t * M + by * block_M, ki * block_K], ds)
                     T.copy(weight[ki * block_K, bx * block_N], ws,
                            eviction_policy="evict_last")
-                    T.gemm(ds, ws, acc)
+                    T.gemm(ds, ws, acc, policy=_warp_policy(block_M, block_N))
                 for i, j in T.Parallel(block_M, block_N):
                     m = by * block_M + i; f = bx * block_N + j
                     if m < M and f < F:
@@ -333,7 +342,7 @@ def conv1x1_bn_if_add_lif(
                     T.copy(d[t * M + by * block_M, ki * block_K], ds)
                     T.copy(weight[ki * block_K, bx * block_N], ws,
                            eviction_policy="evict_last")
-                    T.gemm(ds, ws, acc)
+                    T.gemm(ds, ws, acc, policy=_warp_policy(block_M, block_N))
                 for i, j in T.Parallel(block_M, block_N):
                     m = by * block_M + i; f = bx * block_N + j
                     if m < M and f < F:

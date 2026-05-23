@@ -682,6 +682,46 @@ class TileLangCompiler:
                                             cfg['num_stages'], cfg['threads']))
 
             kern = _compile_inter(cfg)
+        elif cp.in_channels < 4:
+            # Stem conv: C_in < 4, pad to 16 for tensor core alignment.
+            # Use interleaved stem kernel with per-CTA T-loop.
+            from sengine.kernels.conv2d_bn_if_t4 import stem_conv_bn_lif_interleaved_kernel
+
+            C_padded = 16
+            M_per_t = self.B * OH * OW
+            K_red = cp.kernel_h * cp.kernel_w * C_padded
+
+            # Detect LIF params
+            absorbed = node.extra_attrs.get("absorbed_nids", [])
+            lif_node = next((self.ir.nodes[a] for a in absorbed
+                             if self.ir.nodes.get(a) and self.ir.nodes[a].op_type == OpType.LIF), None)
+            np_ = lif_node.neuron_params if lif_node else None
+            recip_tau = 1.0 / np_.tau if (np_ and np_.tau and np_.tau > 0) else 0.5
+
+            def _compile_stem(cfg):
+                return stem_conv_bn_lif_interleaved_kernel(
+                    B=self.B, H=H, W=W,
+                    C_in_padded=C_padded, C_in_real=cp.in_channels, F=cp.out_channels,
+                    KH=cp.kernel_h, KW=cp.kernel_w, S=cp.stride_h, P=cp.pad_h,
+                    T_steps=self.T, recip_tau=recip_tau,
+                    io_dtype=self.io_dtype_tl,
+                    **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
+            _state_stem = torch.zeros(M_per_t, cp.out_channels, dtype=torch.float32, device='cuda')
+            _profile_args_stem = (
+                torch.empty(self.TB, H, W, cp.in_channels, dtype=self.io_dtype_torch, device='cuda'),
+                torch.empty(cp.kernel_h, cp.kernel_w, C_padded, cp.out_channels, dtype=self.io_dtype_torch, device='cuda'),
+                _state_stem,
+                torch.ones(cp.out_channels, dtype=torch.float32, device='cuda'),
+                torch.zeros(cp.out_channels, dtype=torch.float32, device='cuda'),
+            )
+            cfg = self._resolve_config(key, M_per_t, K_red, cp.out_channels,
+                                        compile_fn=_compile_stem, profile_args=_profile_args_stem,
+                                        interleaved=True, n_membranes=1)
+            logger.debug("  Interleaved Stem Conv+BN+LIF %d→%d %dx%d B=%d T=%d cfg=%dx%dx%d",
+                         cp.in_channels, cp.out_channels, H, W, self.B, self.T,
+                         cfg['block_M'], cfg['block_N'], cfg['block_K'])
+
+            kern = _compile_stem(cfg)
         else:
             # 3x3: interleaved (per-CTA T-loop with im2col)
             from sengine.kernels.conv2d_bn_if_t4 import conv2d_bn_if_interleaved_kernel
@@ -1098,13 +1138,27 @@ class TileLangCompiler:
             key1 = f"maxformer_kTv_{TB}_{heads}_{hd}_{N}_{H}_{W}_{self.precision}"
             key2 = f"maxformer_qkv_lif_{TB}_{heads}_{hd}_{N}_{H}_{W}_s{ap.scale}_{self.precision}"
 
+            # Clamp tile sizes: T.copy in these kernels accesses hd×hd
+            # output/intermediate tensors. block_M/block_N must not exceed hd
+            # to avoid out-of-bounds T.copy (which causes TileLang divide-by-zero).
+            def _clamp_attn_cfg(cfg, max_M, max_N, max_K):
+                c = dict(cfg)
+                if c['block_M'] > max_M:
+                    c['block_M'] = max_M
+                if c['block_N'] > max_N:
+                    c['block_N'] = max_N
+                if c['block_K'] > max_K:
+                    c['block_K'] = max_K
+                return c
+
             gemm1 = self._kernel_cache.get(key1)
             if gemm1 is None:
                 def _compile_mf_g1(cfg):
+                    c = _clamp_attn_cfg(cfg, hd, hd, N)
                     return maxformer_kTv_kernel(
                         TB=TB, heads=heads, hd=hd, N=N, H=H, W=W,
                         io_dtype=self.io_dtype_tl,
-                        **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K',
+                        **{k: c[k] for k in ('block_M', 'block_N', 'block_K',
                                                 'num_stages', 'threads')})
                 _profile_mf_g1 = (
                     torch.empty(TB * N, C, dtype=self.io_dtype_torch, device='cuda'),
@@ -1113,6 +1167,7 @@ class TileLangCompiler:
                 cfg1 = self._resolve_config(key1, hd, N, hd,
                                             compile_fn=_compile_mf_g1,
                                             profile_args=_profile_mf_g1)
+                cfg1 = _clamp_attn_cfg(cfg1, hd, hd, N)
                 try:
                     gemm1 = _compile_mf_g1(cfg1)
                 except Exception:
@@ -1123,11 +1178,12 @@ class TileLangCompiler:
             gemm2 = self._kernel_cache.get(key2)
             if gemm2 is None:
                 def _compile_mf_g2(cfg):
+                    c = _clamp_attn_cfg(cfg, N, hd, hd)
                     return maxformer_qkv_kernel(
                         TB=TB, heads=heads, hd=hd, N=N, H=H, W=W,
                         scale=ap.scale,
                         io_dtype=self.io_dtype_tl,
-                        **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K',
+                        **{k: c[k] for k in ('block_M', 'block_N', 'block_K',
                                                 'num_stages', 'threads')})
                 _profile_mf_g2 = (
                     torch.empty(TB * N, C, dtype=self.io_dtype_torch, device='cuda'),
@@ -1136,6 +1192,7 @@ class TileLangCompiler:
                 cfg2 = self._resolve_config(key2, N, hd, hd,
                                             compile_fn=_compile_mf_g2,
                                             profile_args=_profile_mf_g2)
+                cfg2 = _clamp_attn_cfg(cfg2, N, hd, hd)
                 try:
                     gemm2 = _compile_mf_g2(cfg2)
                 except Exception:

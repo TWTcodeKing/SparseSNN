@@ -1287,8 +1287,14 @@ def classify_bound_and_assign_tilelang(ir: EngineIR, batch_size: int = 1):
                 # Grouped conv (not depthwise): use TileLang grouped kernel
                 node.assigned_kernel = KernelVariant.TileLangGroupedConvBN
                 n_decomposed += 1
-            elif cp.in_channels < 4 or cp.out_channels < 8 or K_red % 8 != 0:
-                # Stem conv (C_in<4), tiny output (C_out<8), or misaligned: cuDNN fallback
+            elif cp.in_channels < 4 and cp.out_channels >= 8:
+                # Stem conv (C_in<4): pad C_in to 16 for tensor core alignment.
+                # Use TileLangStemConvBN — the graph slicer will decide
+                # whether to fuse it with the following neuron (interleaved).
+                node.assigned_kernel = KernelVariant.TileLangStemConvBN
+                n_decomposed += 1
+            elif cp.out_channels < 8 or K_red % 8 != 0:
+                # Tiny output (C_out<8) or misaligned K_red: cuDNN fallback
                 node.assigned_kernel = KernelVariant.CuDNNConv
             else:
                 # Compute M_per_timestep from output shapes

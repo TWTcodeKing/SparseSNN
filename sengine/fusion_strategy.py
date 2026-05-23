@@ -96,15 +96,18 @@ def _apply_slicer(ir: EngineIR, batch_size: int,
         cp = anchor.conv_params if anchor else None
         if anchor.op_type == OpType.Conv2d and cp:
             C_in_per_g = cp.in_channels // cp.groups if cp.groups > 0 else cp.in_channels
-            K_red = cp.kernel_h * cp.kernel_w * C_in_per_g
+            # Stem conv: padded C_in (2→16) for tensor core alignment
+            C_in_eff = 16 if cp.in_channels < 4 else C_in_per_g
+            K_red = cp.kernel_h * cp.kernel_w * C_in_eff
 
             # Conv3x3: K_red must be aligned for tensor cores
             if cp.kernel_h != 1 and K_red % 8 != 0:
                 n_decomposed += 1
                 continue
 
-            # Stem conv (C_in < 4): use cuDNN, not fusible
-            if cp.in_channels < 4:
+            # Stem conv (C_in < 4): now handled by TileLang interleaved
+            # stem kernel with padded C_in. Fusible if C_out >= 8.
+            if cp.in_channels < 4 and cp.out_channels < 8:
                 n_decomposed += 1
                 continue
 

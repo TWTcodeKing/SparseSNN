@@ -57,9 +57,23 @@ def calibrate(device_id: int = 0) -> dict:
     else:
         hw['max_blocks_per_sm'] = 16
 
-    # Max shared memory per SM (configurable)
-    hw['max_smem_per_sm'] = getattr(props, 'max_shared_memory_per_block_optin',
-                                     100 * 1024)
+    # Max shared memory per block (configurable, read from CUDA runtime)
+    # PyTorch's max_shared_memory_per_block_optin may not exist on all versions.
+    # Use cudaDeviceGetAttribute directly for the authoritative value.
+    _smem_optin = None
+    try:
+        import ctypes
+        _cudart = ctypes.CDLL('libcudart.so')
+        _val = ctypes.c_int()
+        # cudaDevAttrMaxSharedMemoryPerBlockOptin = 97
+        if _cudart.cudaDeviceGetAttribute(ctypes.byref(_val), 97, device_id) == 0:
+            _smem_optin = _val.value
+    except Exception:
+        pass
+    if _smem_optin is None:
+        _smem_optin = getattr(props, 'max_shared_memory_per_block_optin',
+                              100 * 1024)
+    hw['max_smem_per_sm'] = _smem_optin
 
     # ── Microbenchmark: memory bandwidth ──
     hw['mem_bw_gbps'] = _measure_mem_bw(device_id)

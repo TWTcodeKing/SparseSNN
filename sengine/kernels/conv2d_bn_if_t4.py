@@ -17,6 +17,15 @@ import tilelang
 import tilelang.language as T
 
 
+def _warp_policy(bM, bN):
+    """Select GemmWarpPolicy based on tile aspect ratio."""
+    if bM >= 4 * bN:
+        return T.GemmWarpPolicy.FullRow
+    elif bN >= 4 * bM:
+        return T.GemmWarpPolicy.FullCol
+    return T.GemmWarpPolicy.Square
+
+
 def _is_hopper() -> bool:
     import torch
     if not torch.cuda.is_available():
@@ -182,7 +191,7 @@ def make_conv2d_bn_if_t4(
 
                     T.copy(weight_flat[k_iter * block_K, bx * block_N],
                            weight_shared)
-                    T.gemm(data_shared, weight_shared, acc)
+                    T.gemm(data_shared, weight_shared, acc, policy=_warp_policy(block_M, block_N))
 
                 # ── BN + IF neuron epilogue with T-sequential membrane ──
                 out_shared = T.alloc_shared((block_M, block_N), io_dtype)
@@ -301,7 +310,7 @@ def conv2d_bn_if_t4_kernel(
 
                 T.copy(weight_flat[k_iter * block_K, bx * block_N],
                        weight_shared)
-                T.gemm(data_shared, weight_shared, acc)
+                T.gemm(data_shared, weight_shared, acc, policy=_warp_policy(block_M, block_N))
 
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)
 
@@ -420,7 +429,7 @@ def conv1x1_bn_if_t4_kernel(
                         )
                 T.copy(weight[k_iter * block_K, bx * block_N],
                        weight_shared)
-                T.gemm(data_shared, weight_shared, acc)
+                T.gemm(data_shared, weight_shared, acc, policy=_warp_policy(block_M, block_N))
 
             # BN + IF epilogue
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)
@@ -520,7 +529,7 @@ def stem_conv_bn_if_t4_kernel(
 
                 T.copy(weight_flat[k_iter * block_K, bx * block_N],
                        weight_shared)
-                T.gemm(data_shared, weight_shared, acc)
+                T.gemm(data_shared, weight_shared, acc, policy=_warp_policy(block_M, block_N))
 
             # BN + IF epilogue
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)
@@ -539,6 +548,123 @@ def stem_conv_bn_if_t4_kernel(
                     out_shared[i, j] = T.cast(spike, io_dtype)
 
             T.copy(out_shared, spikes_flat[by * block_M, bx * block_N])
+
+    return main
+
+
+# ---------------------------------------------------------------------------
+# Kernel 3b: Stem Conv + BN + LIF — INTERLEAVED (per-CTA T-loop)
+#
+# Same fused im2col GEMM as stem_conv_bn_if_t4_kernel, but with per-CTA
+# T-loop: membrane persists in fragment registers across T iterations.
+# Eliminates the Conv→LIF DRAM roundtrip (2× data size at 128² spatial).
+#
+# Grid covers B*OH*OW spatial, each CTA loops over T_steps internally.
+# Input NHWC with C_in padded (2→16) for tensor core alignment.
+# ---------------------------------------------------------------------------
+
+@tilelang.jit(out_idx=[-1])
+def stem_conv_bn_lif_interleaved_kernel(
+    B, H, W,
+    block_M, block_N, block_K, num_stages, threads,
+    v_threshold=1.0, v_reset=0.0, recip_tau=0.5,
+    T_steps=4,
+    C_in_padded=16, C_in_real=2, F=64, KH=3, KW=3, S=1, P=1,
+    io_dtype=T.float16,
+):
+    """Interleaved stem Conv+BN+LIF with per-CTA T-loop.
+
+    C_in padded (e.g. 2→16) for tensor core alignment.
+    Membrane in fragment registers — zero DRAM roundtrip between Conv and LIF.
+    """
+    TB = T_steps * B
+    OH = (H + 2 * P - KH) // S + 1
+    OW = (W + 2 * P - KW) // S + 1
+    M_per_t = B * OH * OW
+    K_red = KH * KW * C_in_padded
+    decay = 1.0 - recip_tau
+
+    @T.prim_func
+    def main(
+        data:     T.Tensor((TB, H, W, C_in_real), io_dtype),
+        weight:   T.Tensor((KH, KW, C_in_padded, F), io_dtype),
+        state:    T.Tensor((M_per_t, F), T.float32),
+        bn_scale: T.Tensor((F,), T.float32),
+        bn_bias:  T.Tensor((F,), T.float32),
+        spikes:   T.Tensor((TB, OH, OW, F), io_dtype),
+    ):
+        weight_flat = T.Tensor((K_red, F), io_dtype, weight.data)
+        spikes_flat = T.Tensor((TB * OH * OW, F), io_dtype, spikes.data)
+
+        with T.Kernel(
+            T.ceildiv(F, block_N), T.ceildiv(M_per_t, block_M),
+            threads=threads,
+        ) as (bx, by):
+            data_shared   = T.alloc_shared((block_M, block_K), io_dtype)
+            weight_shared = T.alloc_shared((block_K, block_N), io_dtype)
+            acc           = T.alloc_fragment((block_M, block_N), T.float32)
+            mem           = T.alloc_fragment((block_M, block_N), T.float32)
+            os_           = T.alloc_shared((block_M, block_N), io_dtype)
+
+            # Load initial membrane into registers
+            for i, j in T.Parallel(block_M, block_N):
+                m = by * block_M + i; f = bx * block_N + j
+                if m < M_per_t and f < F:
+                    mem[i, j] = state[m, f]
+                else:
+                    mem[i, j] = T.float32(0)
+
+            for t in range(T_steps):
+                T.clear(acc)
+                for k_iter in T.Pipelined(
+                    T.ceildiv(K_red, block_K), num_stages=num_stages,
+                ):
+                    # im2col with padded K_red — only read real channels,
+                    # zero-fill padded channels (C_in_real..C_in_padded-1)
+                    for i, j in T.Parallel(block_M, block_K):
+                        k = k_iter * block_K + j
+                        m = by * block_M + i
+                        n_idx = t * B + m // (OH * OW)
+                        hw = m % (OH * OW)
+                        oh = hw // OW
+                        ow = hw % OW
+                        kh = k // (KW * C_in_padded)
+                        kw = (k // C_in_padded) % KW
+                        cin = k % C_in_padded
+                        ih = oh * S + kh - P
+                        iw = ow * S + kw - P
+                        ib = ((ih >= 0) and (iw >= 0)
+                              and (ih < H) and (iw < W)
+                              and (cin < C_in_real)
+                              and (m < M_per_t) and (k < K_red))
+                        data_shared[i, j] = T.if_then_else(
+                            ib, data[n_idx, ih, iw, cin], io_dtype(0))
+
+                    T.copy(weight_flat[k_iter * block_K, bx * block_N],
+                           weight_shared)
+                    T.gemm(data_shared, weight_shared, acc,
+                           policy=_warp_policy(block_M, block_N))
+
+                # BN + LIF epilogue — membrane stays in registers
+                for i, j in T.Parallel(block_M, block_N):
+                    m = by * block_M + i; f = bx * block_N + j
+                    if m < M_per_t and f < F:
+                        bn = acc[i, j] * bn_scale[f] + bn_bias[f]
+                        h = T.float32(decay) * mem[i, j] + T.float32(recip_tau) * bn
+                        sp = T.if_then_else(
+                            h >= T.float32(v_threshold),
+                            T.float32(1), T.float32(0))
+                        mem[i, j] = (T.float32(1) - sp) * h + sp * T.float32(v_reset)
+                        os_[i, j] = T.cast(sp, io_dtype)
+
+                T.copy(os_, spikes_flat[t * M_per_t + by * block_M,
+                                         bx * block_N])
+
+            # Write final membrane back
+            for i, j in T.Parallel(block_M, block_N):
+                m = by * block_M + i; f = bx * block_N + j
+                if m < M_per_t and f < F:
+                    state[m, f] = mem[i, j]
 
     return main
 
@@ -606,7 +732,7 @@ def conv2d_bn_t4_kernel(
                         data_shared[i, j] = T.if_then_else(
                             ib, data[n_idx, ah, aw, cin_val], io_dtype(0))
                 T.copy(weight_flat[k_iter * block_K, bx * block_N], weight_shared)
-                T.gemm(data_shared, weight_shared, acc)
+                T.gemm(data_shared, weight_shared, acc, policy=_warp_policy(block_M, block_N))
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
@@ -669,7 +795,7 @@ def conv1x1_bn_t4_kernel(
                         data_shared[i, j] = T.if_then_else(
                             ib, data[n_idx, oh * S, ow * S, cin], io_dtype(0))
                 T.copy(weight[k_iter * block_K, bx * block_N], weight_shared)
-                T.gemm(data_shared, weight_shared, acc)
+                T.gemm(data_shared, weight_shared, acc, policy=_warp_policy(block_M, block_N))
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i
@@ -793,7 +919,7 @@ def conv1x1_bn_if_add_t4_kernel(
                         data_shared[i, j] = T.if_then_else(
                             ib, data[n_idx, oh * S, ow * S, cin], io_dtype(0))
                 T.copy(weight[k_iter * block_K, bx * block_N], weight_shared)
-                T.gemm(data_shared, weight_shared, acc)
+                T.gemm(data_shared, weight_shared, acc, policy=_warp_policy(block_M, block_N))
 
             # BN + IF + Residual Add epilogue
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)
@@ -898,7 +1024,7 @@ def conv2d_bn_if_add_t4_kernel(
 
                 T.copy(weight_flat[k_iter * block_K, bx * block_N],
                        weight_shared)
-                T.gemm(data_shared, weight_shared, acc)
+                T.gemm(data_shared, weight_shared, acc, policy=_warp_policy(block_M, block_N))
 
             # BN + IF + Residual Add epilogue
             out_shared = T.alloc_shared((block_M, block_N), io_dtype)
@@ -1005,7 +1131,7 @@ def conv2d_bn_if_interleaved_kernel(
 
                     T.copy(weight_flat[k_iter * block_K, bx * block_N],
                            weight_shared)
-                    T.gemm(data_shared, weight_shared, acc)
+                    T.gemm(data_shared, weight_shared, acc, policy=_warp_policy(block_M, block_N))
 
                 # BN + IF epilogue
                 for i, j in T.Parallel(block_M, block_N):

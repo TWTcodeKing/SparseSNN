@@ -152,7 +152,10 @@ def winograd_conv2d_bn_kernel(
                     # Load pre-transformed weight tile
                     T.copy(weight_U[alpha, k_iter * block_K, bx * block_N],
                            weight_shared)
-                    T.gemm(data_shared, weight_shared, acc)
+                    T.gemm(data_shared, weight_shared, acc,
+                           policy=T.GemmWarpPolicy.FullRow if block_M >= 4 * block_N
+                           else (T.GemmWarpPolicy.FullCol if block_N >= 4 * block_M
+                                 else T.GemmWarpPolicy.Square))
 
                 # ── Scatter-add into 4 output accumulators (output transform) ──
                 c00 = out_coeffs[alpha, 0]

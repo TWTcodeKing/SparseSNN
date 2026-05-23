@@ -48,9 +48,10 @@ def slice_graph(ir: EngineIR) -> list[FusionSlice]:
     """
     _COMPUTE = {BoundType.COMPUTE}
     _MEMORY = {BoundType.MEMORY}
+    # MaxPool/GlobalAvgPool excluded: they change spatial dimensions and have
+    # no compatible fused kernel template with Conv anchors. They run standalone.
     _ABSORBABLE_OPS = {OpType.IF, OpType.LIF, OpType.MS, OpType.Add,
-                       OpType.MaxPool, OpType.GlobalAvgPool, OpType.Scale,
-                       OpType.Mul, OpType.Sub}
+                       OpType.Scale, OpType.Mul, OpType.Sub}
     _ZERO_OPS = {OpType.Reshape, OpType.Transpose, OpType.Identity,
                  OpType.Flatten, OpType.Tile, OpType.Concat, OpType.ReduceMean}
 

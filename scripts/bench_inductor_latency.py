@@ -19,6 +19,11 @@ import sys
 import time
 
 import numpy as np
+np.float_ = np.float64
+np.int_ = np.int64
+np.complex_ = np.complex128
+np.object_ = np.object_
+np.bool_ = np.bool_
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -46,7 +51,7 @@ def parse_args():
     parser.add_argument("--mode", type=str, default="reduce-overhead",
                         choices=["default", "reduce-overhead", "max-autotune"],
                         help="torch.compile mode")
-    parser.add_argument("--backend", type=str, default="inductor",
+    parser.add_argument("--backend", type=str, default="tvm",
                         help="torch.compile backend (default: inductor)")
     parser.add_argument("--no-compile", action="store_true",
                         help="Skip compilation, benchmark eager PyTorch")
@@ -113,8 +118,24 @@ def main():
     torch.cuda.set_device(device)
 
     ds_cfg = get_dataset_config(args.dataset)
+    is_nlp = ds_cfg.get('task') == 'nlp'
     model, img_size = build_snn_model(args, ds_cfg, device)
     model_name = args.model or os.path.splitext(os.path.basename(args.config))[0]
+
+    # NLP: read seq_len from config YAML if available, else from dataset config
+    if is_nlp:
+        seq_len = ds_cfg.get('seq_len', 128)
+        if args.config:
+            import yaml
+            with open(args.config) as f:
+                cfg_yaml = yaml.safe_load(f)
+            seq_len = cfg_yaml.get('max_seq_len', seq_len)
+
+    # Normalize img_size to (H, W)
+    if isinstance(img_size, (list, tuple)):
+        img_h, img_w = img_size
+    else:
+        img_h = img_w = img_size
 
     batch_sizes = [int(b) for b in args.batch_sizes.split(",")]
     if args.fp16:
@@ -151,11 +172,16 @@ def main():
     results = {}
     for bs in batch_sizes:
         try:
-            input_tensor = torch.randn(
-                bs, ds_cfg['in_channels'], img_size, img_size,
-                dtype=torch.float16 if args.fp16 else torch.float32,
-                device=device,
-            )
+            if is_nlp:
+                input_tensor = torch.randint(
+                    0, 1000, (bs, seq_len), device=device,
+                )
+            else:
+                input_tensor = torch.randn(
+                    bs, ds_cfg['in_channels'], img_h, img_w,
+                    dtype=torch.float16 if args.fp16 else torch.float32,
+                    device=device,
+                )
 
             # Trigger compilation on first batch size (graph capture)
             if not args.no_compile and bs == batch_sizes[0]:

@@ -151,7 +151,8 @@ def main():
     if args.onnx:
         base_shape = tuple(int(x) for x in args.input_shape.split(','))
         in_channels = base_shape[1]
-        img_size = base_shape[2]
+        img_h = base_shape[2]
+        img_w = base_shape[3] if len(base_shape) > 3 else img_h
         tag = os.path.splitext(os.path.basename(args.onnx))[0]
         batch_sizes = [int(x) for x in args.batch_sizes.split(',')]
 
@@ -162,7 +163,7 @@ def main():
 
         results = {}
         for B in batch_sizes:
-            input_shape = (B, in_channels, img_size, img_size)
+            input_shape = (B, in_channels, img_h, img_w)
             engine_path = os.path.join(args.engine_dir,
                                        f"{tag}_b{B}.engine")
 
@@ -222,8 +223,24 @@ def main():
 
     batch_sizes = [int(x) for x in args.batch_sizes.split(',')]
     ds_cfg = get_dataset_config(args.dataset)
+    is_nlp = ds_cfg.get('task') == 'nlp'
     img_size = args.img_size or ds_cfg['img_size']
     in_channels = ds_cfg['in_channels']
+
+    # Normalize img_size to (H, W)
+    if isinstance(img_size, (list, tuple)):
+        img_h, img_w = img_size
+    else:
+        img_h = img_w = img_size
+
+    # NLP: read seq_len from config YAML if available, else from dataset config
+    if is_nlp:
+        seq_len = ds_cfg.get('seq_len', 128)
+        if args.config:
+            import yaml
+            with open(args.config) as f:
+                cfg_yaml = yaml.safe_load(f)
+            seq_len = cfg_yaml.get('max_seq_len', seq_len)
 
     model, tag = build_snn_model(args, ds_cfg, img_size, device_id)
 
@@ -238,7 +255,8 @@ def main():
         if not os.path.exists(dyn_onnx):
             print(f"\n  Exporting ONNX (dynamic batch)...")
             reset_net(model)
-            export_onnx(model, dyn_onnx, input_shape=(1, in_channels, img_size, img_size),
+            dyn_shape = (1, seq_len) if is_nlp else (1, in_channels, img_h, img_w)
+            export_onnx(model, dyn_onnx, input_shape=dyn_shape,
                         dynamic_batch=True, simplify=not args.no_simplify,
                         verbose=False)
             print(f"          Saved: {dyn_onnx}")
@@ -255,7 +273,8 @@ def main():
             if not os.path.exists(onnx_path):
                 print(f"\n  [B={B}] Exporting ONNX (standard torch.onnx.export)...")
                 reset_net(model)
-                export_onnx(model, onnx_path, input_shape=(B, in_channels, img_size, img_size),
+                inp_shape = (B, seq_len) if is_nlp else (B, in_channels, img_h, img_w)
+                export_onnx(model, onnx_path, input_shape=inp_shape,
                             dynamic_batch=False, simplify=not args.no_simplify,
                             verbose=False)
                 # Consolidate external data into single/minimal file(s)
@@ -323,7 +342,7 @@ def main():
     for B in batch_sizes:
         onnx_path = onnx_paths[B]
         engine_path = os.path.join(args.engine_dir, f"{tag}_b{B}{sparse_tag}.engine")
-        input_shape = (B, in_channels, img_size, img_size)
+        input_shape = (B, seq_len) if is_nlp else (B, in_channels, img_h, img_w)
 
         # Build TRT engine
         if not os.path.exists(engine_path):

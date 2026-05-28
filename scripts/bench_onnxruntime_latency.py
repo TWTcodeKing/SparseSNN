@@ -97,9 +97,12 @@ def export_onnx(model, input_shape, onnx_path, opset, device):
 
     print(f"  [ort] Exporting ONNX (opset={opset}, shape={input_shape})...")
     # Export on CPU to avoid GPU OOM on large batch sizes.
-    # ONNX export only traces the graph — no GPU compute needed.
     model_cpu = model.cpu()
-    dummy_input = torch.randn(*input_shape, device='cpu')
+    if len(input_shape) == 2:
+        # NLP: (B, seq_len) — use float for ONNX tracing (model clamps to int internally)
+        dummy_input = torch.randint(0, 1000, input_shape, device='cpu').float()
+    else:
+        dummy_input = torch.randn(*input_shape, device='cpu')
     reset_net(model_cpu)
 
     # Force legacy TorchScript exporter (dynamo exporter has issues with
@@ -286,8 +289,24 @@ def main():
     print(f"[ort] Available providers: {ort.get_available_providers()}")
 
     ds_cfg = get_dataset_config(args.dataset)
+    is_nlp = ds_cfg.get('task') == 'nlp'
     model, img_size = build_snn_model(args, ds_cfg, device)
     model_name = args.model or os.path.splitext(os.path.basename(args.config))[0]
+
+    # Normalize img_size to (H, W)
+    if isinstance(img_size, (list, tuple)):
+        img_h, img_w = img_size
+    else:
+        img_h = img_w = img_size
+
+    # NLP: read seq_len from config YAML if available, else from dataset config
+    if is_nlp:
+        seq_len = ds_cfg.get('seq_len', 128)
+        if args.config:
+            import yaml
+            with open(args.config) as f:
+                cfg_yaml = yaml.safe_load(f)
+            seq_len = cfg_yaml.get('max_seq_len', seq_len)
 
     batch_sizes = [int(b) for b in args.batch_sizes.split(",")]
     os.makedirs(args.onnx_dir, exist_ok=True)
@@ -298,7 +317,10 @@ def main():
         onnx_path = os.path.join(
             args.onnx_dir, f"{model_name}_{args.dataset}_T{args.T}_B{bs}.onnx"
         )
-        export_shape = (bs, ds_cfg['in_channels'], img_size, img_size)
+        if is_nlp:
+            export_shape = (bs, seq_len)
+        else:
+            export_shape = (bs, ds_cfg['in_channels'], img_h, img_w)
         export_onnx(model, export_shape, onnx_path, args.opset, device)
 
     # Free PyTorch model
@@ -331,9 +353,13 @@ def main():
             # Create ORT session for this batch size
             session = create_ort_session(onnx_path, args.gpu_ids, args.graph_opt)
 
-            input_array = np.random.randn(
-                bs, ds_cfg['in_channels'], img_size, img_size
-            ).astype(dtype)
+            if is_nlp:
+                # NLP: float input (model internally casts to int)
+                input_array = np.random.randint(0, 1000, (bs, seq_len)).astype(dtype)
+            else:
+                input_array = np.random.randn(
+                    bs, ds_cfg['in_channels'], img_h, img_w
+                ).astype(dtype)
 
             times = benchmark_ort(session, input_array, args.warmup, args.iters)
             mean_ms = times.mean()

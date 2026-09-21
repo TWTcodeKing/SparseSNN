@@ -8,14 +8,14 @@ Single GPU:
     uv run tengine/transfer.py \
         --config configs/spikingresformer/spikingresformer_ti.yaml \
         --pretrained checkpoints/spikingresformer/ImageNet_spikingresformer_ti.pth \
-        --dataset cifar100 --data-root /home/twt/datasets/ \
+        --dataset cifar100 --data-root /data/twt/datasets \
         --img-size 128 --epochs 100 --lr 1e-4 --gpu-ids 0
 
 Multi-GPU DDP:
     torchrun --nproc_per_node=2 tengine/transfer.py \
         --config configs/spikingresformer/spikingresformer_ti.yaml \
         --pretrained checkpoints/spikingresformer/ImageNet_spikingresformer_ti.pth \
-        --dataset cifar10dvs --data-root /data/cifar10-dvs \
+        --dataset cifar10dvs --data-root /data/twt/datasets/cifar10-dvs \
         --recipe configs/spikingresformer/recipes/cifar10dvs.yaml --gpu-ids 0,1
 """
 

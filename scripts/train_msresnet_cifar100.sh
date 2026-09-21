@@ -15,7 +15,7 @@
 
 DEPTH=${1:-110}
 GPU=${2:-0}
-DATA_ROOT="/home/twt/datasets/"
+DATA_ROOT="${DATA_ROOT:-/data/twt/datasets}"
 RECIPE="configs/ms_resnet/recipes/cifar100_cifar_arch.yaml"
 
 train_one() {

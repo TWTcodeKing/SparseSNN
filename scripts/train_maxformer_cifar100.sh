@@ -9,7 +9,7 @@
 # Reported: ~82.65%
 
 GPU=${1:-0}
-DATA_ROOT="/home/twt/datasets/"
+DATA_ROOT="${DATA_ROOT:-/data/twt/datasets}"
 
 echo "=========================================="
 echo "Training MaxFormer-CIFAR on CIFAR-100 (GPU ${GPU})"

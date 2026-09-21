@@ -1,7 +1,6 @@
 #!/bin/bash
 # Follow-up analysis for bench_new_workloads.sh: TRT nsys traces, sengine per-kernel breakdown
-# vs TRT, a real TensorRT FP32 run (separate engine dir), and a sanitizer run of the failing
-# sengine VGG9 B=32 build.  Usage: bash scripts/analyze_new_workloads.sh [gpu_id]
+# vs TRT, and a real TensorRT FP32 run (separate engine dir).  Usage: bash scripts/analyze_new_workloads.sh [gpu_id]
 set -u
 GPU_ID=${1:-1}
 export CUDA_HOME=/usr/local/cuda-12.8; export PATH=/usr/local/cuda-12.8/bin:$PATH; export TORCH_CUDA_ARCH_LIST="8.9"
@@ -19,6 +18,4 @@ run trt_fp32real_snn_vgg16 $PY scripts/bench_trt_latency.py --model snn_vgg16 --
     --checkpoint output/snn_vgg16_ut_har_bs16_lr0.0005/best.pth --engine-dir trt_engines_fp32 --gpu-ids 0
 run trt_fp32real_snn_vgg9 $PY scripts/bench_trt_latency.py --model snn_vgg9 --dataset urbansound8k --T 4 --batch-sizes 4,8,16,32 \
     --checkpoint output/snn_vgg9_urbansound8k_bs32_lr0.0005/best.pth --engine-dir trt_engines_fp32 --gpu-ids 0
-run sanitizer_vgg9_b32 /usr/local/cuda-12.8/bin/compute-sanitizer --tool memcheck --print-limit 3 \
-    $PY /tmp/claude-1024/-home-twt-SparseSNN/af89380d-d85e-4c5c-9416-b9d49f1fd655/scratchpad/build_b32.py 32 .cache/fusion_rec_snn_vgg9_urbansound8k_T4_B32.json
 echo "[$(date +%H:%M:%S)] ALL DONE"

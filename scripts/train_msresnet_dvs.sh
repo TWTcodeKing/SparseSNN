@@ -15,10 +15,10 @@ DATASET=${1:-cifar10dvs}
 GPUS=${2:-0,1}
 
 if [ "$DATASET" = "cifar10dvs" ]; then
-    DATA_ROOT="/home/twt/datasets/cifar10-dvs"
+    DATA_ROOT="${DATA_ROOT:-/data/twt/datasets}/cifar10-dvs"
     RECIPE="configs/ms_resnet/recipes/cifar10dvs.yaml"
 elif [ "$DATASET" = "dvs128gesture" ]; then
-    DATA_ROOT="/home/twt/datasets/dvs128gesture"
+    DATA_ROOT="${DATA_ROOT:-/data/twt/datasets}/dvs128gesture"
     RECIPE="configs/ms_resnet/recipes/dvs128gesture.yaml"
 else
     echo "Unknown dataset: $DATASET (paper only evaluates on cifar10dvs)"

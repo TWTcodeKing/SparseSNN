@@ -1,21 +1,19 @@
 """Minimal TRT engine runner for nsys/ncu profiling.
 
 Usage:
-    python scripts/profile_trt_engine.py <engine_path> [--warmup 20] [--iters 50]
+    python utils/profile_trt_engine.py <engine_path> [--warmup 20] [--iters 50]
 
 Runs inference with CUDA events for timing. Designed to be wrapped by:
-    nsys profile --no-cpu-sampling -o <output> python scripts/profile_trt_engine.py ...
-    ncu --set full -o <output> python scripts/profile_trt_engine.py ...
+    nsys profile --no-cpu-sampling -o <output> python utils/profile_trt_engine.py ...
+    ncu --set full -o <output> python utils/profile_trt_engine.py ...
 """
 
 import sys, os, ctypes, argparse, torch
 
-# Load TRT shared lib before import
-ctypes.CDLL(
-    os.path.join(os.path.dirname(__file__), '..', '.venv', 'lib', 'python3.12',
-                 'site-packages', 'tensorrt_libs', 'libnvinfer.so.10'),
-    mode=ctypes.RTLD_GLOBAL
-)
+# Load the TRT shared lib (from the tensorrt-cu12-libs wheel) globally before import
+import tensorrt_libs
+ctypes.CDLL(os.path.join(os.path.dirname(tensorrt_libs.__file__), 'libnvinfer.so.10'),
+            mode=ctypes.RTLD_GLOBAL)
 import tensorrt as trt
 
 

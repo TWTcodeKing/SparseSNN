@@ -13,7 +13,7 @@
 
 VARIANT=${1:-ti}
 GPU=${2:-0}
-DATA_ROOT="/home/twt/datasets/"
+DATA_ROOT="${DATA_ROOT:-/data/twt/datasets}"
 CKPT="checkpoints/spikingresformer/ImageNet_spikingresformer_${VARIANT}.pth"
 RECIPE="configs/spikingresformer/recipes/cifar100.yaml"
 

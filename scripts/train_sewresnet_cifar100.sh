@@ -15,7 +15,7 @@
 DEPTH=${1:-110}
 GPU=${2:-0}
 CONNECT_F=${3:-ADD}
-DATA_ROOT="/home/twt/datasets/"
+DATA_ROOT="${DATA_ROOT:-/data/twt/datasets}"
 RECIPE="configs/sew_resnet/recipes/cifar100.yaml"
 
 train_one() {

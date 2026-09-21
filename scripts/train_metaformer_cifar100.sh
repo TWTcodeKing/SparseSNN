@@ -13,7 +13,7 @@
 
 CONFIG=${1:-384}
 GPU=${2:-0}
-DATA_ROOT="/home/twt/datasets/"
+DATA_ROOT="${DATA_ROOT:-/data/twt/datasets}"
 
 echo "=========================================="
 echo "Training MetaSpikeFormer-${CONFIG} on CIFAR-100 (GPU ${GPU})"

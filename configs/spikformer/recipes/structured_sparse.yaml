@@ -2,18 +2,17 @@
 #
 # Trains Spikformer with SR-STE (Sparse-Refined Straight-Through Estimator)
 # regularization to nudge Linear layer weights toward the 2:4 sparsity pattern.
-# After training, hard 2:4 projection + SparseSemiStructuredTensor conversion
-# can be applied with minimal accuracy loss via:
+# After training, apply the hard 2:4 projection with SBC (post-training, no
+# retraining needed):
 #
-#   python -m iengine.structured_sparse.semi_structured_path \
-#       --checkpoint output/.../best.pth \
-#       --config configs/spikformer/spikformer_cifar.yaml \
-#       --dataset cifar100 --data-root /home/twt/datasets/
+#   python -m sparse.snn_sbc --config configs/spikformer/spikformer_cifar.yaml \
+#       --dense-checkpoint output/.../best.pth \
+#       --dataset cifar100 --data-root /data/twt/datasets --T 4 --nm 2 4 --evaluate
 #
 # Usage:
 #   uv run tengine/train.py \
 #       --config configs/spikformer/spikformer_cifar.yaml \
-#       --dataset cifar100 --data-root /home/twt/datasets/ \
+#       --dataset cifar100 --data-root /data/twt/datasets \
 #       --recipe configs/spikformer/recipes/structured_sparse.yaml \
 #       --gpu-ids 0
 #

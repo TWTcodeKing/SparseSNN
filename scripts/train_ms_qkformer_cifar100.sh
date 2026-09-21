@@ -8,7 +8,7 @@
 # Recipe: AdamW lr=1.5e-3, 400 epochs, Mixup=0.75, CutMix=0.5, T=4
 
 GPU=${1:-0}
-DATA_ROOT="/home/twt/datasets/"
+DATA_ROOT="${DATA_ROOT:-/data/twt/datasets}"
 
 echo "=========================================="
 echo "Training MS_QKFormer-CIFAR on CIFAR-100 (GPU ${GPU})"

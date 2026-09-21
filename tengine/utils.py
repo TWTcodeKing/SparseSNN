@@ -282,7 +282,7 @@ def get_dataset_config(dataset_name):
 def build_dataloaders(dataset_name, data_root, batch_size, img_size=None,
                       num_workers=4, distributed=False, **kwargs):
     """Build train/test dataloaders by dataset name."""
-    from datasets import (cifar10_dataloaders, cifar100_dataloaders,
+    from snn_datasets import (cifar10_dataloaders, cifar100_dataloaders,
                           imagenet_dataloaders, cifar10dvs_dataloaders,
                           dvs128gesture_dataloaders)
 
@@ -313,37 +313,37 @@ def build_dataloaders(dataset_name, data_root, batch_size, img_size=None,
             data_root, batch_size, frames_number=frames,
             num_workers=num_workers, distributed=distributed, **kwargs)
     elif dataset_name == 'coco':
-        from datasets import coco_dataloaders
+        from snn_datasets import coco_dataloaders
         return coco_dataloaders(
             data_root, batch_size, img_size=img_size,
             num_workers=num_workers, distributed=distributed, **kwargs)
     elif dataset_name == 'gen1':
-        from datasets import gen1_dataloaders
+        from snn_datasets import gen1_dataloaders
         return gen1_dataloaders(
             data_root, batch_size, img_size=img_size,
             num_workers=num_workers, distributed=distributed, **kwargs)
     elif dataset_name == 'ntufi_humanid':
-        from datasets import ntufi_humanid_dataloaders
+        from snn_datasets import ntufi_humanid_dataloaders
         T = kwargs.pop('T', kwargs.pop('frames_number', 4))
         spatial = img_size if isinstance(img_size, tuple) else (img_size, img_size)
         return ntufi_humanid_dataloaders(
             data_root, batch_size, T=T, spatial_size=spatial,
             num_workers=num_workers, distributed=distributed)
     elif dataset_name == 'ut_har':
-        from datasets import ut_har_dataloaders
+        from snn_datasets import ut_har_dataloaders
         kwargs.pop('T', None); kwargs.pop('frames_number', None)
         return ut_har_dataloaders(
             data_root, batch_size, num_workers=num_workers,
             distributed=distributed, **kwargs)
     elif dataset_name == 'urbansound8k':
-        from datasets import urbansound8k_dataloaders
+        from snn_datasets import urbansound8k_dataloaders
         kwargs.pop('T', None); kwargs.pop('frames_number', None)
         spatial = img_size if isinstance(img_size, tuple) else (img_size, img_size)
         return urbansound8k_dataloaders(
             data_root, batch_size, n_mels=spatial[0], n_frames=spatial[1],
             num_workers=num_workers, distributed=distributed, **kwargs)
     elif dataset_name in ('sst2', 'mrpc', 'cola', 'qnli'):
-        from datasets import glue_dataloaders
+        from snn_datasets import glue_dataloaders
         seq_len = kwargs.pop('seq_len', cfg.get('seq_len', 128))
         return glue_dataloaders(
             data_root, batch_size, task=dataset_name, seq_len=seq_len,

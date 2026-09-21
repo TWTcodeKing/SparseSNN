@@ -40,7 +40,7 @@ from tengine.utils import (
     build_model, build_model_from_config, load_model_config,
     build_dataloaders, get_dataset_config,
 )
-from datasets.augmentation import mixup_data, cutmix_data, mixup_criterion
+from snn_datasets.augmentation import mixup_data, cutmix_data, mixup_criterion
 
 
 def parse_args():

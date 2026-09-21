@@ -40,7 +40,7 @@ from tengine.utils import (
     load_training_recipe,
     build_dataloaders, get_dataset_config, list_models,
 )
-from datasets.augmentation import (
+from snn_datasets.augmentation import (
     mixup_data, cutmix_data, mixup_criterion,
     SNNAugmentWide, snn_aug_batch,
 )

@@ -2,10 +2,10 @@
 
 Usage:
     # nsys
-    sudo nsys profile -o out python motivation/profile_infer.py --batch 1
+    sudo nsys profile -o out python experiments/motivation/profile_infer.py --batch 1
 
     # ncu
-    sudo ncu --set basic --csv python motivation/profile_infer.py --batch 1 --warmup 0 --iters 1
+    sudo ncu --set basic --csv python experiments/motivation/profile_infer.py --batch 1 --warmup 0 --iters 1
 """
 
 import torch
@@ -15,7 +15,7 @@ import argparse
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--engine", default="motivation/output/spikformer_1_512.engine")
+    parser.add_argument("--engine", default="experiments/motivation/output/spikformer_1_512.engine")
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--input-shape", type=int, nargs="+", default=[3, 32, 32],
                         help="C H W (batch prepended automatically)")

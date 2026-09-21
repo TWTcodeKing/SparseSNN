@@ -1,8 +1,8 @@
 """Parse ncu CSV output and produce analysis tables for the motivation experiment.
 
 Usage:
-    python motivation/parse_ncu.py  # analyzes all batch sizes in motivation/output/
-    python motivation/parse_ncu.py motivation/output/ncu_b1.csv  # single file
+    python experiments/motivation/parse_ncu.py  # analyzes all batch sizes in experiments/motivation/output/
+    python experiments/motivation/parse_ncu.py experiments/motivation/output/ncu_b1.csv  # single file
 """
 
 import csv
@@ -118,7 +118,7 @@ def analyze_single(path, batch):
     return cats, total_us
 
 
-def analyze_all(out_dir="motivation/output"):
+def analyze_all(out_dir="experiments/motivation/output"):
     """Cross-batch comparison analysis."""
     results = []
     for b in [1, 4, 8, 16]:
@@ -185,7 +185,7 @@ def main():
         analyze_single(path, batch)
     else:
         # Analyze all batch sizes
-        out_dir = "motivation/output"
+        out_dir = "experiments/motivation/output"
         for b in [1, 16]:
             path = os.path.join(out_dir, f"ncu_b{b}.csv")
             if os.path.exists(path):

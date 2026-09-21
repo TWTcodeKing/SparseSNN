@@ -13,8 +13,8 @@ Three strategies:
                   in registers, no DRAM round-trip for intermediates.
 
 Usage:
-    python motivation/bench_temporal_pipeline.py
-    python motivation/bench_temporal_pipeline.py --B 4 --T 8
+    python experiments/motivation/bench_temporal_pipeline.py
+    python experiments/motivation/bench_temporal_pipeline.py --B 4 --T 8
 """
 
 import torch
@@ -29,7 +29,7 @@ if os.path.isdir(_cuda_home):
     os.environ['CUDA_HOME'] = _cuda_home
     os.environ['PATH'] = os.path.join(_cuda_home, 'bin') + ':' + os.environ.get('PATH', '')
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 
 # ─── IF neuron (single fused CUDA kernel) ───

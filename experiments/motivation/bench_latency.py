@@ -66,7 +66,7 @@ class TRTInfer:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--engine", default="motivation/output/spikformer_1_512.engine")
+    parser.add_argument("--engine", default="experiments/motivation/output/spikformer_1_512.engine")
     parser.add_argument("--input-shape", type=int, nargs="+", default=[3, 32, 32],
                         help="C H W (batch prepended automatically)")
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 2, 4, 8])

@@ -10,10 +10,10 @@ Pairs selected from Spikformer-1-512 on ImageNet (B=8 ncu profile):
 
 Usage:
     # Profile Conv+LIF pair
-    sudo ncu --set basic --csv python motivation/profile_pair.py --pair conv > out.csv
+    sudo ncu --set basic --csv python experiments/motivation/profile_pair.py --pair conv > out.csv
 
     # Profile Linear+LIF pair
-    sudo ncu --set basic --csv python motivation/profile_pair.py --pair linear > out.csv
+    sudo ncu --set basic --csv python experiments/motivation/profile_pair.py --pair linear > out.csv
 """
 
 import argparse

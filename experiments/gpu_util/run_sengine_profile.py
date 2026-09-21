@@ -8,12 +8,12 @@ Uses cudaProfilerStart/Stop so ncu --profile-from-start off only captures
 inference kernels.
 
 Usage (standalone test):
-    python GPUtil/run_sengine_profile.py --model maxformer_10_512 --batch 16 --warmup 10 --iters 1
+    python experiments/gpu_util/run_sengine_profile.py --model maxformer_10_512 --batch 16 --warmup 10 --iters 1
 
 Under ncu:
     sudo CUDA_VISIBLE_DEVICES=3 /opt/.../ncu --profile-from-start off \
         --target-processes all --metrics ... \
-        .venv/bin/python GPUtil/run_sengine_profile.py --model maxformer_10_512 --batch 16
+        .venv/bin/python experiments/gpu_util/run_sengine_profile.py --model maxformer_10_512 --batch 16
 """
 
 import argparse
@@ -21,7 +21,7 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 for cuda_path in ['/usr/local/cuda-12.8', '/usr/local/cuda', '/usr/local/cuda-12.6']:
     if os.path.isdir(cuda_path):
@@ -31,7 +31,7 @@ for cuda_path in ['/usr/local/cuda-12.8', '/usr/local/cuda', '/usr/local/cuda-12
 
 import torch
 
-from GPUtil.config import MODELS, T, PRECISION, sengine_path
+from experiments.gpu_util.config import MODELS, T, PRECISION, sengine_path
 
 
 def load_sengine_no_graph(sengine_file):
@@ -139,7 +139,7 @@ def main():
     se_path = sengine_path(args.model, args.batch)
     if not os.path.exists(se_path):
         print(f"ERROR: .sengine file not found: {se_path}")
-        print(f"Build first: python GPUtil/build_one.py --model {args.model} "
+        print(f"Build first: python experiments/gpu_util/build_one.py --model {args.model} "
               f"--batch {args.batch} --backend sengine --gpu-id <N>")
         sys.exit(1)
 

@@ -13,8 +13,8 @@ Conv3x3 variants (Fused-PS skipped — im2col + T*smem too large):
   2. Production  — interleaved per-T Conv→IF with im2col
 
 Usage:
-    python breakdown/bench_progressive.py --sengine GPUtil/engines/sew_resnet101_B32.sengine --gpu-id 2
-    python breakdown/bench_progressive.py --sengine GPUtil/engines/spikformer_4_512_B4.sengine --gpu-id 2
+    python experiments/breakdown/bench_progressive.py --sengine experiments/gpu_util/engines/sew_resnet101_B32.sengine --gpu-id 2
+    python experiments/breakdown/bench_progressive.py --sengine experiments/gpu_util/engines/spikformer_4_512_B4.sengine --gpu-id 2
 """
 
 import argparse
@@ -22,7 +22,7 @@ import math
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 for cuda_path in ['/usr/local/cuda-12.8', '/usr/local/cuda', '/usr/local/cuda-12.6']:
     if os.path.isdir(cuda_path):

@@ -5,12 +5,12 @@ Uses cudaProfilerStart/Stop to mark the measured inference pass.
 Combined with ncu --profile-from-start off, only inference kernels are profiled.
 
 Usage (standalone test):
-    python GPUtil/run_trt_profile.py --model sew_resnet101 --batch 16 --warmup 10 --iters 1
+    python experiments/gpu_util/run_trt_profile.py --model sew_resnet101 --batch 16 --warmup 10 --iters 1
 
 Under ncu:
     sudo CUDA_VISIBLE_DEVICES=3 /opt/.../ncu --profile-from-start off \
         --target-processes all --metrics ... \
-        .venv/bin/python GPUtil/run_trt_profile.py --model sew_resnet101 --batch 16
+        .venv/bin/python experiments/gpu_util/run_trt_profile.py --model sew_resnet101 --batch 16
 """
 
 import argparse
@@ -19,11 +19,11 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import torch
 
-from GPUtil.config import MODELS, T, trt_engine_path
+from experiments.gpu_util.config import MODELS, T, trt_engine_path
 
 _trt_lib = os.path.join(os.path.dirname(__file__), '..', '.venv', 'lib', 'python3.12',
                         'site-packages', 'tensorrt_libs', 'libnvinfer.so.10')
@@ -45,7 +45,7 @@ def main():
     engine_path = trt_engine_path(args.model, args.batch)
     if not os.path.exists(engine_path):
         print(f"ERROR: TRT engine not found: {engine_path}")
-        print(f"Build it first:  python GPUtil/build_one.py --model {args.model} "
+        print(f"Build it first:  python experiments/gpu_util/build_one.py --model {args.model} "
               f"--batch {args.batch} --backend trt --gpu-id <N>")
         sys.exit(1)
 

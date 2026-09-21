@@ -7,7 +7,7 @@ Figure layout: 2x2
   (d) Bar: Linear+LIF SM vs DRAM
 
 Usage:
-    python motivation/plot_pair.py
+    python experiments/motivation/plot_pair.py
 """
 
 import csv

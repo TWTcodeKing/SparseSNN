@@ -2,7 +2,7 @@
 """Phase 1: Build all sengine + TRT engines for GPU utilization profiling.
 
 Usage:
-    python GPUtil/build_engines.py [--gpu-id 3] [--skip-sengine] [--skip-trt]
+    python experiments/gpu_util/build_engines.py [--gpu-id 3] [--skip-sengine] [--skip-trt]
 """
 
 import argparse
@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 # Auto-detect CUDA
 for cuda_path in ['/usr/local/cuda-12.8', '/usr/local/cuda', '/usr/local/cuda-12.6']:
@@ -24,7 +24,7 @@ for cuda_path in ['/usr/local/cuda-12.8', '/usr/local/cuda', '/usr/local/cuda-12
 
 import torch
 
-from GPUtil.config import (
+from experiments.gpu_util.config import (
     MODELS, BATCH_SIZES, T, PRECISION, DATASET, IMG_SIZE, IN_CHANNELS, NUM_CLASSES,
     PROJECT_ROOT, select_gpu, plugin_onnx_path, sengine_path,
     trt_engine_path, trt_onnx_path, SENGINE_DIR, TRT_ENGINES_DIR,

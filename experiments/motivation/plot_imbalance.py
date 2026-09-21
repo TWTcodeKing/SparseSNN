@@ -3,7 +3,7 @@
 Single pie chart: Conv/GEMM vs LIF Neuron vs Reshape at B=8.
 
 Usage:
-    python motivation/plot_imbalance.py
+    python experiments/motivation/plot_imbalance.py
 """
 
 import matplotlib.pyplot as plt

@@ -53,6 +53,6 @@ def build_engine(onnx_path, engine_path, batch_sizes=(1, 4, 8, 16), fp16=True):
 
 
 if __name__ == "__main__":
-    onnx_path = "motivation/output/model.onnx"
-    engine_path = "motivation/output/model.engine"
+    onnx_path = "experiments/motivation/output/model.onnx"
+    engine_path = "experiments/motivation/output/model.engine"
     build_engine(onnx_path, engine_path)

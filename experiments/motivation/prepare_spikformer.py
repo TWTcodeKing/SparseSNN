@@ -2,10 +2,10 @@
 
 Usage:
     # CIFAR-100 (32x32)
-    python motivation/prepare_spikformer.py
+    python experiments/motivation/prepare_spikformer.py
 
     # ImageNet (224x224)
-    python motivation/prepare_spikformer.py --dataset imagenet --max-batch 32
+    python experiments/motivation/prepare_spikformer.py --dataset imagenet --max-batch 32
 """
 
 import argparse
@@ -14,9 +14,9 @@ import sys
 import yaml
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-OUT = "motivation/output"
+OUT = "experiments/motivation/output"
 
 
 def export_onnx(dataset, img_size, num_classes, max_batch):

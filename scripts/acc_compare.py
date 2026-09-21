@@ -13,8 +13,8 @@ Usage:
     # All three backends
     python scripts/acc_compare.py --backend all \
         --checkpoint checkpoints/sewresnet/imagenet/sew101_checkpoint_319.pth \
-        --sengine GPUtil/engines/sew_resnet101_B16_trained.sengine \
-        --trt GPUtil/trt_engines/sew_resnet101_B16_trained.engine \
+        --sengine experiments/gpu_util/engines/sew_resnet101_B16_trained.sengine \
+        --trt experiments/gpu_util/trt_engines/sew_resnet101_B16_trained.engine \
         --num-images 4800
 """
 

@@ -4,7 +4,7 @@ Profiles C=384→384, 14x14, B=16, T=4 (SpikFormer-like layer).
 import torch, os, sys
 os.environ['CUDA_HOME'] = '/usr/local/cuda-12.8'
 os.environ['PATH'] = '/usr/local/cuda-12.8/bin:' + os.environ.get('PATH', '')
-sys.path.insert(0, '/home/twt/SparseSNN')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
 
 from sengine.kernels.interleaved_templates import conv1x1_bn_if
 

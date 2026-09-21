@@ -7,9 +7,9 @@ For each kernel, shows:
   - Efficiency = achieved / theoretical (how close to the HW-imposed ceiling)
 
 Usage:
-    python GPUtil/parse_occupancy.py
-    python GPUtil/parse_occupancy.py --top 15
-    python GPUtil/parse_occupancy.py --model maxformer_10_512 --batch 16
+    python experiments/gpu_util/parse_occupancy.py
+    python experiments/gpu_util/parse_occupancy.py --top 15
+    python experiments/gpu_util/parse_occupancy.py --model maxformer_10_512 --batch 16
 """
 
 import argparse
@@ -20,9 +20,9 @@ import re
 import subprocess
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from GPUtil.config import (
+from experiments.gpu_util.config import (
     MODELS, BATCH_SIZES, NCU_PATH, NCU_REPORTS_DIR, RESULTS_DIR,
     ncu_report_path,
 )

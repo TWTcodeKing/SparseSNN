@@ -5,7 +5,7 @@ Figure layout: 1 row, 2 columns
   (b) DRAM Throughput grouped bar: Conv/GEMM vs LIF across B=1..8
 
 Usage:
-    python motivation/plot_imbalance_bar.py
+    python experiments/motivation/plot_imbalance_bar.py
 """
 
 import matplotlib.pyplot as plt

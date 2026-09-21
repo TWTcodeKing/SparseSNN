@@ -2,7 +2,7 @@
 """Phase 3: Parse ncu reports and generate comparison tables.
 
 Usage:
-    python GPUtil/parse_ncu.py [--top 10]
+    python experiments/gpu_util/parse_ncu.py [--top 10]
 """
 
 import argparse
@@ -12,9 +12,9 @@ import os
 import subprocess
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from GPUtil.config import (
+from experiments.gpu_util.config import (
     MODELS, BATCH_SIZES, NCU_PATH, NCU_REPORTS_DIR, RESULTS_DIR,
     METRIC_LABELS, ncu_report_path,
 )

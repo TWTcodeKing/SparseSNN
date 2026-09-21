@@ -8,7 +8,7 @@ Key metrics: SM throughput, DRAM throughput, total DRAM bytes, duration.
 
 Usage:
     # Self-profile (no sudo)
-    python motivation/profile_interleaved.py
+    python experiments/motivation/profile_interleaved.py
 
     # ncu profile (requires sudo)
     sudo /usr/local/cuda-12.8/bin/ncu \
@@ -16,7 +16,7 @@ Usage:
         --kernel-name regex:"main_kernel|if_neuron_kernel|gemm|sgemm|hgemm|cutlass" \
         --launch-skip 20 --launch-count 10 \
         --target-processes all \
-        python motivation/profile_interleaved.py --ncu
+        python experiments/motivation/profile_interleaved.py --ncu
 """
 
 import torch
@@ -26,7 +26,7 @@ import argparse
 
 os.environ['CUDA_HOME'] = '/usr/local/cuda-12.8'
 os.environ['PATH'] = '/usr/local/cuda-12.8/bin:' + os.environ.get('PATH', '')
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 
 def compile_fused(B, C_in, H, W, F, T_steps):

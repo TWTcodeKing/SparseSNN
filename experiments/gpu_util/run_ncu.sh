@@ -2,7 +2,7 @@
 # Phase 2: Run ncu profiling for all model × batch × backend combinations.
 #
 # Usage:
-#   sudo bash GPUtil/run_ncu.sh [gpu_id]
+#   sudo bash experiments/gpu_util/run_ncu.sh [gpu_id]
 #
 # Requires sudo for ncu access to GPU performance counters.
 # Estimated runtime: 4-8 hours total (16 runs × 15-30 min each).
@@ -12,7 +12,7 @@ set -e
 GPU_ID=${1:-3}
 NCU=/opt/nvidia/nsight-compute/2025.1.1/ncu
 PYTHON=.venv/bin/python
-REPORT_DIR=GPUtil/ncu_reports
+REPORT_DIR=experiments/gpu_util/ncu_reports
 
 export CUDA_HOME=/usr/local/cuda-12.8
 export PATH=/usr/local/cuda-12.8/bin:$PATH
@@ -66,7 +66,7 @@ for model in "${MODELS[@]}"; do
             --metrics "$METRICS" \
             -o "$report" \
             --force-overwrite \
-            $PYTHON GPUtil/run_sengine_profile.py \
+            $PYTHON experiments/gpu_util/run_sengine_profile.py \
                 --model "$model" --batch "$batch" \
                 --warmup $WARMUP_ITERS --iters $MEASURE_ITERS
 
@@ -87,7 +87,7 @@ for model in "${MODELS[@]}"; do
             --metrics "$METRICS" \
             -o "$report" \
             --force-overwrite \
-            $PYTHON GPUtil/run_trt_profile.py \
+            $PYTHON experiments/gpu_util/run_trt_profile.py \
                 --model "$model" --batch "$batch" \
                 --warmup $WARMUP_ITERS --iters $MEASURE_ITERS
 
@@ -99,5 +99,5 @@ echo ""
 echo "================================================================"
 echo "  All $total profiling runs completed."
 echo "  Reports in: $REPORT_DIR/"
-echo "  Next: python GPUtil/parse_ncu.py"
+echo "  Next: python experiments/gpu_util/parse_ncu.py"
 echo "================================================================"

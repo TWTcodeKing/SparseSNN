@@ -3,13 +3,13 @@
 
 Usage:
     # Build sengine for maxformer B=16
-    python GPUtil/build_one.py --model maxformer_10_512 --batch 16 --backend sengine --gpu-id 3
+    python experiments/gpu_util/build_one.py --model maxformer_10_512 --batch 16 --backend sengine --gpu-id 3
 
     # Build TRT for sew_resnet101 B=32
-    python GPUtil/build_one.py --model sew_resnet101 --batch 32 --backend trt --gpu-id 3
+    python experiments/gpu_util/build_one.py --model sew_resnet101 --batch 32 --backend trt --gpu-id 3
 
     # Build both
-    python GPUtil/build_one.py --model maxformer_10_512 --batch 16 --backend both --gpu-id 3
+    python experiments/gpu_util/build_one.py --model maxformer_10_512 --batch 16 --backend both --gpu-id 3
 """
 
 import argparse
@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 for cuda_path in ['/usr/local/cuda-12.8', '/usr/local/cuda', '/usr/local/cuda-12.6']:
     if os.path.isdir(cuda_path):
@@ -30,7 +30,7 @@ for cuda_path in ['/usr/local/cuda-12.8', '/usr/local/cuda', '/usr/local/cuda-12
 
 import torch
 
-from GPUtil.config import (
+from experiments.gpu_util.config import (
     MODELS, T, PRECISION, DATASET, IMG_SIZE, IN_CHANNELS, NUM_CLASSES,
     PROJECT_ROOT, plugin_onnx_path, sengine_path,
     trt_engine_path, trt_onnx_path, SENGINE_DIR, TRT_ENGINES_DIR,

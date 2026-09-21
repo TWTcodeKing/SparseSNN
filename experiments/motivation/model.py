@@ -63,7 +63,7 @@ class MotivationSNN(nn.Module):
         return v_new * (1.0 - spike)
 
 
-def export_onnx(output_path="motivation/output/model.onnx", hidden_dim=768,
+def export_onnx(output_path="experiments/motivation/output/model.onnx", hidden_dim=768,
                 batch_size=1, T=4):
     """Export MotivationSNN to ONNX with dynamic batch axis."""
     model = MotivationSNN(hidden_dim=hidden_dim, T=T)

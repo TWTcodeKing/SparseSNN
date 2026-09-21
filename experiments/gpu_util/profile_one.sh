@@ -3,13 +3,13 @@
 #
 # Usage:
 #   # Build + profile sengine for maxformer B=16 on GPU 3
-#   sudo bash GPUtil/profile_one.sh maxformer_10_512 16 sengine 3
+#   sudo bash experiments/gpu_util/profile_one.sh maxformer_10_512 16 sengine 3
 #
 #   # Profile TRT only (assumes engine already built)
-#   sudo bash GPUtil/profile_one.sh sew_resnet101 32 trt 3
+#   sudo bash experiments/gpu_util/profile_one.sh sew_resnet101 32 trt 3
 #
 #   # Profile both backends
-#   sudo bash GPUtil/profile_one.sh spikformer_4_512 16 both 3
+#   sudo bash experiments/gpu_util/profile_one.sh spikformer_4_512 16 both 3
 #
 # Arguments:
 #   $1 = model key (maxformer_10_512 | sew_resnet101 | spikingresformer_m | spikformer_4_512)
@@ -26,7 +26,7 @@ GPU_ID=${4:-3}
 
 NCU=/opt/nvidia/nsight-compute/2025.1.1/ncu
 PYTHON=.venv/bin/python
-REPORT_DIR=GPUtil/ncu_reports
+REPORT_DIR=experiments/gpu_util/ncu_reports
 
 export CUDA_HOME=/usr/local/cuda-12.8
 export PATH=/usr/local/cuda-12.8/bin:$PATH
@@ -70,7 +70,7 @@ profile_backend() {
         --metrics "$METRICS" \
         -o "$report" \
         --force-overwrite \
-        $PYTHON GPUtil/run_${be}_profile.py \
+        $PYTHON experiments/gpu_util/run_${be}_profile.py \
             --model "$MODEL" --batch "$BATCH" \
             --warmup $WARMUP --iters $ITERS
 
@@ -99,5 +99,5 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Done. Parse with: python GPUtil/parse_ncu.py"
+echo "  Done. Parse with: python experiments/gpu_util/parse_ncu.py"
 echo "================================================================"

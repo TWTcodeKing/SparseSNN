@@ -1,26 +1,6 @@
 # SparseSNN
 
-Post-training 2:4 structured sparsity and a fused inference engine for Spiking Neural Networks.
-
-Two parts:
-
-1. **Spiking Brain Compression (SBC)** (`sparse/`): second-order (OBS-based) N:M pruning
-   whose Hessian is built from a Surrogate Membrane Potential that encodes LIF temporal dynamics
-   through the Van Rossum Distance convolution matrix. It produces TensorRT-compatible 2:4 sparse
-   checkpoints from a trained dense SNN without retraining (optional channel permutation and a
-   1-epoch KD fine-tune are available).
-2. **sengine** (`sengine/`): an SNN inference engine. Temporal Dimension Lowering (TDL) turns the
-   5-D `(T, B, C, H, W)` execution model into a 4-D graph with stateful neuron ops, TileLang
-   generates Conv/Linear kernels whose epilogue runs the BN + neuron update per timestep, a
-   bound-aware scheduler (BA-MTTS) orders compute- and memory-bound kernels to overlap, and the
-   whole schedule is captured in a CUDA Graph driven by a C++ executor. One code base targets
-   RTX 4090 (default), A100 and Jetson AGX Orin through target profiles; `sengine_cpu/` is a
-   CPU port with native C kernels.
-
-The training stack (`tengine/`, `models/`, `snn_datasets/`) covers spiking ResNets, VGGs and
-Transformers (Spikformer, MetaFormer, QKFormer, MaxFormer, SpikingResFormer) on CIFAR, ImageNet,
-DVS, WiFi-CSI and audio datasets. TensorRT, torch.compile, ONNX Runtime and TVM baselines are in
-`iengine/` and `scripts/`.
+An inference engine for Spiking Neural Networks.
 
 ## Repository layout
 
@@ -30,7 +10,6 @@ DVS, WiFi-CSI and audio datasets. TensorRT, torch.compile, ONNX Runtime and TVM 
 | `snn_datasets/` | dataset loaders (CIFAR, ImageNet, CIFAR10-DVS, DVS128 Gesture, COCO, Gen1, GLUE, NTU-Fi HumanID, UT-HAR, UrbanSound8K) |
 | `tengine/` | training (`train.py`), evaluation (`test.py`), transfer learning (`transfer.py`), DDP, recipes |
 | `configs/` | architecture YAMLs for transformer models and training recipes per dataset |
-| `sparse/` | SBC pruning (`python -m sparse.snn_sbc`) |
 | `sengine/` | the GPU inference engine (see `docs/ARCHITECTURE.md`) |
 | `sengine_cpu/` | CPU engine, native C runtime (`sengine_cpu/BUILD.md`) |
 | `iengine/` | TensorRT backend (ONNX export, 2:4 sparse engine build, INT8 calibration) and TVM Relax backend |
@@ -98,20 +77,6 @@ torchrun --nproc_per_node=4 tengine/train.py --config <yaml> --dataset imagenet 
 Runs land in `output/{model}_{dataset}_bs{B}_lr{lr}/best.pth`. The `scripts/train_*.sh` wrappers
 train whole model families (`DATA_ROOT` env var overrides the default root). Evaluate with
 `tengine/test.py`, transfer ImageNet checkpoints with `tengine/transfer.py`.
-
-### 2. SBC 2:4 pruning
-
-```bash
-python -m sparse.snn_sbc --model sew_resnet_cifar56 --dense-checkpoint output/.../best.pth \
-    --dataset cifar100 --data-root /data/twt/datasets --T 4 --nm 2 4 --evaluate
-# --permute-channels (helps 3x3 convs, hurts 1x1), --finetune <epochs> (KD), --config for transformers
-bash scripts/run_sbc_global_cifar100.sh [gpu]   # every CIFAR-100 model in output/ -> obc_pt/
-bash scripts/finetune_all.sh [gpu]              # SBC -> permutation -> 1-epoch KD (ResNets), SBC only (transformers)
-```
-
-ImageNet models were pruned with the same command and `--dataset imagenet --img-size 224
---calib-batches 400..1600` from the authors' released dense checkpoints (SEW-ResNet, MS-ResNet,
-MaxFormer, SpikingResFormer), which are not redistributed here.
 
 ### 3. Build and benchmark sengine
 
@@ -196,9 +161,6 @@ python experiments/breakdown/bench_progressive.py --sengine experiments/gpu_util
 bash experiments/motivation/run_all.sh [gpu]
 ```
 
-Kernel smoke tests (each autotunes and checks against cuDNN): `scripts/bench_grouped_conv_smoke.py`,
-`scripts/bench_winograd_fused_smoke.py`, `scripts/bench_winograd_vs_imcol.py`.
-
 ## Results
 
 FP16 latency in milliseconds on an idle RTX 4090, T=4 (`results/latency_4090.csv`; TensorRT and
@@ -226,14 +188,3 @@ MetaFormer-8-384), CIFAR10-DVS and DVS128 Gesture (MaxFormer, MS-QKFormer, MS-Re
 SpikingResFormer-Ti/S transfers, SNN-VGG16 on UT-HAR and SNN-VGG9 on UrbanSound8K. `obc_pt/`
 holds the SBC 2:4 outputs (`{model}_{dataset}_sbc_2_4_global.pth`, `_perm_ft1` for permuted +
 KD-fine-tuned) including the ImageNet models. Neither directory is in git.
-
-## Known limitations
-
-- `sengine --precision fp32` does not match PyTorch on SNN-VGG16/UT-HAR (FP16 does).
-- The `--fusion none` ablation is functional but only validated with `--fp16-tolerance` on
-  low-confidence models.
-- Detection (SpikeYOLO, EMS-YOLO on COCO/Gen1) and NLP (Spike-BERT on GLUE, needs `transformers`
-  and HuggingFace `datasets`) are supported by the model/export stack but have no trained
-  checkpoints or reported numbers in this repository.
-- The Orin profile is validated functionally on x86 (kernels compile and match PyTorch); latency
-  must be measured on the device.

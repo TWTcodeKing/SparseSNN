@@ -12,7 +12,6 @@ from typing import Optional
 
 _CSRC_DIR = os.path.join(os.path.dirname(__file__), '..', 'csrc')
 _LIB_PATH = os.path.join(_CSRC_DIR, 'libsengine_exec.so')
-_PREBUILT_DIR = os.path.join(_CSRC_DIR, 'prebuilt')
 _lib: Optional[ctypes.CDLL] = None
 
 
@@ -29,16 +28,12 @@ def _current_arch() -> str:
 
 
 def _resolve_lib_path() -> str:
-    """csrc/libsengine_exec.so (built by `make lib`), else csrc/prebuilt/libsengine_exec.<arch>.so."""
+    """csrc/libsengine_exec.so, built per device with `make lib` (build products are not portable)."""
     if os.path.exists(_LIB_PATH):
         return _LIB_PATH
     arch = _current_arch()
-    prebuilt = os.path.join(_PREBUILT_DIR, f'libsengine_exec.{arch}.so')
-    if os.path.exists(prebuilt):
-        return prebuilt
     raise FileNotFoundError(
-        f"libsengine_exec.so not found at {os.path.abspath(_LIB_PATH)} and no prebuilt "
-        f"binary for {arch} at {os.path.abspath(prebuilt)}. Build it with\n"
+        f"libsengine_exec.so not found at {os.path.abspath(_LIB_PATH)}. Build it for this GPU with\n"
         f"    make -C sengine/csrc lib            # RTX 4090 (sm_89, CUDA 12.8)\n"
         f"    make -C sengine/csrc lib ARCH=\"-gencode arch=compute_{arch[3:]},code={arch}\" "
         f"CUDA_HOME=/usr/local/cuda   # other GPUs, e.g. Jetson Orin sm_87"

@@ -28,6 +28,7 @@ from sengine.logger import logger
 
 _conv2d_bn_t4 = None
 _conv1x1_bn_t4 = None
+_stem_conv_bn_t4 = None
 _stem_conv_bn_if_t4 = None
 _linear_bn = None
 _linear_bn_lif_t4 = None
@@ -37,16 +38,18 @@ _ext_if = None
 
 
 def _load_conv_kernels():
-    global _conv2d_bn_t4, _conv1x1_bn_t4, _stem_conv_bn_if_t4
+    global _conv2d_bn_t4, _conv1x1_bn_t4, _stem_conv_bn_t4, _stem_conv_bn_if_t4
     if _conv2d_bn_t4 is not None:
         return
     from sengine.kernels.conv2d_bn_if_t4 import (
         conv2d_bn_t4_kernel,
         conv1x1_bn_t4_kernel,
+        stem_conv_bn_t4_kernel,
         stem_conv_bn_if_t4_kernel,
     )
     _conv2d_bn_t4 = conv2d_bn_t4_kernel
     _conv1x1_bn_t4 = conv1x1_bn_t4_kernel
+    _stem_conv_bn_t4 = stem_conv_bn_t4_kernel
     _stem_conv_bn_if_t4 = stem_conv_bn_if_t4_kernel
 
 
@@ -835,11 +838,13 @@ class TileLangCompiler:
 
         cfg = self._resolve_config(key, M, K_red, cp.out_channels)
 
-        kern = _stem_conv_bn_if_t4(
+        # Conv+BN only (no neuron): on the unfused path the IF/LIF runs as a
+        # separate native epilogue node. The slicer path fuses the stem via the
+        # interleaved kernel (_get_fused_stem_conv_bn_if) instead.
+        kern = _stem_conv_bn_t4(
             TB=self.TB, H=H, W=W,
             C_in_padded=C_padded, C_in_real=cp.in_channels, F=cp.out_channels,
             KH=cp.kernel_h, KW=cp.kernel_w, S=cp.stride_h, P=cp.pad_h,
-            T_steps=self.T,
             io_dtype=self.io_dtype_tl,
             **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
 

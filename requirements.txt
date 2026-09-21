@@ -1,0 +1,50 @@
+# SparseSNN Python dependencies (Python 3.12, CUDA 12.x).
+#
+#   uv venv .venv && source .venv/bin/activate
+#   uv pip install torch==2.5.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#   uv pip install -r requirements.txt
+#
+# torch is installed separately so the CUDA build matches your driver.
+# TVM (scripts/bench_tvm_latency.py, iengine/backends/tvm, the optional sengine_cpu
+# TVM backend) is not pip-installable; build it separately (see README).
+
+# core
+numpy
+scipy
+pyyaml
+tqdm
+pillow
+matplotlib
+pandas
+colorlog
+
+# SNN framework
+spikingjelly==0.0.0.0.14
+
+# ONNX pipeline (pinned: newer onnxscript converters break the plugin export)
+onnx==1.21.0
+onnxsim==0.6.2
+onnxruntime-gpu==1.25.1
+onnx-graphsurgeon
+protobuf
+
+# sengine kernel compiler
+tilelang==0.1.8
+
+# TensorRT baseline
+tensorrt-cu12>=10.7.0
+tensorrt-cu12-bindings>=10.7.0
+tensorrt-cu12-libs>=10.7.0
+cupy-cuda12x
+
+# audio features (UrbanSound8K log-mel)
+soundfile
+
+# CPU engine baselines (scripts/bench_snn_vgg9_cpu.py)
+openvino
+ncnn
+
+# optional, per workload:
+#   pycocotools           COCO detection
+#   transformers datasets GLUE (sst2/mrpc) for spike_bert
+#   prophesee_utils       Gen1 event preprocessing

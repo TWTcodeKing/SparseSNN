@@ -163,7 +163,12 @@ def main():
     if not args.model and not args.config:
         parser.error("Provide --model or --config")
 
-    device_id = int(args.gpu_ids.split(',')[0])
+    physical_gpu = int(args.gpu_ids.split(',')[0])
+    # Restrict CUDA visibility to the target GPU so it always appears as
+    # device 0. TileLang allocates output tensors on device 0; a non-zero
+    # --gpu-ids without this masking crashes with a device mismatch.
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(physical_gpu)
+    device_id = 0
     torch.cuda.set_device(device_id)
 
     from tengine.utils import get_dataset_config
@@ -178,7 +183,7 @@ def main():
     gpu_arch = f"sm_{props.major}{props.minor}"
     gpu_sms = props.multi_processor_count
     gpu_mem = props.total_memory / 1e9
-    print(f"GPU {device_id}: {gpu_name} ({gpu_arch}, {gpu_sms} SMs, {gpu_mem:.1f} GB)")
+    print(f"GPU {physical_gpu}: {gpu_name} ({gpu_arch}, {gpu_sms} SMs, {gpu_mem:.1f} GB)")
     print(f"Model: {tag} | Dataset: {args.dataset} | T={args.T}")
     print(f"Fusion: {fusion_modes} | Autotune: {args.autotune} | Precision: {args.precision}")
 

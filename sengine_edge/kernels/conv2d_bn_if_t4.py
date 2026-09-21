@@ -550,6 +550,105 @@ def stem_conv_bn_if_t4_kernel(
 
 
 # ---------------------------------------------------------------------------
+# Kernel 3a': Stem Conv + BN ONLY (no neuron, padded C_in)
+#
+# Conv+BN-only counterpart of stem_conv_bn_if_t4_kernel. Used on the un-fused
+# ('none') path: the stem does Conv+BN, and the IF/LIF neuron runs afterwards
+# as a separate epilogue node (the native CUDAVec4IF/LIF kernel, which loops T
+# inside each spatial thread with the membrane in a register → no cross-CTA
+# membrane race). The slicer path instead fuses into the interleaved kernel
+# below. This avoids both the double-IF (stem kernel + standalone IF) and the
+# racy shared-membrane epilogue of the IF-embedding stem kernel.
+# ---------------------------------------------------------------------------
+
+@tilelang.jit(out_idx=[-1])
+def stem_conv_bn_t4_kernel(
+    TB, H, W,
+    block_M, block_N, block_K, num_stages, threads,
+    C_in_padded=16, C_in_real=3, F=64, KH=7, KW=7, S=2, P=3,
+    io_dtype=T.float16,
+):
+    """Fused stem Conv(C_in→F, 7×7, s=2, p=3) + BN, NO neuron.
+
+    Same padded-C_in im2col GEMM as stem_conv_bn_if_t4_kernel, but the epilogue
+    writes the BN output directly instead of integrating an IF membrane.
+
+    C_in is padded from C_in_real (e.g. 3) to C_in_padded (16) for tensor-core
+    alignment; only the first C_in_real channels are read, the rest are zero.
+    """
+    OH = (H + 2 * P - KH) // S + 1
+    OW = (W + 2 * P - KW) // S + 1
+    M = TB * OH * OW
+    K_red = KH * KW * C_in_padded
+
+    @T.prim_func
+    def main(
+        data:     T.Tensor((TB, H, W, C_in_real), io_dtype),
+        weight:   T.Tensor((KH, KW, C_in_padded, F), io_dtype),
+        bn_scale: T.Tensor((F,), T.float32),
+        bn_bias:  T.Tensor((F,), T.float32),
+        output:   T.Tensor((TB, OH, OW, F), io_dtype),
+    ):
+        with T.Kernel(
+            T.ceildiv(F, block_N), T.ceildiv(M, block_M),
+            threads=threads,
+        ) as (bx, by):
+            data_shared   = T.alloc_shared((block_M, block_K), io_dtype)
+            weight_shared = T.alloc_shared((block_K, block_N), io_dtype)
+            acc           = T.alloc_fragment((block_M, block_N), T.float32)
+
+            weight_flat = T.Tensor((K_red, F), io_dtype, weight.data)
+            output_flat = T.Tensor((M, F), io_dtype, output.data)
+
+            T.clear(acc)
+
+            for k_iter in T.Pipelined(
+                T.ceildiv(K_red, block_K), num_stages=num_stages,
+            ):
+                # im2col with padded C_in
+                for i, j in T.Parallel(block_M, block_K):
+                    k = k_iter * block_K + j
+                    m = by * block_M + i
+                    n_idx = m // (OH * OW)
+                    hw = m % (OH * OW)
+                    oh = hw // OW
+                    ow = hw % OW
+                    kh = k // (KW * C_in_padded)
+                    kw = (k // C_in_padded) % KW
+                    cin = k % C_in_padded
+                    access_h = oh * S + kh - P
+                    access_w = ow * S + kw - P
+                    # Only read real channels (0..C_in_real-1), zero-pad the rest
+                    in_bound = (
+                        (access_h >= 0) and (access_w >= 0)
+                        and (access_h < H) and (access_w < W)
+                        and (cin < C_in_real) and (m < M) and (k < K_red)
+                    )
+                    data_shared[i, j] = T.if_then_else(
+                        in_bound,
+                        data[n_idx, access_h, access_w, cin],
+                        io_dtype(0),
+                    )
+
+                T.copy(weight_flat[k_iter * block_K, bx * block_N],
+                       weight_shared)
+                T.gemm(data_shared, weight_shared, acc, policy=_warp_policy(block_M, block_N))
+
+            # BN epilogue (no neuron) — write BN output directly
+            out_shared = T.alloc_shared((block_M, block_N), io_dtype)
+            for i, j in T.Parallel(block_M, block_N):
+                m = by * block_M + i
+                f = bx * block_N + j
+                if m < M and f < F:
+                    val = acc[i, j] * bn_scale[f] + bn_bias[f]
+                    out_shared[i, j] = T.cast(val, io_dtype)
+
+            T.copy(out_shared, output_flat[by * block_M, bx * block_N])
+
+    return main
+
+
+# ---------------------------------------------------------------------------
 # Kernel 3b: Stem Conv + BN + LIF — INTERLEAVED (per-CTA T-loop)
 #
 # Same fused im2col GEMM as stem_conv_bn_if_t4_kernel, but with per-CTA

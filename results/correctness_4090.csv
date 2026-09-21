@@ -1,0 +1,7 @@
+engine,model,dataset,T,engine_precision,top1_agree_vs_fp32,mean_cos_vs_fp32,top1_agree_vs_fp16,mean_cos_vs_fp16,min_cos_vs_fp16,max_abs_diff_vs_fp16,torch_fp16_vs_fp32_agree,engine_test_acc,torch_fp32_test_acc,torch_fp16_test_acc,test_samples,strict_verdict
+sengine_cpu,snn_vgg16,ut_har,4,fp32,1.0000,0.9993,0.9900,0.9993,0.9943,0.2844,0.9900,0.9920,0.9920,0.9900,500,PASS
+sengine_cpu,snn_vgg9,urbansound8k,4,fp32,0.9900,0.9983,0.9600,0.9979,0.9843,0.5351,0.9700,0.8483,0.8483,0.8519,837,FAIL
+sengine_edge,snn_vgg16,ut_har,4,fp16,1.0000,0.9993,0.9900,0.9994,0.9961,0.3555,0.9900,0.9920,0.9920,0.9900,500,PASS
+sengine_edge,snn_vgg9,urbansound8k,4,fp16,0.9600,0.9984,0.9700,0.9983,0.9915,0.5664,0.9700,0.8447,0.8483,0.8519,837,FAIL
+sengine,snn_vgg16,ut_har,4,fp16,1.0000,0.9993,0.9900,0.9994,0.9961,0.3555,0.9900,0.9920,0.9920,0.9900,500,PASS
+sengine,snn_vgg9,urbansound8k,4,fp16,0.9600,0.9984,0.9700,0.9983,0.9915,0.5664,0.9700,0.8447,0.8483,0.8519,837,FAIL

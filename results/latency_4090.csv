@@ -1,0 +1,73 @@
+model,dataset,input_shape,T,batch,tool,precision,mode,latency_ms,std_ms,throughput_img_per_s,gpu_index,source_log
+snn_vgg16,ut_har,1x250x90,4,4,inductor,fp16,max-autotune,3.001,0.055,1333,6,extra_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,4,inductor,fp32,max-autotune,5.395,0.055,741,6,extra_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,4,inductor,fp16,reduce-overhead,3.074,0.165,1301,6,remeasure_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,4,inductor,fp32,reduce-overhead,5.970,0.100,670,1,inductor_fp32_snn_vgg16.log
+snn_vgg16,ut_har,1x250x90,4,4,ort,fp16,cuda_ep graph_opt=all,4.721,0.092,847,6,extra_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,4,ort,fp32,cuda_ep graph_opt=all,8.990,0.081,445,6,extra_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,4,sengine,fp16,slicer+validated,2.269,,1763,6,remeasure_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,4,trt,fp16,,2.160,0.126,1852,6,remeasure_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,4,trt,fp32,,5.357,0.159,747,1,trt_fp32real_snn_vgg16.log
+snn_vgg16,ut_har,1x250x90,4,8,inductor,fp16,max-autotune,6.266,0.075,1277,6,extra_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,8,inductor,fp32,max-autotune,11.390,0.069,702,6,extra_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,8,inductor,fp16,reduce-overhead,6.514,0.066,1228,6,remeasure_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,8,inductor,fp32,reduce-overhead,12.256,0.112,653,1,inductor_fp32_snn_vgg16.log
+snn_vgg16,ut_har,1x250x90,4,8,ort,fp16,cuda_ep graph_opt=all,9.955,0.120,804,6,extra_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,8,ort,fp32,cuda_ep graph_opt=all,20.645,0.097,388,6,extra_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,8,sengine,fp16,slicer+validated,4.010,,1995,6,remeasure_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,8,trt,fp16,,4.735,0.050,1689,6,remeasure_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,8,trt,fp32,,11.239,0.356,712,1,trt_fp32real_snn_vgg16.log
+snn_vgg16,ut_har,1x250x90,4,16,inductor,fp16,max-autotune,12.326,0.072,1298,6,extra_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,16,inductor,fp32,max-autotune,23.343,0.080,685,6,extra_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,16,inductor,fp16,reduce-overhead,12.886,0.059,1242,6,remeasure_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,16,inductor,fp32,reduce-overhead,24.576,0.069,651,1,inductor_fp32_snn_vgg16.log
+snn_vgg16,ut_har,1x250x90,4,16,ort,fp16,cuda_ep graph_opt=all,22.655,0.103,706,6,extra_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,16,ort,fp32,cuda_ep graph_opt=all,46.883,0.109,341,6,extra_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,16,sengine,fp16,slicer+validated,7.275,,2199,6,remeasure_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,16,trt,fp16,,10.207,0.063,1568,6,remeasure_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,16,trt,fp32,,22.829,0.174,701,1,trt_fp32real_snn_vgg16.log
+snn_vgg16,ut_har,1x250x90,4,32,inductor,fp16,max-autotune,25.449,0.047,1257,6,extra_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,32,inductor,fp32,max-autotune,47.671,0.140,671,6,extra_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,32,inductor,fp16,reduce-overhead,26.414,0.067,1211,6,remeasure_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,32,inductor,fp32,reduce-overhead,49.330,0.066,649,1,inductor_fp32_snn_vgg16.log
+snn_vgg16,ut_har,1x250x90,4,32,ort,fp16,cuda_ep graph_opt=all,51.127,0.100,626,6,extra_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,32,ort,fp32,cuda_ep graph_opt=all,100.602,0.124,318,6,extra_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,32,sengine,fp16,slicer+validated,15.120,,2116,6,remeasure_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,32,trt,fp16,,21.712,0.087,1474,6,remeasure_gpu6.log
+snn_vgg16,ut_har,1x250x90,4,32,trt,fp32,,44.936,0.168,712,1,trt_fp32real_snn_vgg16.log
+snn_vgg9,urbansound8k,1x64x176,4,4,inductor,fp16,max-autotune,0.651,0.014,6140,6,extra_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,4,inductor,fp32,max-autotune,1.185,0.078,3377,6,extra_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,4,inductor,fp16,reduce-overhead,0.650,0.015,6150,6,remeasure_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,4,inductor,fp32,reduce-overhead,1.262,0.073,3169,1,inductor_fp32_snn_vgg9.log
+snn_vgg9,urbansound8k,1x64x176,4,4,ort,fp16,cuda_ep graph_opt=all,1.267,0.226,3158,6,extra_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,4,ort,fp32,cuda_ep graph_opt=all,2.080,0.310,1923,6,extra_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,4,sengine,fp16,slicer+validated,0.610,,6557,6,remeasure_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,4,trt,fp16,,0.515,0.020,7762,6,remeasure_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,4,trt,fp32,,1.152,0.134,3471,1,trt_fp32real_snn_vgg9.log
+snn_vgg9,urbansound8k,1x64x176,4,8,inductor,fp16,max-autotune,1.207,0.060,6630,6,extra_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,8,inductor,fp32,max-autotune,2.451,0.061,3264,6,extra_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,8,inductor,fp16,reduce-overhead,1.193,0.045,6708,6,remeasure_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,8,inductor,fp32,reduce-overhead,2.603,0.065,3074,1,inductor_fp32_snn_vgg9.log
+snn_vgg9,urbansound8k,1x64x176,4,8,ort,fp16,cuda_ep graph_opt=all,2.185,0.038,3662,6,extra_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,8,ort,fp32,cuda_ep graph_opt=all,4.221,0.217,1895,6,extra_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,8,sengine,fp16,slicer+validated,0.950,,8423,6,remeasure_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,8,trt,fp16,,1.022,0.042,7825,6,remeasure_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,8,trt,fp32,,2.719,3.298,2943,1,trt_fp32real_snn_vgg9.log
+snn_vgg9,urbansound8k,1x64x176,4,16,inductor,fp16,max-autotune,2.420,0.033,6612,6,extra_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,16,inductor,fp32,max-autotune,5.231,0.065,3059,6,extra_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,16,inductor,fp16,reduce-overhead,2.524,0.021,6340,6,remeasure_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,16,inductor,fp32,reduce-overhead,5.686,0.060,2814,1,inductor_fp32_snn_vgg9.log
+snn_vgg9,urbansound8k,1x64x176,4,16,ort,fp16,cuda_ep graph_opt=all,4.523,0.129,3538,6,extra_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,16,ort,fp32,cuda_ep graph_opt=all,10.032,0.127,1595,6,extra_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,16,sengine,fp16,slicer+validated,1.929,,8292,6,remeasure_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,16,trt,fp16,,2.327,0.094,6874,6,remeasure_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,16,trt,fp32,,5.529,0.273,2894,1,trt_fp32real_snn_vgg9.log
+snn_vgg9,urbansound8k,1x64x176,4,32,inductor,fp16,max-autotune,5.166,0.036,6194,6,extra_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,32,inductor,fp32,max-autotune,11.058,0.243,2894,6,extra_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,32,inductor,fp16,reduce-overhead,5.488,0.065,5831,6,remeasure_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,32,inductor,fp32,reduce-overhead,12.044,1.097,2657,1,inductor_fp32_snn_vgg9.log
+snn_vgg9,urbansound8k,1x64x176,4,32,ort,fp16,cuda_ep graph_opt=all,11.081,0.065,2888,6,extra_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,32,ort,fp32,cuda_ep graph_opt=all,23.743,0.144,1348,6,extra_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,32,sengine,fp16,slicer+validated,3.645,,8778,6,remeasure_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,32,trt,fp16,,5.388,0.083,5939,6,remeasure_gpu6.log
+snn_vgg9,urbansound8k,1x64x176,4,32,trt,fp32,,11.486,0.172,2786,1,trt_fp32real_snn_vgg9.log

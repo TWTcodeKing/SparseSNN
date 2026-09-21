@@ -30,7 +30,7 @@ def _try_import_tvm():
     except ImportError as e:
         raise ImportError(
             f"tvm import failed: {e}\n"
-            "Run with the TVM venv: /home/twt/tvm_build/tvm_venv/bin/python"
+            "Run with an interpreter that has TVM (Relax) installed; see README, section TVM baseline"
         ) from e
 
 

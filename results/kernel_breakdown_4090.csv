@@ -1,0 +1,40 @@
+tool,model,batch,kind,name,shape,time_us_per_iter,tflops
+tensorrt_fp16,snn_vgg16,32,category,conv_gemm,,6742.1,
+tensorrt_fp16,snn_vgg16,32,category,neuron_myelin,,11718.5,
+tensorrt_fp16,snn_vgg16,32,category,layout_transpose,,1842.6,
+tensorrt_fp16,snn_vgg16,32,category,pool,,1008.2,
+tensorrt_fp16,snn_vgg16,32,category,other,,56.4,
+tensorrt_fp16,snn_vgg16,4,category,conv_gemm,,950.2,
+tensorrt_fp16,snn_vgg16,4,category,neuron_myelin,,844.4,
+tensorrt_fp16,snn_vgg16,4,category,layout_transpose,,295.1,
+tensorrt_fp16,snn_vgg16,4,category,pool,,68.6,
+tensorrt_fp16,snn_vgg16,4,category,other,,9.7,
+tensorrt_fp16,snn_vgg9,16,category,conv_gemm,,783.4,
+tensorrt_fp16,snn_vgg9,16,category,neuron_myelin,,926.3,
+tensorrt_fp16,snn_vgg9,16,category,layout_transpose,,388.6,
+tensorrt_fp16,snn_vgg9,16,category,pool,,228.5,
+tensorrt_fp16,snn_vgg9,16,category,other,,27.1,
+tensorrt_fp16,snn_vgg9,4,category,conv_gemm,,235.5,
+tensorrt_fp16,snn_vgg9,4,category,neuron_myelin,,122.3,
+tensorrt_fp16,snn_vgg9,4,category,layout_transpose,,76.2,
+tensorrt_fp16,snn_vgg9,4,category,pool,,32.1,
+tensorrt_fp16,snn_vgg9,4,category,other,,13.6,
+sengine_fp16,snn_vgg16,4,layer,node1:TileLangFusedConvBNIF,"[16, 250, 90]→[16, 2",183.9,2.2
+sengine_fp16,snn_vgg16,4,layer,node4:TileLangFusedConvBNIF,"[16, 250, 90]→[16, 2",238.6,111.1
+sengine_fp16,snn_vgg16,4,layer,node8:TileLangFusedConvBNIF,"[16, 125, 45]→[16, 1",105.1,126.5
+sengine_fp16,snn_vgg16,4,layer,node11:TileLangFusedConvBNIF,"[16, 125, 45]→[16, 1",190.6,139.0
+sengine_fp16,snn_vgg16,4,layer,node15:TileLangFusedConvBNIF,"[16, 62, 22]→[16, 62",104.8,123.1
+sengine_fp16,snn_vgg16,4,layer,node18:TileLangFusedConvBNIF,"[16, 62, 22]→[16, 62",205.0,125.4
+sengine_fp16,snn_vgg16,4,layer,node21:TileLangFusedConvBNIF,"[16, 62, 22]→[16, 62",204.9,125.4
+sengine_fp16,snn_vgg16,4,layer,node25:TileLangConvBN,"[16, 31, 11]→[16, 31",92.6,139.3
+sengine_fp16,snn_vgg16,4,layer,node28:TileLangFusedConvBNIF,"[16, 31, 11]→[16, 31",238.6,107.7
+sengine_fp16,snn_vgg16,4,layer,node31:TileLangFusedConvBNIF,"[16, 31, 11]→[16, 31",238.4,107.8
+sengine_fp16,snn_vgg16,4,layer,node35:TileLangFusedConvBNIF,"[16, 15, 5]→[16, 15,",102.5,55.6
+sengine_fp16,snn_vgg16,4,layer,node38:TileLangFusedConvBNIF,"[16, 15, 5]→[16, 15,",102.5,55.6
+sengine_fp16,snn_vgg16,4,layer,node41:TileLangFusedConvBNIF,"[16, 15, 5]→[16, 15,",102.8,55.4
+sengine_fp16,snn_vgg9,4,layer,node1:TileLangFusedConvBNIF,"[16, 64, 176]→[16, 6",69.4,2.9
+sengine_fp16,snn_vgg9,4,layer,node5:TileLangFusedConvBNIF,"[16, 32, 88]→[16, 32",60.9,108.4
+sengine_fp16,snn_vgg9,4,layer,node9:TileLangFusedConvBNIF,"[16, 16, 44]→[16, 16",71.4,92.4
+sengine_fp16,snn_vgg9,4,layer,node12:TileLangFusedConvBNIF,"[16, 16, 44]→[16, 16",133.9,99.3
+sengine_fp16,snn_vgg9,4,layer,node16:TileLangFusedConvBNIF,"[16, 8, 22]→[16, 8,",73.2,90.2
+sengine_fp16,snn_vgg9,4,layer,node19:TileLangFusedConvBNIF,"[16, 8, 22]→[16, 8,",167.8,79.3

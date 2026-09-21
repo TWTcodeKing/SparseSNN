@@ -46,5 +46,5 @@ experiments/gpu_util/ncu_reports/
 sengine/csrc/sengine_exec
 sengine_edge/csrc/sengine_exec
 
-# local-only notes
-docs/*.md*
+# local-only notes (early design docs, PDFs)
+docs/archive/

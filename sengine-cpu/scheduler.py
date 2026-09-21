@@ -147,8 +147,19 @@ def build_schedule_from_ir(ir: EngineIR) -> list[int]:
             continue  # skip zero-cost nodes
 
         bound = Bound.COMPUTE if node.bound_type == BoundType.COMPUTE else Bound.MEMORY
-        deps = [p for p in ir.predecessors(nid)
-                if ir.nodes.get(p) and ir.nodes[p].bound_type != BoundType.ZERO]
+        # Effective predecessors: walk back through zero-cost nodes (absorbed
+        # neurons, reshapes, ...) so that e.g. MaxPool -> LIF(skip) -> Conv
+        # still orders the pool after the conv that produces its input.
+        deps, seen, stack = [], set(), list(ir.predecessors(nid))
+        while stack:
+            p = stack.pop()
+            if p in seen or ir.nodes.get(p) is None:
+                continue
+            seen.add(p)
+            if ir.nodes[p].bound_type != BoundType.ZERO:
+                deps.append(p)
+            else:
+                stack.extend(ir.predecessors(p))
 
         scheduler.add_op(Op(
             id=nid, name=node.name, bound=bound,

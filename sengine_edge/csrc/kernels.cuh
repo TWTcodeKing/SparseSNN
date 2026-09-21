@@ -192,6 +192,18 @@ __global__ void naive_conv2d_bn_nhwc_kernel(
 
 // ─── FP16 GEMM (naive, for reference) ───
 
+// Row-wise bias add for GEMM outputs: data[(m, n)] += bias[n]
+__global__ void bias_add_fp16_kernel(half* data, const float* __restrict__ bias, int total, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    data[i] = __float2half(__half2float(data[i]) + bias[i % N]);
+}
+__global__ void bias_add_fp32_kernel(float* data, const float* __restrict__ bias, int total, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    data[i] += bias[i % N];
+}
+
 __global__ void gemm_fp16_kernel(
     const half* __restrict__ input, const half* __restrict__ weight,
     half* __restrict__ output, int M, int K, int N

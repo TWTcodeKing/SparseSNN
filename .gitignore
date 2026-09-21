@@ -2,14 +2,48 @@ __pycache__/
 *.pyc
 *.pt
 *.pth
+*.onnx
+*.engine
+*.sengine
+*.so
+*.pdf
+*.nsys-rep
+*.sqlite
+*.ncu-rep
+
+# environments / editor state
+.venv/
+.vscode/
+.pkl_memoize_py3/
+.cache/
+.sengine-cpu.cache/
+
+# vendored
+third_party/
+third-party/
+
+# training / pruning outputs
 output/
 sweep_results/
 checkpoints/
-obs_pt/
-.venv/
-third_party/
-*.onnx
-*.engine
-*.pdf
-third-party/
-docs/*.md*.sengine
+obc_pt/
+obc_pt_ft/
+
+# engine / benchmark artifacts
+sengine/exports/
+sengine/exports_trained/
+sengine_edge/exports/
+trt_engines/
+trt_engines_fp32/
+onnxrt_exports/
+profiles/
+GPUtil/engines/
+GPUtil/trt_engines/
+GPUtil/ncu_reports/
+
+# compiled executors (rebuild with make)
+sengine/csrc/sengine_exec
+sengine_edge/csrc/sengine_exec
+
+# local-only notes
+docs/*.md*

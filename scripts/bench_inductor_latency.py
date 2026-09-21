@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument("--mode", type=str, default="reduce-overhead",
                         choices=["default", "reduce-overhead", "max-autotune"],
                         help="torch.compile mode")
-    parser.add_argument("--backend", type=str, default="tvm",
+    parser.add_argument("--backend", type=str, default="inductor",
                         help="torch.compile backend (default: inductor)")
     parser.add_argument("--no-compile", action="store_true",
                         help="Skip compilation, benchmark eager PyTorch")

@@ -10,7 +10,7 @@ CFLAGS  = -O3 -march=native -fPIC -fopenmp -Wall -Wextra -Wno-unused-parameter
 LDFLAGS = -shared -ldl -lm -fopenmp
 
 TARGET  = libsengine_cpu.so
-SRCS    = cpu_executor.c native_kernels.c
+SRCS    = cpu_executor.c native_kernels.c native_conv.c
 
 # ─── Optional OpenBLAS linkage ───
 # Set NO_BLAS=1 to disable (uses naive triple-loop GEMM)

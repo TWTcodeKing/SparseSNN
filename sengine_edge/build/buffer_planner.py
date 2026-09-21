@@ -74,6 +74,7 @@ class ExecutionPlan:
 
 _ZEROCOST_OPS = {OpType.Reshape, OpType.Transpose, OpType.Identity, OpType.Flatten}
 _NHWC_OPS = {OpType.Conv2d, OpType.MaxPool, OpType.GlobalAvgPool,
+             OpType.TemporalMean,
              OpType.Add, OpType.IF, OpType.LIF, OpType.MS,
              OpType.Tile, OpType.Sub, OpType.Mul, OpType.Scale,
              OpType.FusedAttention}
@@ -125,7 +126,11 @@ def plan_buffers(ir: EngineIR, schedule: list[int],
                 w_key = f"weight_1x1_{nid}"
                 wbid = _alloc(w_shape, precision, "2d", "weight_1x1", nid, w_key)
             else:
-                w_shape = (cp.kernel_h, cp.kernel_w, cp.in_channels, cp.out_channels)
+                C_in_w = cp.in_channels
+                # Stem conv (C_in < 4): pad to 16 for tensor core alignment
+                if cp.in_channels < 4 and cp.groups == 1:
+                    C_in_w = 16
+                w_shape = (cp.kernel_h, cp.kernel_w, C_in_w, cp.out_channels)
                 w_key = f"weight_{nid}"
                 wbid = _alloc(w_shape, precision, "4d", "weight", nid, w_key)
             weight_bufs[f"weight_{nid}"] = wbid
@@ -152,6 +157,16 @@ def plan_buffers(ir: EngineIR, schedule: list[int],
                 weight_bufs[f"scale_{nid}"] = sbid
                 bbid = _alloc((N_out,), "fp32", "1d", "bn_bias", nid,
                               weight_key=f"__matmul_lif_bias_{nid}")
+                weight_bufs[f"bias_{nid}"] = bbid
+
+        # Classifier Gemm (cuBLAS): weight (N_out, K) + optional bias (N_out,)
+        elif node.op_type == OpType.Gemm and node.weight_info is not None:
+            ws = tuple(node.weight_info.shape) if node.weight_info.shape else (1, 1)
+            wbid = _alloc(ws, precision, "2d", "weight", nid, f"weight_{nid}")
+            weight_bufs[f"weight_{nid}"] = wbid
+            if node.bias_info is not None:
+                bbid = _alloc((ws[0],), "fp32", "1d", "gemm_bias", nid,
+                              weight_key=f"__gemm_bias_{nid}")
                 weight_bufs[f"bias_{nid}"] = bbid
 
     # ── Phase 2: Allocate membrane buffers ──
@@ -417,7 +432,7 @@ def plan_buffers(ir: EngineIR, schedule: list[int],
             nodes.append(NodeExecPlan(
                 nid=nid, kernel_type="gemm",
                 input_bufs=[input_bid], output_buf=output_bid,
-                weight_buf=w_bid))
+                weight_buf=w_bid, bias_buf=b_bid))
 
         elif kv == KernelVariant.CuDNNConv:
             # Use cuDNN for large convolutions (validator-REVERT'd),

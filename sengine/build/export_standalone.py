@@ -157,6 +157,15 @@ def export_all_kernels(kernels: dict, ir, build_dir: str,
         kid = id(kern_obj)
         if kid in kern_to_so:
             return kern_to_so[kid]
+        # Key the cached .so by kernel source, not only by node id: models that
+        # share a build dir reuse node ids, and a stale kern_<nid>.so compiled
+        # for another shape silently corrupts results (or faults).
+        try:
+            import hashlib
+            src = kern_obj.adapter.get_device_source()
+            so_path = so_path[:-3] + '_' + hashlib.sha1(src.encode()).hexdigest()[:12] + '.so'
+        except Exception:
+            pass
         if os.path.exists(so_path):
             kern_to_so[kid] = so_path
             return so_path
@@ -192,7 +201,16 @@ def export_all_kernels(kernels: dict, ir, build_dir: str,
             nid_to_so[nid] = kern_to_so[kid]
             continue
 
-        so_path = os.path.join(build_dir, f'kern_{nid}.so')
+        # Key the cached .so by kernel source: node ids repeat across models
+        # (and forks) sharing a build dir, and a stale kern_<nid>.so compiled
+        # for another shape silently corrupts results or faults.
+        try:
+            import hashlib
+            _h = hashlib.sha1(kern.adapter.get_device_source().encode()).hexdigest()[:12]
+            so_path = os.path.join(build_dir, f'kern_{nid}_{_h}.so')
+        except Exception as _e:
+            logger.warning("kernel source hash failed for node %d (%s); using nid-only name", nid, _e)
+            so_path = os.path.join(build_dir, f'kern_{nid}.so')
         if os.path.exists(so_path):
             kern_to_so[kid] = so_path
             nid_to_so[nid] = so_path

@@ -285,6 +285,18 @@ __global__ void scale_nhwc_broadcast_fp32_kernel(
 
 // FP16 GEMM: output = input @ weight^T  (row-major)
 // input: (M, K), weight: (N, K), output: (M, N)
+// Row-wise bias add for GEMM outputs: data[(m, n)] += bias[n]
+__global__ void bias_add_fp16_kernel(half* data, const float* __restrict__ bias, int total, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    data[i] = __float2half(__half2float(data[i]) + bias[i % N]);
+}
+__global__ void bias_add_fp32_kernel(float* data, const float* __restrict__ bias, int total, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    data[i] += bias[i % N];
+}
+
 __global__ void gemm_fp16_kernel(
     const half* __restrict__ input, const half* __restrict__ weight,
     half* __restrict__ output, int M, int K, int N
@@ -705,6 +717,7 @@ struct NodeDesc {
     half* gemm_w;
     half* gemm_out;
     int gemm_M, gemm_K, gemm_N;
+    float* gemm_bias;   // optional (N,) fp32 bias added after the GEMM (nullptr = none)
 
     // For alias (zero-cost: reshape/transpose — just pointer copy)
     half** alias_src;
@@ -798,6 +811,23 @@ SEngineExecutor* sengine_create() {
     e->cudnn = nullptr;  // lazy init — created on first cuDNN conv node
     cublasSetStream(e->cublas, e->stream);
     cublasSetMathMode(e->cublas, CUBLAS_TENSOR_OP_MATH);
+
+    // Orin sm_87: 128KB unified L1/smem. Memory-bound native kernels
+    // (IF/LIF/Add/Pool) benefit from max L1 cache (cudaSharedMemBankSizeDefault).
+    // Set carveout to prefer L1 for these streaming kernels.
+    // cudaFuncAttributePreferredSharedMemoryCarveout = 1
+    // 0 = no preference, 100 = max shared mem, cudaSharedmemCarveoutMaxL1 = 0
+    cudaFuncSetAttribute((void*)if_neuron_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 0);
+    cudaFuncSetAttribute((void*)lif_neuron_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 0);
+    cudaFuncSetAttribute((void*)add_fp16_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 0);
+    cudaFuncSetAttribute((void*)maxpool2d_nhwc_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 0);
+    cudaFuncSetAttribute((void*)global_avgpool_nhwc_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 0);
+    cudaFuncSetAttribute((void*)temporal_mean_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 0);
+    // FP32 variants
+    cudaFuncSetAttribute((void*)if_neuron_fp32_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 0);
+    cudaFuncSetAttribute((void*)lif_neuron_fp32_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 0);
+    cudaFuncSetAttribute((void*)add_fp32_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 0);
+
     return e;
 }
 
@@ -989,13 +1019,14 @@ void sengine_set_temporal_mean_node(SEngineExecutor* e, int nid,
 
 void sengine_set_gemm_node(SEngineExecutor* e, int nid,
                              half* input, half* weight, half* output,
-                             int M, int K, int N) {
+                             int M, int K, int N, float* bias) {
     auto& nd = e->nodes[nid];
     nd.type = KT_GEMM;
     nd.gemm_in = input;
     nd.gemm_w = weight;
     nd.gemm_out = output;
     nd.gemm_M = M; nd.gemm_K = K; nd.gemm_N = N;
+    nd.gemm_bias = bias;
 }
 
 void sengine_set_fused_attn_node(SEngineExecutor* e, int nid,
@@ -1301,9 +1332,10 @@ void sengine_execute(SEngineExecutor* e) {
         }
         case KT_GEMM: {
             // cuBLAS GEMM: C = A @ B^T (row-major via column-major trick)
+            cublasStatus_t gemm_st;
             if (e->is_fp32) {
                 const float alpha_f = 1.0f, beta_f = 0.0f;
-                cublasSgemm(e->cublas,
+                gemm_st = cublasSgemm(e->cublas,
                     CUBLAS_OP_T, CUBLAS_OP_N,
                     nd.gemm_N, nd.gemm_M, nd.gemm_K,
                     &alpha_f,
@@ -1314,7 +1346,7 @@ void sengine_execute(SEngineExecutor* e) {
             } else {
                 const half alpha_h = __float2half(1.0f);
                 const half beta_h = __float2half(0.0f);
-                cublasHgemm(e->cublas,
+                gemm_st = cublasHgemm(e->cublas,
                     CUBLAS_OP_T, CUBLAS_OP_N,
                     nd.gemm_N, nd.gemm_M, nd.gemm_K,
                     &alpha_h,
@@ -1322,6 +1354,20 @@ void sengine_execute(SEngineExecutor* e) {
                     nd.gemm_in, nd.gemm_K,
                     &beta_h,
                     nd.gemm_out, nd.gemm_N);
+            }
+            if (gemm_st != CUBLAS_STATUS_SUCCESS) {
+                fprintf(stderr, "[sengine] cuBLAS GEMM failed: status %d (M=%d K=%d N=%d)\n",
+                        (int)gemm_st, nd.gemm_M, nd.gemm_K, nd.gemm_N);
+            }
+            if (nd.gemm_bias) {
+                int total = nd.gemm_M * nd.gemm_N;
+                int thr = 256, blk = (total + thr - 1) / thr;
+                if (e->is_fp32)
+                    bias_add_fp32_kernel<<<blk, thr, 0, s>>>(
+                        (float*)nd.gemm_out, nd.gemm_bias, total, nd.gemm_N);
+                else
+                    bias_add_fp16_kernel<<<blk, thr, 0, s>>>(
+                        nd.gemm_out, nd.gemm_bias, total, nd.gemm_N);
             }
             break;
         }
@@ -1652,6 +1698,66 @@ void sengine_execute_checked(SEngineExecutor* e) {
             e->schedule_len = orig_len;
         }
     }
+}
+
+void sengine_setup_l2_persistence(SEngineExecutor* e, void** weight_ptrs,
+                                   size_t* weight_sizes, int n_weights) {
+    /**
+     * Configure L2 cache persistence for weight buffers (Ampere+, sm_87).
+     *
+     * On Jetson AGX Orin (4MB L2, LPDDR5), pinning weights in L2 avoids
+     * repeated DRAM fetches across T timesteps. Weights are the primary
+     * reuse target — activations are streaming.
+     *
+     * Sets cudaLimitPersistingL2CacheSize and per-stream access policy
+     * windows with cudaAccessPropertyPersisting for weight data.
+     */
+    if (n_weights == 0) return;
+
+    // Query max persisting L2 cache size
+    int max_persist = 0;
+    cudaDeviceGetAttribute(&max_persist, cudaDevAttrMaxPersistingL2CacheSize, 0);
+    if (max_persist == 0) return;
+
+    // Calculate total weight bytes
+    size_t total_weight_bytes = 0;
+    for (int i = 0; i < n_weights; i++) {
+        total_weight_bytes += weight_sizes[i];
+    }
+
+    // Reserve up to 75% of max L2 for weights
+    size_t persist_budget = (size_t)(max_persist * 0.75);
+    size_t persist_size = (total_weight_bytes < persist_budget) ? total_weight_bytes : persist_budget;
+
+    cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persist_size);
+
+    // Set access policy window on the execution stream for the largest
+    // contiguous weight block. The L2 cache controller will preferentially
+    // keep these lines resident.
+    // Find largest weight buffer
+    size_t max_buf_size = 0;
+    void* max_buf_ptr = nullptr;
+    for (int i = 0; i < n_weights; i++) {
+        if (weight_sizes[i] > max_buf_size) {
+            max_buf_size = weight_sizes[i];
+            max_buf_ptr = weight_ptrs[i];
+        }
+    }
+
+    if (max_buf_ptr && max_buf_size > 0) {
+        cudaStreamAttrValue stream_attr;
+        memset(&stream_attr, 0, sizeof(stream_attr));
+        stream_attr.accessPolicyWindow.base_ptr = max_buf_ptr;
+        stream_attr.accessPolicyWindow.num_bytes = max_buf_size;
+        stream_attr.accessPolicyWindow.hitRatio = 1.0f;
+        stream_attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+        stream_attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+        cudaStreamSetAttribute(e->stream, cudaStreamAttributeAccessPolicyWindow,
+                               &stream_attr);
+    }
+
+    fprintf(stderr, "[sengine] L2 persistence: %zu KB / %d KB max for %zu KB weights\n",
+            persist_size / 1024, max_persist / 1024, total_weight_bytes / 1024);
 }
 
 void sengine_capture_graph(SEngineExecutor* e) {

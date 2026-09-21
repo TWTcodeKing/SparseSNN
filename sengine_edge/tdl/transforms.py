@@ -77,6 +77,11 @@ class TDLTransform:
         if self._original_fwd is not None:
             self.model.forward = self._original_fwd
             self._original_fwd = None
+        if hasattr(self.model, '_tdl_orig_forward'):
+            # Undo the top-level patch made by _wrap_bare_convs_for_tdl
+            self.model.forward = self.model._tdl_orig_forward
+            del self.model._tdl_orig_forward
+            self.model._tdl_forward_4d = False
 
         # Restore DSSA modules (TDL-3)
         for name, (parent, attr, orig_module) in self._dssa_replacements.items():
@@ -897,6 +902,11 @@ class TDLTransform:
         """Fallback: wrap original forward with 4D input handling."""
         T = self.T
         orig = self._original_fwd
+        if getattr(self.model, '_tdl_forward_4d', False):
+            # _wrap_bare_convs_for_tdl already installed a 4D forward that
+            # tiles the input itself (VGG style). Wrapping it again would tile
+            # T*T times and export a graph with a T*B "batch".
+            return
 
         def forward_4d(x):
             x = x.repeat(T, 1, 1, 1)
@@ -1022,6 +1032,9 @@ def _wrap_bare_convs_for_tdl(model: nn.Module, T: int, verbose: bool = False):
             x = x.reshape(T, B_val, *x.shape[1:]).mean(0)
             return x
 
+        if not hasattr(model, '_tdl_orig_forward'):
+            model._tdl_orig_forward = orig_forward
+        model._tdl_forward_4d = True
         model.forward = _new_forward
 
     elif hasattr(model, 'features') and hasattr(model, 'classifier'):
@@ -1043,6 +1056,9 @@ def _wrap_bare_convs_for_tdl(model: nn.Module, T: int, verbose: bool = False):
             x = model.classifier(x)
             return x
 
+        if not hasattr(model, '_tdl_orig_forward'):
+            model._tdl_orig_forward = orig_forward
+        model._tdl_forward_4d = True
         model.forward = _new_forward
         n_patched += 1  # count top-level forward as patched
 

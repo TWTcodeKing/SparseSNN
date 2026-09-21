@@ -264,7 +264,11 @@ _DATASET_CONFIG = {
     'gen1':       {'num_classes': 2,    'img_size': 320, 'in_channels': 3, 'task': 'detection'},
     'sst2':       {'num_classes': 2,    'img_size': 1,   'in_channels': 1, 'task': 'nlp', 'seq_len': 128},
     'mrpc':       {'num_classes': 2,    'img_size': 1,   'in_channels': 1, 'task': 'nlp', 'seq_len': 128},
-    'ntufi_humanid': {'num_classes': 14, 'img_size': 32, 'in_channels': 3},
+    'ntufi_humanid': {'num_classes': 14, 'img_size': (112, 128), 'in_channels': 3},
+    # UT-HAR WiFi CSI (SenseFi preprocessed): one static (1, 250, 90) sample per clip
+    'ut_har':     {'num_classes': 7,    'img_size': (250, 90),  'in_channels': 1},
+    # UrbanSound8K: log-mel spectrogram (1, 64 mel, 176 frames) per 4s clip
+    'urbansound8k': {'num_classes': 10, 'img_size': (64, 176),  'in_channels': 1},
 }
 
 
@@ -321,9 +325,23 @@ def build_dataloaders(dataset_name, data_root, batch_size, img_size=None,
     elif dataset_name == 'ntufi_humanid':
         from datasets import ntufi_humanid_dataloaders
         T = kwargs.pop('T', kwargs.pop('frames_number', 4))
+        spatial = img_size if isinstance(img_size, tuple) else (img_size, img_size)
         return ntufi_humanid_dataloaders(
-            data_root, batch_size, T=T, spatial_size=(img_size, img_size),
+            data_root, batch_size, T=T, spatial_size=spatial,
             num_workers=num_workers, distributed=distributed)
+    elif dataset_name == 'ut_har':
+        from datasets import ut_har_dataloaders
+        kwargs.pop('T', None); kwargs.pop('frames_number', None)
+        return ut_har_dataloaders(
+            data_root, batch_size, num_workers=num_workers,
+            distributed=distributed, **kwargs)
+    elif dataset_name == 'urbansound8k':
+        from datasets import urbansound8k_dataloaders
+        kwargs.pop('T', None); kwargs.pop('frames_number', None)
+        spatial = img_size if isinstance(img_size, tuple) else (img_size, img_size)
+        return urbansound8k_dataloaders(
+            data_root, batch_size, n_mels=spatial[0], n_frames=spatial[1],
+            num_workers=num_workers, distributed=distributed, **kwargs)
     elif dataset_name in ('sst2', 'mrpc', 'cola', 'qnli'):
         from datasets import glue_dataloaders
         seq_len = kwargs.pop('seq_len', cfg.get('seq_len', 128))

@@ -13,3 +13,6 @@ from .dvs128gesture import dvs128gesture_dataloaders
 from .coco import coco_dataloaders
 from .gen1 import gen1_dataloaders
 from .glue import glue_dataloaders
+from .ntufi_humanid import ntufi_humanid_dataloaders
+from .ut_har import ut_har_dataloaders
+from .urbansound8k import urbansound8k_dataloaders

@@ -29,19 +29,27 @@ from models.neurons import reset_net
 
 
 def export_model(model_name: str, output_dir: str, T: int = 4,
-                 dataset: str = 'imagenet', img_size: int | None = None,
+                 dataset: str = 'imagenet', img_size=None,
                  config: str | None = None, checkpoint: str | None = None):
     """Export one model to plugin-mode ONNX."""
     device = torch.device('cuda:0')
     os.makedirs(output_dir, exist_ok=True)
 
+    # Resolve img_size from dataset config if not specified
+    from tengine.utils import get_dataset_config
+    ds_cfg = get_dataset_config(dataset)
     if img_size is None:
-        img_size = 32 if 'cifar' in dataset else 224
+        img_size = ds_cfg['img_size']
+    num_classes = ds_cfg['num_classes']
+    in_channels = ds_cfg['in_channels']
 
-    num_classes = 100 if 'cifar100' in dataset else (10 if 'cifar10' in dataset else 1000)
-    in_channels = 2 if 'dvs' in dataset else 3
+    # Normalize img_size to (H, W) tuple
+    if isinstance(img_size, (list, tuple)):
+        img_h, img_w = img_size
+    else:
+        img_h = img_w = img_size
 
-    print(f"\n=== Exporting {model_name} (T={T}, img={img_size}x{img_size}) ===")
+    print(f"\n=== Exporting {model_name} (T={T}, img={img_h}x{img_w}) ===")
 
     # Build model
     if config:
@@ -52,7 +60,7 @@ def export_model(model_name: str, output_dir: str, T: int = 4,
         cfg['num_classes'] = num_classes
         cfg['in_channels'] = in_channels
         cfg['T'] = T
-        cfg['img_size'] = img_size
+        cfg['img_size'] = img_h  # transformer builders expect int
         model = build_model_from_config(cfg)
     else:
         from tengine.utils import build_model
@@ -69,7 +77,7 @@ def export_model(model_name: str, output_dir: str, T: int = 4,
     else:
         print(f"  No checkpoint (random weights)")
 
-    input_shape = (1, in_channels, img_size, img_size)
+    input_shape = (1, in_channels, img_h, img_w)
     tag = f"{model_name}_{dataset}"
     plugin_path = os.path.join(output_dir, f"{tag}_plugin.onnx")
 

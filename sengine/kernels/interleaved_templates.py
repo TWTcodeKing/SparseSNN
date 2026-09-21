@@ -84,8 +84,14 @@ def conv1x1_bn_if(
                                             T.float32(1), T.float32(0))
                         mem[i, j] = (T.float32(1) - sp) * h + sp * T.float32(v_reset)
                         os_[i, j] = T.cast(sp, io_dtype)
-                T.copy(os_, o[t * M + by * block_M, bx * block_N],
-                       eviction_policy="evict_first")
+                if M % block_M == 0 and F % block_N == 0:
+                    T.copy(os_, o[t * M + by * block_M, bx * block_N],
+                           eviction_policy="evict_first")
+                else:
+                    for i, j in T.Parallel(block_M, block_N):
+                        m = by * block_M + i; f = bx * block_N + j
+                        if m < M and f < F:
+                            o[t * M + m, f] = os_[i, j]
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i; f = bx * block_N + j
                 if m < M and f < F: state[m, f] = mem[i, j]
@@ -151,8 +157,14 @@ def conv1x1_bn_lif(
                                             T.float32(1), T.float32(0))
                         mem[i, j] = (T.float32(1) - sp) * h + sp * T.float32(v_reset)
                         os_[i, j] = T.cast(sp, io_dtype)
-                T.copy(os_, o[t * M + by * block_M, bx * block_N],
-                       eviction_policy="evict_first")
+                if M % block_M == 0 and F % block_N == 0:
+                    T.copy(os_, o[t * M + by * block_M, bx * block_N],
+                           eviction_policy="evict_first")
+                else:
+                    for i, j in T.Parallel(block_M, block_N):
+                        m = by * block_M + i; f = bx * block_N + j
+                        if m < M and f < F:
+                            o[t * M + m, f] = os_[i, j]
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i; f = bx * block_N + j
                 if m < M and f < F: state[m, f] = mem[i, j]
@@ -217,8 +229,14 @@ def conv1x1_bn_add_lif(
                                             T.float32(1), T.float32(0))
                         mem[i, j] = (T.float32(1) - sp) * h + sp * T.float32(v_reset)
                         os_[i, j] = T.cast(sp, io_dtype)
-                T.copy(os_, o[t * M + by * block_M, bx * block_N],
-                       eviction_policy="evict_first")
+                if M % block_M == 0 and F % block_N == 0:
+                    T.copy(os_, o[t * M + by * block_M, bx * block_N],
+                           eviction_policy="evict_first")
+                else:
+                    for i, j in T.Parallel(block_M, block_N):
+                        m = by * block_M + i; f = bx * block_N + j
+                        if m < M and f < F:
+                            o[t * M + m, f] = os_[i, j]
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i; f = bx * block_N + j
                 if m < M and f < F: state[m, f] = mem[i, j]
@@ -283,8 +301,14 @@ def conv1x1_bn_if_add(
                         mem[i, j] = (T.float32(1) - sp) * h + sp * T.float32(v_reset)
                         rv = T.cast(r[t * M + m, f], T.float32)
                         os_[i, j] = T.cast(sp + rv, io_dtype)
-                T.copy(os_, o[t * M + by * block_M, bx * block_N],
-                       eviction_policy="evict_first")
+                if M % block_M == 0 and F % block_N == 0:
+                    T.copy(os_, o[t * M + by * block_M, bx * block_N],
+                           eviction_policy="evict_first")
+                else:
+                    for i, j in T.Parallel(block_M, block_N):
+                        m = by * block_M + i; f = bx * block_N + j
+                        if m < M and f < F:
+                            o[t * M + m, f] = os_[i, j]
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i; f = bx * block_N + j
                 if m < M and f < F: state[m, f] = mem[i, j]
@@ -357,8 +381,14 @@ def conv1x1_bn_if_add_lif(
                                              T.float32(1), T.float32(0))
                         m2[i, j] = (T.float32(1) - sp2) * h2 + sp2 * T.float32(v_reset)
                         os_[i, j] = T.cast(sp2, io_dtype)
-                T.copy(os_, o[t * M + by * block_M, bx * block_N],
-                       eviction_policy="evict_first")
+                if M % block_M == 0 and F % block_N == 0:
+                    T.copy(os_, o[t * M + by * block_M, bx * block_N],
+                           eviction_policy="evict_first")
+                else:
+                    for i, j in T.Parallel(block_M, block_N):
+                        m = by * block_M + i; f = bx * block_N + j
+                        if m < M and f < F:
+                            o[t * M + m, f] = os_[i, j]
             for i, j in T.Parallel(block_M, block_N):
                 m = by * block_M + i; f = bx * block_N + j
                 if m < M and f < F:

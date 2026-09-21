@@ -28,7 +28,8 @@ typedef enum {
     KT_GEMM           = 7,   /* BLAS GEMM (or naive fallback)             */
     KT_SOFTMAX        = 8,   /* Numerically stable softmax                */
     KT_SKIP           = 9,   /* No-op (absorbed into fusion)              */
-    KT_ALIAS          = 10   /* Pointer alias (reshape/flatten, zero-cost)*/
+    KT_ALIAS          = 10,  /* Pointer alias (reshape/flatten, zero-cost)*/
+    KT_CONV           = 11   /* Native NHWC Conv+BN(+IF/LIF), im2col+BLAS  */
 } KernelType;
 
 /* ─── TVM kernel handle (loaded via dlopen) ─── */
@@ -84,6 +85,14 @@ typedef struct {
 
     /* Softmax */
     int sm_outer, sm_inner;
+    /* GEMM bias (optional, (N,) added after the GEMM) */
+    float* gemm_bias;
+    /* Native conv (NHWC, fused BN + neuron) */
+    float* conv_in; float* conv_w; float* conv_scale; float* conv_bias;
+    float* conv_mem; float* conv_out; float* conv_col;   /* conv_col owned by executor */
+    int conv_B, conv_H, conv_W, conv_Cin, conv_F, conv_T, conv_KH, conv_KW, conv_pad, conv_stride;
+    int conv_neuron;          /* 0 none, 1 IF, 2 LIF */
+    float conv_vth, conv_vreset, conv_rt;
 } NodeDesc;
 
 /* ─── Executor state ─── */
@@ -135,6 +144,18 @@ void sengine_cpu_reset_membranes(CPUExecutor* e);
 
 /** Register a membrane buffer for reset tracking. */
 void sengine_cpu_register_membrane(CPUExecutor* e, float* ptr, int size);
+
+/* Native fused conv node: allocates the im2col scratch (M*K floats). */
+void sengine_cpu_set_conv_node(CPUExecutor* e, int nid,
+                               float* input, float* weight, float* scale, float* bias,
+                               float* membrane, float* output,
+                               int B, int H, int W, int C_in, int F, int T,
+                               int KH, int KW, int pad, int stride,
+                               int neuron, float v_threshold, float v_reset, float recip_tau);
+/** Optional bias for a GEMM node (call after sengine_cpu_set_gemm_node). */
+void sengine_cpu_set_gemm_bias(CPUExecutor* e, int nid, float* bias);
+/** Set BLAS (OpenBLAS) thread count if the symbol is available. */
+void sengine_blas_set_threads(int n);
 
 /* ─── Node registration (one per kernel type) ─── */
 

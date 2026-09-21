@@ -92,6 +92,54 @@ class CPUEngine:
                 self._tensor_bufs[name] = np.zeros(n, dtype=np.float32)
                 self._input_buf = self._tensor_bufs[name]
 
+        # --- 2b. Alias zero-cost / absorbed nodes onto their data input ---
+        # Reshape/Flatten/Identity/absorbed-neuron outputs are the same bytes as
+        # their input; downstream nodes resolve buffers by tensor name, so point
+        # the output names at the producer's buffer. The Tile node is the
+        # engine input (T-replicated NHWC) and keeps its own buffer.
+        self._input_name = None
+        for nid in ir.topo_order:
+            node = ir.nodes.get(nid)
+            if node is None or not node.output_names:
+                continue
+            if node.op_type == OpType.Tile:
+                # Not in the BA-MTTS schedule (zero-cost), so the memory plan
+                # has no slot for it: allocate the T-replicated input here.
+                self._input_name = node.output_names[0]
+                if self._input_name not in self._tensor_bufs:
+                    n = _numel(node.output_shapes[0]) if node.output_shapes else 0
+                    if n <= 0:
+                        n = _numel(ir.model_input_shape) * self.T
+                    self._tensor_bufs[self._input_name] = np.zeros(max(n, 1), dtype=np.float32)
+                continue
+            kv = node.assigned_kernel
+            if not (kv in (CPUKernelVariant.ZeroCost, CPUKernelVariant.Skip)
+                    or node.op_type == OpType.Identity):
+                continue
+            src = next((n for n in node.input_names
+                        if n not in ir.weights and n in self._tensor_bufs), None)
+            if src is None:
+                continue
+            for out in node.output_names:
+                self._tensor_bufs[out] = self._tensor_bufs[src]
+        if self._input_name is None:
+            for name in graph_inputs:
+                self._input_name = name
+                break
+        self._input_buf = self._tensor_bufs.get(self._input_name)
+        # Graph output: a produced tensor nobody consumes (prefer the last one in topo order)
+        self._output_name = None
+        for nid in reversed(ir.topo_order):
+            node = ir.nodes.get(nid)
+            if node is None:
+                continue
+            for out in node.output_names:
+                if out not in consumed and out in self._tensor_bufs:
+                    self._output_name = out
+                    break
+            if self._output_name is not None:
+                break
+
         # --- 3. Allocate membrane state buffers ---
         for nid, node in ir.nodes.items():
             if node.is_stateful and node.neuron_params:
@@ -121,6 +169,10 @@ class CPUEngine:
 
             elif kv.name.startswith("TVM") and nid in self.kernel_map:
                 self._register_tvm_node(exe, nid, node, tvm_indices)
+
+            elif kv in (CPUKernelVariant.NativeConvBNIF, CPUKernelVariant.NativeConvBNLIF,
+                        CPUKernelVariant.NativeConvBN):
+                self._register_native_conv(exe, nid, node)
 
             elif kv == CPUKernelVariant.NativeIF:
                 self._register_native_neuron(exe, nid, node, is_lif=False)
@@ -234,6 +286,63 @@ class CPUEngine:
         args = [data_buf, w_buf.ravel(), scale_buf, bias_buf, mem_buf, out_buf, new_mem_buf]
         exe.set_tvm_node(nid, tvm_idx, args)
 
+    def _register_native_conv(self, exe, nid, node):
+        """Register the native NHWC Conv+BN(+neuron) kernel for a Conv2d node."""
+        cp = node.conv_params
+        inp_buf = self._get_input_buf(node)
+        out_buf = self._get_output_buf(node)
+        in_shape = node.input_shapes[0] if node.input_shapes else ()
+        if len(in_shape) != 4:
+            log.warning("Native conv #%d: missing 4D input shape, skipping", nid)
+            exe.set_skip_node(nid); return
+        TB, C_in, H, W = in_shape
+        T = self.T
+        B = max(TB // T, 1)
+        F = cp.out_channels
+        if cp.groups != 1 or cp.kernel_h != cp.kernel_w or cp.stride_h != cp.stride_w \
+                or cp.pad_h != cp.pad_w or cp.dilation_h != 1:
+            raise NotImplementedError(f"native conv #{nid}: unsupported conv params {cp}")
+        # Weight (F, C_in, KH, KW) -> (KH, KW, C_in, F) == (K, F) row-major
+        w_name = node.weight_info.name if node.weight_info else ""
+        w = np.asarray(self.ir.weights[w_name], dtype=np.float32).reshape(F, C_in, cp.kernel_h, cp.kernel_w)
+        w_kf = np.ascontiguousarray(w.transpose(2, 3, 1, 0)).reshape(-1)
+        self._weight_bufs[f"__conv_w_{nid}"] = w_kf
+        scale = np.ascontiguousarray(np.array(node.bn_scale, dtype=np.float32)) if node.bn_scale \
+            else np.ones(F, dtype=np.float32)
+        bias = np.ascontiguousarray(np.array(node.bn_bias, dtype=np.float32)) if node.bn_bias \
+            else np.zeros(F, dtype=np.float32)
+        if node.bias_info is not None and node.bias_info.name in self.ir.weights:
+            # conv bias without BN: y = scale*(conv + b) + bias
+            b = np.asarray(self.ir.weights[node.bias_info.name], dtype=np.float32).reshape(-1)
+            bias = bias + scale * b
+        self._weight_bufs[f"__conv_scale_{nid}"] = scale
+        self._weight_bufs[f"__conv_bias_{nid}"] = bias
+        # Neuron (fused) + membrane (M, F)
+        neuron, v_th, v_reset, recip_tau = 0, 1.0, 0.0, 1.0
+        mem_buf = np.zeros(1, dtype=np.float32)
+        fg_id = node.fusion_group_id
+        if fg_id >= 0 and fg_id < len(self.ir.fusion_groups):
+            nn = self.ir.nodes.get(self.ir.fusion_groups[fg_id].neuron_node_id)
+            npar = nn.neuron_params if nn is not None else None
+            if npar is not None:
+                neuron = 2 if npar.neuron_type == NeuronType.LIF else 1
+                v_th = float(npar.v_threshold)
+                v_reset = float(npar.v_reset if npar.hard_reset else 0.0)
+                recip_tau = (1.0 / float(npar.tau)) if (neuron == 2 and npar.tau > 0) else 1.0
+            OH = (H + 2 * cp.pad_h - cp.kernel_h) // cp.stride_h + 1
+            OW = (W + 2 * cp.pad_w - cp.kernel_w) // cp.stride_w + 1
+            need = B * OH * OW * F
+            mem_buf = self._membranes.get(nn.id) if nn is not None else None
+            if mem_buf is None or mem_buf.size < need:
+                mem_buf = np.zeros(need, dtype=np.float32)
+                if nn is not None:
+                    self._membranes[nn.id] = mem_buf
+                exe.register_membrane(mem_buf)
+        self._weight_bufs[f"__conv_mem_{nid}"] = mem_buf
+        exe.set_conv_node(nid, inp_buf, w_kf, scale, bias, mem_buf, out_buf,
+                          B, H, W, C_in, F, T, cp.kernel_h, cp.kernel_w, cp.pad_h, cp.stride_h,
+                          neuron, v_th, v_reset, recip_tau)
+
     def _register_native_neuron(self, exe, nid, node, is_lif=False):
         """Register a standalone native IF/LIF neuron."""
         inp_buf = self._get_input_buf(node)
@@ -288,15 +397,20 @@ class CPUEngine:
         M = in_shape[0] if len(in_shape) >= 1 else 1
         K = in_shape[1] if len(in_shape) >= 2 else (in_shape[0] if in_shape else 1)
         N = out_shape[1] if len(out_shape) >= 2 else (out_shape[0] if out_shape else 1)
-        # Handle transB
+        # The C kernel computes C = A @ B^T with B stored (N, K) row-major,
+        # which is exactly ONNX Gemm(transB=1). For transB=0 the weight is
+        # (K, N) and must be transposed once at build time.
         transB = node.gemm_params.get("transB", 0) if node.gemm_params else 0
-        if transB and node.weight_info and node.weight_info.shape:
+        if not transB and node.weight_info and node.weight_info.shape:
             ws = node.weight_info.shape
-            # ONNX Gemm with transB: weight is (N, K), need to transpose
             w_buf = np.ascontiguousarray(w_buf.reshape(ws).T)
             self._weight_bufs[f"__gemm_w_{nid}"] = w_buf
 
         exe.set_gemm_node(nid, inp_buf, w_buf.ravel(), out_buf, M, K, N)
+        if b_buf is not None:
+            b32 = np.ascontiguousarray(np.asarray(b_buf, dtype=np.float32).reshape(-1))
+            self._weight_bufs[f"__gemm_b_{nid}"] = b32
+            exe.set_gemm_bias(nid, b32)
 
     def _register_native_maxpool(self, exe, nid, node):
         """Register a native MaxPool node."""
@@ -353,11 +467,35 @@ class CPUEngine:
     # ─── Public API ───────────────────────────────────────────
 
     def infer(self, input_data: np.ndarray) -> np.ndarray:
-        """Run inference. Returns output numpy array."""
+        """Run inference on (B, C, H, W) NCHW float32 input. Returns (B, ...) output.
+
+        The input is converted to NHWC and replicated T times (direct
+        encoding) into the Tile node's buffer, exactly like the GPU engine.
+        """
         self._setup_executor()
+        x = np.asarray(input_data, dtype=np.float32)
+        if x.ndim == 4:
+            x = x.transpose(0, 2, 3, 1)  # NCHW -> NHWC
+        x = np.ascontiguousarray(x).reshape(-1)
+        buf = self._input_buf
+        if buf is None:
+            raise RuntimeError("engine input buffer not found")
+        if buf.size >= x.size * self.T:
+            buf[:x.size * self.T] = np.tile(x, self.T)
+        else:
+            buf[:min(buf.size, x.size)] = x[:buf.size]
         self._executor.reset_membranes()
         self._executor.execute()
-        return np.zeros(self.ir.model_output_shape or (1,), dtype=np.float32)
+        out = self._tensor_bufs.get(self._output_name)
+        if out is None:
+            return np.zeros(self.ir.model_output_shape or (1,), dtype=np.float32)
+        shape = [int(d) for d in (self.ir.model_output_shape or ())]
+        if shape and shape[0] == 0:
+            shape[0] = self.batch_size
+        n = int(np.prod(shape)) if shape else out.size
+        if n <= 0 or n > out.size:
+            return out.copy()
+        return out[:n].reshape(shape).copy()
 
     def benchmark(self, warmup: int = 50, iters: int = 200) -> float:
         """Benchmark latency. Returns average ms per inference."""
@@ -393,10 +531,14 @@ class CPUEngineBuilder:
         log.info("Optimizing IR")
         optimize_ir(ir, batch_size=self.batch_size, T=self.T)
 
-        log.info("Compiling TVM kernels")
-        compiler = TVMCompiler(ir, T=self.T, batch_size=self.batch_size,
-                                target=self.target)
-        kernel_map = compiler.compile_all()
+        if any(n.assigned_kernel.name.startswith("TVM") for n in ir.nodes.values()):
+            log.info("Compiling TVM kernels")
+            compiler = TVMCompiler(ir, T=self.T, batch_size=self.batch_size,
+                                    target=self.target)
+            kernel_map = compiler.compile_all()
+        else:
+            log.info("No TVM kernels needed (native conv backend)")
+            kernel_map = {}
 
         log.info("Building BA-MTTS schedule")
         schedule = build_schedule(ir)
@@ -417,8 +559,11 @@ class CPUEngineBuilder:
         t0 = time.time()
         ir, schedule, T, batch_size = load_sengine_cpu(path)
 
-        compiler = TVMCompiler(ir, T=T, batch_size=batch_size)
-        kernel_map = compiler.compile_all()
+        if any(n.assigned_kernel.name.startswith("TVM") for n in ir.nodes.values()):
+            compiler = TVMCompiler(ir, T=T, batch_size=batch_size)
+            kernel_map = compiler.compile_all()
+        else:
+            kernel_map = {}
         mem_plan = plan_memory(ir, execution_order=schedule)
 
         elapsed = time.time() - t0

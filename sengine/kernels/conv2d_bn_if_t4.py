@@ -640,8 +640,14 @@ def stem_conv_bn_lif_interleaved_kernel(
                         data_shared[i, j] = T.if_then_else(
                             ib, data[n_idx, ih, iw, cin], io_dtype(0))
 
-                    T.copy(weight_flat[k_iter * block_K, bx * block_N],
-                           weight_shared)
+                    # Bounds-guarded weight tile load (elementwise, no static branch inside
+                    # T.Pipelined): K_red = KH*KW*16 = 144 is not a multiple of block_K, so a
+                    # plain T.copy reads past the (K_red, F) weight buffer (garbage/NaN, faults).
+                    for wi, wj in T.Parallel(block_K, block_N):
+                        wk = k_iter * block_K + wi
+                        wf = bx * block_N + wj
+                        weight_shared[wi, wj] = T.if_then_else(
+                            (wk < K_red) and (wf < F), weight_flat[wk, wf], io_dtype(0))
                     T.gemm(data_shared, weight_shared, acc,
                            policy=_warp_policy(block_M, block_N))
 
@@ -657,8 +663,15 @@ def stem_conv_bn_lif_interleaved_kernel(
                         mem[i, j] = (T.float32(1) - sp) * h + sp * T.float32(v_reset)
                         os_[i, j] = T.cast(sp, io_dtype)
 
-                T.copy(os_, spikes_flat[t * M_per_t + by * block_M,
-                                         bx * block_N])
+                # Guarded store: a full-tile copy would spill rows past M_per_t into the
+                # next timestep's region when M_per_t % block_M != 0 (e.g. 250x90 inputs).
+                if M_per_t % block_M == 0 and F % block_N == 0:
+                    T.copy(os_, spikes_flat[t * M_per_t + by * block_M, bx * block_N])
+                else:
+                    for i, j in T.Parallel(block_M, block_N):
+                        m = by * block_M + i; f = bx * block_N + j
+                        if m < M_per_t and f < F:
+                            spikes_flat[t * M_per_t + m, f] = os_[i, j]
 
             # Write final membrane back
             for i, j in T.Parallel(block_M, block_N):
@@ -1059,8 +1072,12 @@ def conv2d_bn_if_interleaved_kernel(
     block_M, block_N, block_K, num_stages, threads,
     v_threshold=1.0, v_reset=0.0,
     io_dtype=T.float16,
+    recip_tau=None,
 ):
-    """Interleaved Conv3x3+BN+IF with per-CTA T-loop.
+    """Interleaved Conv3x3+BN+IF/LIF with per-CTA T-loop.
+
+    recip_tau=None → IF (h = mem + x); recip_tau=1/tau → LIF
+    (h = (1 - 1/tau) * mem + (1/tau) * x), matching models.neurons.LIFNeuron.
 
     Same architecture as conv1x1_bn_if_interleaved_kernel but with im2col
     gather for KxK convolutions. Grid covers B*OH*OW spatial positions,
@@ -1074,6 +1091,9 @@ def conv2d_bn_if_interleaved_kernel(
     M_per_t = B * OH * OW
     K_red = KH * KW * C_in
     TB = T_steps * B
+    # IF: decay=1, rt=1 (pure integrate). LIF: decay=1-1/tau, rt=1/tau.
+    _rt = float(recip_tau) if recip_tau is not None else 1.0
+    _decay = (1.0 - _rt) if recip_tau is not None else 1.0
 
     @T.prim_func
     def main(
@@ -1129,6 +1149,8 @@ def conv2d_bn_if_interleaved_kernel(
                         data_shared[i, j] = T.if_then_else(
                             ib, data[n_idx, ih, iw, cin], io_dtype(0))
 
+                    # NOTE: K_red = 9*C_in is a multiple of block_K for C_in >= 64; the
+                    # stem kernel (C_in padded to 16) uses a bounds-guarded load instead.
                     T.copy(weight_flat[k_iter * block_K, bx * block_N],
                            weight_shared)
                     T.gemm(data_shared, weight_shared, acc, policy=_warp_policy(block_M, block_N))
@@ -1139,7 +1161,7 @@ def conv2d_bn_if_interleaved_kernel(
                     f = bx * block_N + j
                     if m < M_per_t and f < F:
                         bn_out = acc[i, j] * bn_scale[f] + bn_bias[f]
-                        h = mem_frag[i, j] + bn_out
+                        h = T.float32(_decay) * mem_frag[i, j] + T.float32(_rt) * bn_out
                         spike = T.if_then_else(
                             h >= T.float32(v_threshold),
                             T.float32(1), T.float32(0))
@@ -1147,8 +1169,15 @@ def conv2d_bn_if_interleaved_kernel(
                                           spike * T.float32(v_reset)
                         out_shared[i, j] = T.cast(spike, io_dtype)
 
-                T.copy(out_shared,
-                       spikes_flat[t * M_per_t + by * block_M, bx * block_N])
+                # Guarded store: a full-tile copy would spill rows past M_per_t into the
+                # next timestep's region when M_per_t % block_M != 0 (e.g. 250x90 inputs).
+                if M_per_t % block_M == 0 and F % block_N == 0:
+                    T.copy(out_shared, spikes_flat[t * M_per_t + by * block_M, bx * block_N])
+                else:
+                    for i, j in T.Parallel(block_M, block_N):
+                        m = by * block_M + i; f = bx * block_N + j
+                        if m < M_per_t and f < F:
+                            spikes_flat[t * M_per_t + m, f] = out_shared[i, j]
 
             # Write final membrane
             for i, j in T.Parallel(block_M, block_N):

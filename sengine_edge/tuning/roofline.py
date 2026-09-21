@@ -146,12 +146,17 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
         return [dict(block_M=32, block_N=64, block_K=max(16, min(32, K)),
                      num_stages=2, threads=128)]
 
-    # Ranking for Orin: grid coverage and occupancy dominate.
-    # With 16 SMs, wave efficiency is the #1 factor.
+    # Ranking for Orin: wave efficiency, grid coverage, and occupancy dominate.
+    # With 16 SMs, a grid of 17 CTAs wastes 15/16 SMs in the second wave.
     def _rank(cfg_tuple):
         cfg, grid, occ, area = cfg_tuple
         # Tile area: moderate cap — Orin can't saturate with huge tiles
         area_score = min(area, 4096)
+        # Wave efficiency: fraction of SMs utilized across all waves.
+        # grid=16 → 1.0, grid=17 → 17/32=0.53, grid=32 → 1.0, grid=33 → 0.52
+        active_slots = sm_count * occ if occ >= 1 else sm_count
+        n_waves = math.ceil(grid / active_slots)
+        wave_eff = grid / (n_waves * active_slots) if n_waves > 0 else 0.5
         # Grid coverage: critical on 16 SMs — penalize hard if < sm_count
         if grid >= sm_count * 2:
             grid_ok = 1.0
@@ -168,7 +173,8 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
         occ_score = 1.0 + 0.3 * min(occ, 4)
         # Pipeline depth bonus (Ampere cp.async)
         ns_bonus = 1.0 + 0.08 * (cfg['num_stages'] - 2)
-        return -(area_score * grid_ok * k_eff * occ_score * ns_bonus)
+        # Wave efficiency: grid=16 perfect, grid=17 wastes 47% of second wave
+        return -(area_score * grid_ok * wave_eff * k_eff * occ_score * ns_bonus)
 
     all_cfgs.sort(key=_rank)
 
@@ -184,16 +190,21 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
             break
 
     # Known-good configs for Orin (16 SMs, 100KB smem, Ampere cp.async)
+    # Research: fewer SMs → larger tiles per CTA to amortize overhead.
+    # Include 128x64/64x128 alongside moderate tiles for wave-aligned grids.
     known_good = [
-        # Primary: moderate tiles that fill 16 SMs well
+        # Large tiles: fewer CTAs but each CTA does more work (good for big GEMMs)
+        dict(block_M=128, block_N=64, block_K=32, num_stages=3, threads=256),
+        dict(block_M=64, block_N=128, block_K=32, num_stages=3, threads=256),
+        dict(block_M=128, block_N=64, block_K=64, num_stages=2, threads=256),
+        dict(block_M=64, block_N=128, block_K=64, num_stages=2, threads=256),
+        # Moderate tiles: good SM fill for medium GEMMs
         dict(block_M=64, block_N=64, block_K=32, num_stages=3, threads=128),
         dict(block_M=32, block_N=64, block_K=32, num_stages=3, threads=128),
         dict(block_M=64, block_N=64, block_K=64, num_stages=2, threads=128),
-        dict(block_M=64, block_N=128, block_K=32, num_stages=2, threads=128),
-        dict(block_M=128, block_N=64, block_K=32, num_stages=2, threads=128),
-        # Deeper pipeline for memory-bound shapes
-        dict(block_M=32, block_N=64, block_K=64, num_stages=4, threads=128),
+        # Deeper pipeline for memory-bound shapes (LPDDR5 high latency)
         dict(block_M=64, block_N=64, block_K=32, num_stages=4, threads=128),
+        dict(block_M=32, block_N=64, block_K=64, num_stages=4, threads=128),
         # Asymmetric tiles for narrow GEMMs
         dict(block_M=32, block_N=128, block_K=32, num_stages=2, threads=128),
         dict(block_M=128, block_N=32, block_K=32, num_stages=2, threads=128),

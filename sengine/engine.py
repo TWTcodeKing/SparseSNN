@@ -683,7 +683,9 @@ class SEngine:
                     M = input_buf.shape[0]
                     K = input_buf.shape[-1]
                     N = w.shape[0]
-                    exe.set_gemm_node(nid, p(input_buf), p(w), p(output_buf), M, K, N)
+                    bias = getattr(engine, 'gemm_biases', {}).get(nid)
+                    exe.set_gemm_node(nid, p(input_buf), p(w), p(output_buf), M, K, N,
+                                      p(bias) if bias is not None else 0)
                 else:
                     exe.set_skip_node(nid)
 

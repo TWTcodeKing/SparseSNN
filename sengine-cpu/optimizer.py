@@ -19,6 +19,22 @@ from sengine_cpu.ir import (
 )
 
 
+def _native_conv_backend() -> bool:
+    """True when conv layers should use the native C kernel instead of TVM.
+
+    SENGINE_CPU_BACKEND=native|tvm forces a choice; the default ('auto') uses
+    TVM only when its isolated interpreter exists on this machine.
+    """
+    import os
+    mode = os.environ.get("SENGINE_CPU_BACKEND", "auto").lower()
+    if mode == "native":
+        return True
+    if mode == "tvm":
+        return False
+    from sengine_cpu.build.tvm_compiler import TVM_PYTHON
+    return not os.path.exists(TVM_PYTHON)
+
+
 def optimize_ir(ir: EngineIR, batch_size: int = 1, T: int = 4) -> EngineIR:
     """Apply all optimization passes. Mutates ir in place."""
     log.info("Running optimization passes on %d nodes", len(ir.nodes))
@@ -370,6 +386,9 @@ def _compute_output_shape(node: Node, in_shapes: list[tuple], ir: EngineIR) -> t
         return (inp[0] * T,) + inp[1:] if inp else inp
 
     if node.op_type == OpType.TemporalMean:
+        if len(inp) == 5:
+            # (T, B, C, H, W) -> (B, C, H, W): reduce over the leading T axis
+            return inp[1:]
         if len(inp) >= 1:
             B = inp[0] // T if T > 0 else inp[0]
             return (max(B, 1),) + inp[1:]
@@ -395,6 +414,19 @@ def _compute_output_shape(node: Node, in_shapes: list[tuple], ir: EngineIR) -> t
                 else: known *= d
             if neg_idx >= 0 and known > 0:
                 result[neg_idx] = total // known
+            # The ONNX constant was traced at export batch size (1): if the
+            # element count no longer matches the runtime input, rescale the
+            # batch axis (dim 1 of a (T, B, ...) split, else dim 0).
+            prod = 1
+            for d in result:
+                prod *= d
+            if total > 0 and prod != total:
+                for idx in ((1, 0) if len(result) >= 5 else (0, 1)):
+                    if idx < len(result) and result[idx] > 0 and prod % result[idx] == 0:
+                        rest = prod // result[idx]
+                        if rest > 0 and total % rest == 0:
+                            result[idx] = total // rest
+                            break
             return tuple(result)
         if node.output_shapes: return node.output_shapes[0]
         return inp
@@ -450,7 +482,18 @@ def classify_bound_and_assign_cpu_kernels(ir: EngineIR, batch_size: int = 1):
             node.bound_type = BoundType.ZERO
 
         # --- CPU kernel assignment ---
-        if node.op_type == OpType.Conv2d:
+        if node.op_type == OpType.Conv2d and _native_conv_backend():
+            cp = node.conv_params
+            if node.fusion_group_id >= 0:
+                fg = ir.fusion_groups[node.fusion_group_id]
+                neuron_node = ir.nodes.get(fg.neuron_node_id)
+                nt = neuron_node.neuron_params.neuron_type if neuron_node and neuron_node.neuron_params else NeuronType.IF
+                node.assigned_kernel = (CPUKernelVariant.NativeConvBNIF if nt == NeuronType.IF
+                                        else CPUKernelVariant.NativeConvBNLIF)
+            else:
+                node.assigned_kernel = CPUKernelVariant.NativeConvBN
+
+        elif node.op_type == OpType.Conv2d:
             cp = node.conv_params
             if node.fusion_group_id >= 0:
                 # Fused with neuron — determine variant
@@ -583,6 +626,9 @@ def select_interleaved_vs_decomposed(ir: EngineIR, T: int = 4,
       FusionGroup: removed (conv.fusion_group_id = -1)
     """
     if not ir.fusion_groups:
+        return
+    if _native_conv_backend():
+        log.info("Native conv backend: all %d Conv->neuron groups stay fused", len(ir.fusion_groups))
         return
 
     n_fused = 0

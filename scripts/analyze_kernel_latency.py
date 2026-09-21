@@ -173,6 +173,10 @@ def main():
     parser.add_argument('--batch', type=int, default=4)
     parser.add_argument('--warmup', type=int, default=100)
     parser.add_argument('--iters', type=int, default=500)
+    parser.add_argument('--fusion', type=str, default='slicer', choices=['none', 'slicer'])
+    parser.add_argument('--fusion-rec', type=str, default=None,
+                        help='fusion recommendation JSON (default: .cache/fusion_rec_<tag>_T<T>_B<B>.json if present)')
+    parser.add_argument('--precision', type=str, default='fp16', choices=['fp16', 'fp32'])
     args = parser.parse_args()
 
     from sengine.build.engine_builder import EngineBuilder
@@ -187,7 +191,14 @@ def main():
     # Build engine
     print("Building engine...", flush=True)
     builder = EngineBuilder(args.onnx, T=args.T, batch_size=args.batch)
-    engine = builder.build(capture_graph=False)
+    rec = args.fusion_rec
+    if rec is None:
+        tag = os.path.basename(args.onnx).replace('_plugin.onnx', '')
+        cand = os.path.join('.cache', f'fusion_rec_{tag}_T{args.T}_B{args.batch}.json')
+        rec = cand if os.path.exists(cand) else None
+    print(f"Fusion: {args.fusion} | rec: {rec} | precision: {args.precision}", flush=True)
+    engine = builder.build(capture_graph=False, fusion=args.fusion, fusion_rec=rec,
+                           precision=args.precision)
 
     # Export .so files (reuse main build cache to avoid arch mismatch)
     cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),

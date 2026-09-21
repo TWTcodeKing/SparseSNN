@@ -285,6 +285,18 @@ __global__ void scale_nhwc_broadcast_fp32_kernel(
 
 // FP16 GEMM: output = input @ weight^T  (row-major)
 // input: (M, K), weight: (N, K), output: (M, N)
+// Row-wise bias add for GEMM outputs: data[(m, n)] += bias[n]
+__global__ void bias_add_fp16_kernel(half* data, const float* __restrict__ bias, int total, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    data[i] = __float2half(__half2float(data[i]) + bias[i % N]);
+}
+__global__ void bias_add_fp32_kernel(float* data, const float* __restrict__ bias, int total, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    data[i] += bias[i % N];
+}
+
 __global__ void gemm_fp16_kernel(
     const half* __restrict__ input, const half* __restrict__ weight,
     half* __restrict__ output, int M, int K, int N
@@ -705,6 +717,7 @@ struct NodeDesc {
     half* gemm_w;
     half* gemm_out;
     int gemm_M, gemm_K, gemm_N;
+    float* gemm_bias;   // optional (N,) fp32 bias added after the GEMM (nullptr = none)
 
     // For alias (zero-cost: reshape/transpose — just pointer copy)
     half** alias_src;
@@ -989,13 +1002,14 @@ void sengine_set_temporal_mean_node(SEngineExecutor* e, int nid,
 
 void sengine_set_gemm_node(SEngineExecutor* e, int nid,
                              half* input, half* weight, half* output,
-                             int M, int K, int N) {
+                             int M, int K, int N, float* bias) {
     auto& nd = e->nodes[nid];
     nd.type = KT_GEMM;
     nd.gemm_in = input;
     nd.gemm_w = weight;
     nd.gemm_out = output;
     nd.gemm_M = M; nd.gemm_K = K; nd.gemm_N = N;
+    nd.gemm_bias = bias;
 }
 
 void sengine_set_fused_attn_node(SEngineExecutor* e, int nid,
@@ -1301,9 +1315,10 @@ void sengine_execute(SEngineExecutor* e) {
         }
         case KT_GEMM: {
             // cuBLAS GEMM: C = A @ B^T (row-major via column-major trick)
+            cublasStatus_t gemm_st;
             if (e->is_fp32) {
                 const float alpha_f = 1.0f, beta_f = 0.0f;
-                cublasSgemm(e->cublas,
+                gemm_st = cublasSgemm(e->cublas,
                     CUBLAS_OP_T, CUBLAS_OP_N,
                     nd.gemm_N, nd.gemm_M, nd.gemm_K,
                     &alpha_f,
@@ -1314,7 +1329,7 @@ void sengine_execute(SEngineExecutor* e) {
             } else {
                 const half alpha_h = __float2half(1.0f);
                 const half beta_h = __float2half(0.0f);
-                cublasHgemm(e->cublas,
+                gemm_st = cublasHgemm(e->cublas,
                     CUBLAS_OP_T, CUBLAS_OP_N,
                     nd.gemm_N, nd.gemm_M, nd.gemm_K,
                     &alpha_h,
@@ -1322,6 +1337,20 @@ void sengine_execute(SEngineExecutor* e) {
                     nd.gemm_in, nd.gemm_K,
                     &beta_h,
                     nd.gemm_out, nd.gemm_N);
+            }
+            if (gemm_st != CUBLAS_STATUS_SUCCESS) {
+                fprintf(stderr, "[sengine] cuBLAS GEMM failed: status %d (M=%d K=%d N=%d)\n",
+                        (int)gemm_st, nd.gemm_M, nd.gemm_K, nd.gemm_N);
+            }
+            if (nd.gemm_bias) {
+                int total = nd.gemm_M * nd.gemm_N;
+                int thr = 256, blk = (total + thr - 1) / thr;
+                if (e->is_fp32)
+                    bias_add_fp32_kernel<<<blk, thr, 0, s>>>(
+                        (float*)nd.gemm_out, nd.gemm_bias, total, nd.gemm_N);
+                else
+                    bias_add_fp16_kernel<<<blk, thr, 0, s>>>(
+                        nd.gemm_out, nd.gemm_bias, total, nd.gemm_N);
             }
             break;
         }

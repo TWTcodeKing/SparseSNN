@@ -1,0 +1,11 @@
+Rank,Kernel,Duration (us),SM Occ %,TC Util %,DRAM %,FMA %
+1,__myl_ResSliSliResSliResSliResMulMulMulAdd...,1.2,77.1,0.0,37.0,4.6
+2,__myl_ResSliResSliResSliResSliMulMulMulAdd...,0.6,77.4,0.0,35.1,4.7
+3,sm75_xmma_fprop_implicit_gemm_f16f16_f16f1...,0.5,16.4,84.9,25.8,3.0
+4,sm80_xmma_fprop_implicit_gemm_f16f16_f16f1...,0.5,8.3,86.2,10.3,0.9
+5,__myl_Res_0xfc73331baa911e31700ed99a3e0ce95d,0.4,82.1,0.0,93.9,1.4
+6,__myl_ResSliSliResSliResSliResMulMulMulAdd...,0.3,78.3,0.0,29.7,4.7
+7,__myl_ResAddSliSliResSliResSliResMulMulMul...,0.3,87.0,0.0,93.8,11.0
+8,__myl_AddResSliSliResSliResSliResMulMulMul...,0.3,86.9,0.0,94.1,11.1
+9,sm80_xmma_fprop_implicit_gemm_f16f16_f16f1...,0.3,16.7,72.2,6.4,1.0
+10,__myl_ResMulMulAddAddEqlGtrOrCasRes_0xa85c...,0.3,91.5,0.0,50.2,6.2

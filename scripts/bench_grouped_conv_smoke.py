@@ -28,7 +28,7 @@ import torch
 import torch.nn.functional as F
 import tilelang.language as T
 
-from sengine.kernels.grouped_conv_bn import grouped_conv_bn_kernel
+from sengine.kernels.grouped_conv_bn import grouped_conv_bn_kernel, grouped_conv_bn_lif_kernel
 from sengine.tuning.roofline import select_config_roofline
 
 
@@ -171,6 +171,62 @@ def main():
                     print(f"     bK={bK:>3}: {ms_k:.3f} ms (K_iters={k_iters})")
                 except Exception as e:
                     print(f"     bK={bK:>3}: FAILED ({e})")
+
+        # ── 6. Interleaved fused GroupedConv+BN+LIF ──
+        if groups > 1:
+            print(f"\n  6. Interleaved GroupedConv+BN+LIF (fused, per-CTA T-loop):")
+            B_val = TB // 4  # T=4
+            T_steps = 4
+            M_per_t = B_val * OH * OW
+
+            def _compile_fused(cfg):
+                return grouped_conv_bn_lif_kernel(
+                    B=B_val, C_in=C_in, H=H, W=W, C_out=C_out,
+                    K=K, S=S, D=1, P=P, groups=groups, T_steps=T_steps,
+                    io_dtype=T.float16, recip_tau=0.5,
+                    **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
+
+            st_fused = torch.zeros(M_per_t, C_out, dtype=torch.float32, device=device)
+            fused_profile_args = (data, weight, st_fused, bn_s, bn_b)
+
+            print(f"     Autotuning fused kernel...")
+            t0 = time.time()
+            fused_cfg = select_config_roofline(
+                M_per_t=M_per_t, K=K_red, N=C_out_per_g, T_steps=T_steps,
+                compile_fn=_compile_fused, profile_args=fused_profile_args,
+                top_k=5, n_profile=200, n_membranes=1, bpe=2)
+            tune_t = time.time() - t0
+            print(f"     Config: bM={fused_cfg['block_M']} bN={fused_cfg['block_N']} "
+                  f"bK={fused_cfg['block_K']} latency={fused_cfg.get('latency_us',0):.1f}µs ({tune_t:.1f}s)")
+
+            kern_fused = _compile_fused(fused_cfg)
+            ms_fused = benchmark(lambda: kern_fused(data, weight, st_fused, bn_s, bn_b),
+                                 warmup=50, iters=300)
+            print(f"     Latency: {ms_fused:.3f} ms")
+
+            # Compare: decomposed = Conv+BN + separate IF
+            ms_decomp = ms_tl  # the autotuned decomposed Conv+BN
+            # Add IF/LIF cost (~7-50µs from validator)
+            if_input = torch.randn(TB, OH, OW, C_out, dtype=torch.float16, device=device)
+            if_mem = torch.zeros(M_per_t, C_out, dtype=torch.float32, device=device)
+            # Simple IF benchmark via PyTorch (approximation)
+            def _run_lif():
+                if_mem.zero_()
+                v = if_mem
+                for t_idx in range(T_steps):
+                    frame = if_input[t_idx*B_val:(t_idx+1)*B_val].reshape(-1, C_out).float()
+                    h = 0.5 * v + 0.5 * frame
+                    spike = (h >= 1.0).float()
+                    v = (1.0 - spike) * h
+                if_mem.copy_(v)
+            ms_lif = benchmark(_run_lif, warmup=20, iters=100)
+            ms_decomp_total = ms_tl + ms_lif
+
+            print(f"\n     Fused interleaved: {ms_fused:.3f} ms")
+            print(f"     Decomposed (conv+lif): {ms_decomp_total:.3f} ms (conv={ms_tl:.3f} + lif={ms_lif:.3f})")
+            print(f"     cuDNN decomposed:  {ms_cudnn + ms_lif:.3f} ms (cudnn={ms_cudnn:.3f} + lif={ms_lif:.3f})")
+            fused_vs_decomp = ms_fused / ms_decomp_total
+            print(f"     Fused/Decomposed:  {fused_vs_decomp:.2f}x ({'faster' if fused_vs_decomp < 1 else 'SLOWER'})")
 
         # ── Summary ──
         print(f"\n  Summary:")

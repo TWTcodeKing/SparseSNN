@@ -105,6 +105,16 @@ def save_sengine(path: str, ir: EngineIR, schedule: list[int],
         # Gemm params
         if node.gemm_params:
             nd["gemm_params"] = node.gemm_params
+        # Attention params
+        if node.attention_params:
+            ap = node.attention_params
+            nd["attention_params"] = {
+                "variant": ap.variant, "num_heads": ap.num_heads,
+                "head_dim": ap.head_dim, "scale": ap.scale,
+                "H": ap.H, "W": ap.W,
+                "attn_lif_tau": ap.attn_lif_tau,
+                "attn_lif_v_threshold": ap.attn_lif_v_threshold,
+            }
         # BN params: store as named weight blobs (not inline JSON)
         # to keep the header small for C++ parsing.
         if node.bn_scale is not None:
@@ -305,11 +315,19 @@ def load_sengine(path: str) -> tuple[EngineIR, list[int], int, int]:
             node.pool_params = nd["pool_params"]
         if "gemm_params" in nd:
             node.gemm_params = nd["gemm_params"]
-        # BN params
-        if "bn_scale" in nd:
-            node.bn_scale = nd["bn_scale"]
-        if "bn_bias" in nd:
-            node.bn_bias = nd["bn_bias"]
+        # Attention params
+        if "attention_params" in nd:
+            from sengine.ir import AttentionParams
+            node.attention_params = AttentionParams(**nd["attention_params"])
+        # BN params (stored as named weight blobs during save)
+        if "bn_scale_name" in nd:
+            w = ir.weights.get(nd["bn_scale_name"])
+            if w is not None:
+                node.bn_scale = w
+        if "bn_bias_name" in nd:
+            w = ir.weights.get(nd["bn_bias_name"])
+            if w is not None:
+                node.bn_bias = w
         # Weight info
         if "weight_name" in nd:
             node.weight_info = WeightInfo(

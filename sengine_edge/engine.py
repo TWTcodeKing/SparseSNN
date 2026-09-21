@@ -130,7 +130,7 @@ class SEngine:
         # 2. Export TileLang kernels as standalone .so
         if build_dir is None:
             build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                                     '.cache', f'sengine_B{batch_size}')
+                                     '.cache', f'sengine_edge_B{batch_size}')
         eng._kernel_so_map = export_all_kernels(
             eng._kernels, eng._ir, build_dir, nvcc=nvcc, arch=arch)
 
@@ -244,7 +244,7 @@ class SEngine:
         # 4. Export standalone .so + C++ executor
         if build_dir is None:
             build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                                     '.cache', f'sengine_B{batch_size}')
+                                     '.cache', f'sengine_edge_B{batch_size}')
         eng._kernel_so_map = export_all_kernels(
             eng._kernels, ir, build_dir, nvcc=nvcc, arch=arch)
         eng._setup_cpp_executor()
@@ -683,7 +683,9 @@ class SEngine:
                     M = input_buf.shape[0]
                     K = input_buf.shape[-1]
                     N = w.shape[0]
-                    exe.set_gemm_node(nid, p(input_buf), p(w), p(output_buf), M, K, N)
+                    bias = getattr(engine, 'gemm_biases', {}).get(nid)
+                    exe.set_gemm_node(nid, p(input_buf), p(w), p(output_buf), M, K, N,
+                                      p(bias) if bias is not None else 0)
                 else:
                     exe.set_skip_node(nid)
 

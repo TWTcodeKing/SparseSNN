@@ -3,7 +3,7 @@
 bench_snn_vgg9_cpu.py — Cross-platform SNN-VGG-9 CPU inference benchmark.
 
 Benchmarks sengine-cpu (MLAS), ONNX Runtime, OpenVINO, and ncnn
-on SNN-VGG-9 (T=4, B=1, 32×32 CIFAR-class input, 14 classes).
+on SNN-VGG-9 (T=4, B=1, 112×128 NTU-Fi-HumanID input, 14 classes).
 
 Portable across: AMD EPYC (AVX2/FMA3), Intel Xeon (AVX-512), ARM Cortex-A7 (NEON).
 
@@ -30,17 +30,17 @@ import numpy as np
 # ──────────────────────────────────────────────────────────────────────
 T = 4
 B = 1
-IMG_C, IMG_H, IMG_W = 3, 32, 32
+IMG_C, IMG_H, IMG_W = 3, 112, 128
 NUM_CLASSES = 14
 
 VGG9_LAYERS = [
-    # (C_in, C_out, H, W, has_pool)
-    (3,   64,  32, 32, True),
-    (64,  128, 16, 16, True),
-    (128, 256,  8,  8, False),
-    (256, 256,  8,  8, True),
-    (256, 512,  4,  4, False),
-    (512, 512,  4,  4, True),
+    # (C_in, C_out, H, W, has_pool) — shapes for 112×128 input
+    (3,   64,  112, 128, True),   # → pool → 56×64
+    (64,  128,  56,  64, True),   # → pool → 28×32
+    (128, 256,  28,  32, False),
+    (256, 256,  28,  32, True),   # → pool → 14×16
+    (256, 512,  14,  16, False),
+    (512, 512,  14,  16, True),   # → pool → 7×8
 ]
 
 CACHE_DIR = Path("/tmp/snn_vgg9_bench")
@@ -264,6 +264,7 @@ def export_models():
                 print("  [WARN] pnnx export failed, ncnn benchmark will be skipped")
         else:
             print("  [WARN] pnnx not found, ncnn benchmark will be skipped")
+            print("         Install via: pip install pnnx ncnn")
     else:
         print(f"[export] ncnn exists: {ncnn_param}")
 
@@ -488,7 +489,7 @@ def main():
     # ── Print results table ──
     print()
     print("=" * 75)
-    print(" Results: SNN-VGG-9 (T=4, B=1, 32x32)")
+    print(" Results: SNN-VGG-9 (T=4, B=1, 112x128)")
     print("=" * 75)
 
     # Header

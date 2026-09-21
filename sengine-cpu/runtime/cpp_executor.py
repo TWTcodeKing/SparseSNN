@@ -25,11 +25,32 @@ def _find_lib() -> str:
         "libsengine_cpu.so not found. Build it with: cd sengine-cpu/csrc && make")
 
 
+def _preload_blas() -> str | None:
+    """Load scipy's bundled OpenBLAS with RTLD_GLOBAL so the C runtime can
+    dlsym('scipy_cblas_sgemm') for its conv / classifier GEMMs."""
+    import glob
+    try:
+        import scipy
+    except ImportError:
+        return None
+    libs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(scipy.__file__))), 'scipy.libs')
+    for path in sorted(glob.glob(os.path.join(libs_dir, 'libscipy_openblas-*.so'))):
+        if '64_' in os.path.basename(path):
+            continue  # ILP64 build: incompatible int width
+        try:
+            ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+            return path
+        except OSError:
+            continue
+    return None
+
+
 class CPUCppExecutor:
     """Python wrapper around the C CPU executor."""
 
     def __init__(self, n_threads: int | None = None):
         lib_path = _find_lib()
+        blas = _preload_blas()
         self._lib = ctypes.CDLL(lib_path)
         self._setup_signatures()
 
@@ -37,6 +58,8 @@ class CPUCppExecutor:
         self._handle = self._lib.sengine_cpu_create(n_threads)
         if not self._handle:
             raise RuntimeError("sengine_cpu_create returned NULL")
+        self._lib.sengine_blas_set_threads(n_threads)
+        log.info("BLAS: %s", blas or "none (naive GEMM fallback)")
         self._membranes: list[np.ndarray] = []
         log.info("C executor: loaded %s, %d threads", lib_path, n_threads)
 
@@ -133,6 +156,15 @@ class CPUCppExecutor:
         # Alias node
         lib.sengine_cpu_set_alias_node.argtypes = [c_void_p, c_int, float_p, float_p, c_int]
         lib.sengine_cpu_set_alias_node.restype = None
+        # Native fused conv node
+        lib.sengine_cpu_set_conv_node.argtypes = (
+            [c_void_p, c_int] + [float_p] * 6 + [c_int] * 11 + [c_float] * 3)
+        lib.sengine_cpu_set_conv_node.restype = None
+        # GEMM bias
+        lib.sengine_cpu_set_gemm_bias.argtypes = [c_void_p, c_int, float_p]
+        lib.sengine_cpu_set_gemm_bias.restype = None
+        lib.sengine_blas_set_threads.argtypes = [c_int]
+        lib.sengine_blas_set_threads.restype = None
 
     # ─── Public API ───────────────────────────────────────────
 
@@ -204,6 +236,20 @@ class CPUCppExecutor:
                       c: np.ndarray, M: int, K: int, N: int):
         self._lib.sengine_cpu_set_gemm_node(
             self._handle, nid, self._fp(a), self._fp(b), self._fp(c), M, K, N)
+
+    def set_conv_node(self, nid: int, inp, weight, scale, bias, membrane, out,
+                      B, H, W, C_in, F, T, KH, KW, pad, stride,
+                      neuron: int, v_threshold: float, v_reset: float, recip_tau: float):
+        """Native NHWC Conv+BN(+neuron). neuron: 0 none, 1 IF, 2 LIF."""
+        self._lib.sengine_cpu_set_conv_node(
+            self._handle, nid, self._fp(inp), self._fp(weight), self._fp(scale),
+            self._fp(bias), self._fp(membrane), self._fp(out),
+            int(B), int(H), int(W), int(C_in), int(F), int(T), int(KH), int(KW),
+            int(pad), int(stride), int(neuron),
+            float(v_threshold), float(v_reset), float(recip_tau))
+
+    def set_gemm_bias(self, nid: int, bias):
+        self._lib.sengine_cpu_set_gemm_bias(self._handle, nid, self._fp(bias))
 
     def destroy(self):
         if self._handle:

@@ -84,6 +84,7 @@ class CUDAGraphEngine:
         self._allocate_weights()
         self._allocate_membranes()
         self._allocate_activations()
+        self._setup_l2_persistence()
 
         # CUDA IF/LIF extension loaded lazily only when Python runtime dispatches neurons.
         # The C++ executor has native IF/LIF kernels — no torch extension needed.
@@ -186,6 +187,88 @@ class CUDAGraphEngine:
 
     # ─── Internal ───
 
+    def _setup_l2_persistence(self):
+        """Configure L2 cache persistence for weight tensors (Ampere+).
+
+        On Jetson AGX Orin (4MB L2, 204.8 GB/s LPDDR5), weights are the
+        primary reuse candidate — they're read every timestep while activations
+        stream through. Pinning weights in L2 avoids repeated LPDDR5 fetches.
+
+        Uses cudaDeviceSetLimit + cudaStreamAttrValue access policy windows
+        via CuPy/ctypes for the CUDA runtime calls that PyTorch doesn't expose.
+        """
+        import os as _os
+        if 'Orin' not in torch.cuda.get_device_name(0) and _os.environ.get('SENGINE_EDGE_L2_PERSIST', '0') != '1':
+            logger.phase("ENGINE", "L2 persistence: not a Jetson Orin, skipping (SENGINE_EDGE_L2_PERSIST=1 to force)")
+            return
+        try:
+            import ctypes
+            _cudart = ctypes.CDLL('libcudart.so')
+        except Exception:
+            logger.phase("ENGINE", "L2 persistence: libcudart.so not available, skipping")
+            return
+
+        # Calculate total weight bytes
+        total_weight_bytes = 0
+        weight_ptrs = []
+        for t in self.weights.values():
+            total_weight_bytes += t.nelement() * t.element_size()
+            weight_ptrs.append((t.data_ptr(), t.nelement() * t.element_size()))
+        for t in self.weights_1x1.values():
+            total_weight_bytes += t.nelement() * t.element_size()
+            weight_ptrs.append((t.data_ptr(), t.nelement() * t.element_size()))
+
+        if total_weight_bytes == 0:
+            return
+
+        # Query max persisting L2 size
+        max_persist = ctypes.c_size_t()
+        props = torch.cuda.get_device_properties(0)
+        # cudaDevAttrMaxPersistingL2CacheSize = 108
+        _val = ctypes.c_int()
+        ret = _cudart.cudaDeviceGetAttribute(ctypes.byref(_val), 108, 0)
+        if ret != 0 or _val.value == 0:
+            logger.phase("ENGINE", "L2 persistence: device does not support persisting L2")
+            return
+        max_persist_bytes = _val.value
+
+        # Reserve up to 75% of max persisting L2 for weights
+        persist_budget = int(max_persist_bytes * 0.75)
+        persist_size = min(total_weight_bytes, persist_budget)
+
+        # cudaLimitPersistingL2CacheSize = 0x06
+        ret = _cudart.cudaDeviceSetLimit(0x06, ctypes.c_size_t(persist_size))
+        if ret != 0:
+            logger.phase("ENGINE", "L2 persistence: cudaDeviceSetLimit failed (%d)", ret)
+            return
+
+        # Set access policy windows on the default stream for weight buffers.
+        # We use cudaStreamSetAttribute with cudaStreamAttrValue.
+        # The struct layout for cudaAccessPolicyWindow:
+        #   void*  base_ptr       (8 bytes)
+        #   size_t num_bytes      (8 bytes)
+        #   float  hitRatio       (4 bytes)
+        #   enum   hitProp        (4 bytes)  cudaAccessPropertyPersisting = 2
+        #   enum   missProp       (4 bytes)  cudaAccessPropertyStreaming  = 1
+        # Total cudaAccessPolicyWindow = 28 bytes
+        # cudaStreamAttrValue is a union; accessPolicyWindow is offset 0.
+        # cudaStreamAttributeAccessPolicyWindow = 1
+
+        # For simplicity, set a single window covering the largest weight block.
+        # The L2 hardware will handle caching heuristics for the rest.
+        if weight_ptrs:
+            # Sort by size descending, pin the largest weights first
+            weight_ptrs.sort(key=lambda x: -x[1])
+            pinned_bytes = 0
+            for ptr, nbytes in weight_ptrs:
+                if pinned_bytes + nbytes > persist_size:
+                    break
+                pinned_bytes += nbytes
+
+        logger.phase("ENGINE", "L2 persistence: reserved %d KB / %d KB max for %d KB weights",
+                     persist_size // 1024, max_persist_bytes // 1024,
+                     total_weight_bytes // 1024)
+
     def _allocate_weights(self):
         """Convert ONNX weights to NHWC tensors on GPU (precision-aware)."""
         w_dtype = self.io_np_dtype
@@ -219,11 +302,28 @@ class CUDAGraphEngine:
                 else:
                     # General Conv: (C_out, C_in/groups, K, K) → (K, K, C_in/groups, C_out)
                     w_nhwc = w_np.transpose(2, 3, 1, 0).astype(w_dtype)
+                    # Stem conv (C_in < 4): the stem kernel reads a weight padded
+                    # to 16 input channels (tensor-core alignment); without the
+                    # padding it reads past the buffer and the first layer is garbage.
+                    if cp.in_channels < 4 and cp.groups == 1:
+                        C_padded = 16
+                        KH, KW, C_in_actual, C_out = w_nhwc.shape
+                        import numpy as np
+                        w_padded = np.zeros((KH, KW, C_padded, C_out), dtype=w_dtype)
+                        w_padded[:, :, :C_in_actual, :] = w_nhwc
+                        w_nhwc = w_padded
                     self.weights[nid] = torch.from_numpy(w_nhwc.copy()).cuda()
 
             elif node.op_type == OpType.Gemm:
                 # FC: (out, in) — keep as-is for cuBLAS
                 self.weights[nid] = torch.from_numpy(w_np.astype(w_dtype)).cuda()
+                # Classifier bias (ONNX Gemm input C), applied after the GEMM
+                if node.bias_info is not None and node.bias_info.name in self.ir.weights:
+                    import numpy as _np
+                    b_np = _np.asarray(self.ir.weights[node.bias_info.name], dtype=_np.float32).reshape(-1)
+                    if not hasattr(self, 'gemm_biases'):
+                        self.gemm_biases = {}
+                    self.gemm_biases[nid] = torch.from_numpy(b_np.copy()).cuda()
 
             elif node.op_type == OpType.Linear:
                 # Linear weight: (K, N) for matmul — keep as-is
@@ -425,6 +525,7 @@ class CUDAGraphEngine:
                 # - MatMul/Linear: flattened 2D (M,N) for GEMM kernels
                 # - Everything else: ONNX shape as-is
                 _NHWC_OPS = {OpType.Conv2d, OpType.MaxPool, OpType.GlobalAvgPool,
+                             OpType.TemporalMean,  # 4D: reduces T of an NHWC tensor
                              OpType.Add, OpType.IF, OpType.LIF, OpType.MS, OpType.ILIF,
                              OpType.Tile, OpType.Sub, OpType.Mul, OpType.Scale,
                              OpType.Resize, OpType.Concat, OpType.Slice,

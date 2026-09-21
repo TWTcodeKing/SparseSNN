@@ -106,24 +106,24 @@ def benchmark(fn, warmup=100, iters=500):
 # Test shapes: 3×3 stride=1 convolutions from SNN models
 # ═══════════════════════════════════════════════════════════════
 
-SHAPES = [
-    # (TB, C_in, C_out, H, W, name)
-    # SEW-ResNet / MS-ResNet
-    (4,  64,   64,  56, 56, "ResNet: 64→64 56×56"),
-    (4,  128, 128,  28, 28, "ResNet: 128→128 28×28"),
-    (4,  256, 256,  14, 14, "ResNet: 256→256 14×14"),
-    (4,  512, 512,   7,  7, "ResNet: 512→512 7×7"),
-    # SpikingResFormer-M (standard conv, not grouped)
-    (16, 256, 256,  56, 56, "SRF-M: 256→256 56×56"),
-    (16, 1536, 1536, 28, 28, "SRF-M: 1536→1536 28×28"),
-    (16, 3072, 3072, 14, 14, "SRF-M: 3072→3072 14×14"),
-    # SpikingResFormer-L
-    (16, 2048, 2048, 28, 28, "SRF-L: 2048→2048 28×28"),
-    (16, 4096, 4096, 14, 14, "SRF-L: 4096→4096 14×14"),
-    # Small channels (where im2col should win)
-    (4,  32,   32,  112, 112, "Small: 32→32 112×112"),
-    (4,  64,   64,  112, 112, "Small: 64→64 112×112"),
+# Key bottleneck shapes tested across batch sizes (T=4, B=1,2,4,8 → TB=4,8,16,32)
+_BASE = [
+    # (C_in, C_out, H, W, name)
+    (64,   64,   56, 56, "64→64 56×56"),
+    (256,  256,  14, 14, "256→256 14×14"),
+    (1536, 1536, 28, 28, "1536→1536 28×28"),
+    (2048, 2048, 28, 28, "2048→2048 28×28"),
+    (4096, 4096, 14, 14, "4096→4096 14×14"),
 ]
+
+T_VAL = 4
+BATCH_SIZES = [1, 2, 4, 8]
+
+SHAPES = []
+for C_in, C_out, H, W, prefix in _BASE:
+    for B in BATCH_SIZES:
+        TB = T_VAL * B
+        SHAPES.append((TB, C_in, C_out, H, W, f"{prefix} B={B}(TB={TB})"))
 
 
 def main():

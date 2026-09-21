@@ -231,6 +231,9 @@ def main():
     print(f"  Phase 3: Build + benchmark")
     print(f"{'='*70}")
 
+    import sengine
+    from sengine.ir import KernelVariant
+
     all_results = {}
 
     for fusion in fusion_modes:
@@ -238,83 +241,56 @@ def main():
             label = f"fusion={fusion}, B={B}"
             rec_path = rec_files.get((fusion, B))
 
-            # Run each build in a SUBPROCESS to guarantee clean CUDA state.
-            # The validator pre-pass and previous builds may leave stale
-            # CUDA errors that corrupt graph capture in the same process.
-            import subprocess, json as json_mod
-            prec_suffix = f'_{args.precision}' if args.precision != 'fp16' else ''
-            cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                                      '.cache', f'sengine_B{B}{prec_suffix}')
-            result_file = f'/tmp/sengine_bench_{tag}_{fusion}_B{B}_{args.precision}.json'
+            # Clear any stale CUDA errors before each build
+            torch.cuda.synchronize(device_id)
+            torch.cuda.current_device()  # ensure context
+            gc.collect()
+            torch.cuda.empty_cache()
 
-            sub_cmd = f"""
-import os, sys, time, json; sys.path.insert(0, '{os.path.dirname(os.path.dirname(__file__))}')
-os.environ['CUDA_HOME']='{os.environ.get("CUDA_HOME","")}'
-os.environ['PATH']='{os.environ.get("PATH","")}'
-import sengine
-from sengine.ir import KernelVariant
-try:
-    # Check how many configs are pre-loaded from rec.json
-    n_preloaded = 0
-    rec_path = {repr(rec_path)}
-    if rec_path:
-        from sengine.build.fusion_validator import load_tuning_configs
-        cfgs, _, _, _, _ = load_tuning_configs(rec_path)
-        n_preloaded = len(cfgs)
-    t0 = time.time()
-    e = sengine.build('{plugin_onnx}', T={args.T}, batch_size={B},
-                       fusion='{fusion}', autotune={args.autotune},
-                       fusion_rec=rec_path,
-                       precision='{args.precision}')
-    build_s = time.time() - t0
-    mode = 'C++' if not e._use_python_runtime else 'Python'
-    n_fused = sum(1 for n in e._ir.nodes.values()
-                  if n.assigned_kernel in (KernelVariant.TileLangFusedConv1x1BNIF,
-                                            KernelVariant.TileLangFusedConvBNIF))
-    ms = e.benchmark(warmup={args.warmup}, iters={args.iters})
-    fps = 1000.0 / ms * {B} if ms > 0 else 0
-    json.dump({{'ms': ms, 'fps': fps, 'mode': mode, 'fused': n_fused,
-                'build_s': build_s, 'validated': rec_path is not None,
-                'preloaded': n_preloaded,
-                'precision': '{args.precision}'}},
-              open('{result_file}', 'w'))
-except Exception as ex:
-    json.dump({{'error': str(ex)}}, open('{result_file}', 'w'))
-"""
-            print(f"\n  [{label}] Building (subprocess)...")
-            env = os.environ.copy()
-            env['CUDA_VISIBLE_DEVICES'] = str(device_id)
-            proc = subprocess.run(
-                [sys.executable, '-c', sub_cmd],
-                env=env, timeout=1800,
-                capture_output=True, text=True)
+            print(f"\n  [{label}] Building...")
+            try:
+                n_preloaded = 0
+                if rec_path:
+                    from sengine.build.fusion_validator import load_tuning_configs
+                    cfgs, _, _, _, _ = load_tuning_configs(rec_path)
+                    n_preloaded = len(cfgs)
 
-            if os.path.exists(result_file):
-                with open(result_file) as f:
-                    r = json_mod.load(f)
-                if 'error' in r:
-                    print(f"  [{label}] FAILED: {r['error']}")
-                    all_results[(fusion, B)] = None
-                else:
-                    all_results[(fusion, B)] = r
-                    v = 'yes' if r.get('validated') else 'no'
-                    extra = ""
-                    if r.get('validated'):
-                        extra += " | validated"
-                    if r.get('preloaded', 0) > 0:
-                        extra += f" | {r['preloaded']} cached configs"
-                    print(f"  [{label}] {r['ms']:.3f} ms | {r['fps']:.0f} img/s | "
-                          f"fused={r['fused']} | {r['mode']} | build={r['build_s']:.0f}s"
-                          + extra)
-                os.remove(result_file)
-            else:
-                print(f"  [{label}] FAILED: subprocess crashed")
-                if proc.stderr:
-                    # Show last few lines of error
-                    err_lines = proc.stderr.strip().split('\n')
-                    for line in err_lines[-3:]:
-                        if 'Error' in line or 'FAILED' in line:
-                            print(f"    {line}")
+                t0 = time.time()
+                e = sengine.build(plugin_onnx, T=args.T, batch_size=B,
+                                  fusion=fusion, autotune=args.autotune,
+                                  fusion_rec=rec_path,
+                                  precision=args.precision)
+                build_s = time.time() - t0
+
+                mode = 'C++' if not e._use_python_runtime else 'Python'
+                n_fused = sum(1 for n in e._ir.nodes.values()
+                              if n.assigned_kernel in (KernelVariant.TileLangFusedConv1x1BNIF,
+                                                        KernelVariant.TileLangFusedConvBNIF))
+                ms = e.benchmark(warmup=args.warmup, iters=args.iters)
+                fps = 1000.0 / ms * B if ms > 0 else 0
+
+                r = {'ms': ms, 'fps': fps, 'mode': mode, 'fused': n_fused,
+                     'build_s': build_s, 'validated': rec_path is not None,
+                     'preloaded': n_preloaded, 'precision': args.precision}
+                all_results[(fusion, B)] = r
+
+                extra = ""
+                if r.get('validated'):
+                    extra += " | validated"
+                if n_preloaded > 0:
+                    extra += f" | {n_preloaded} cached configs"
+                print(f"  [{label}] {ms:.3f} ms | {fps:.0f} img/s | "
+                      f"fused={n_fused} | {mode} | build={build_s:.0f}s"
+                      + extra)
+
+                del e
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            except Exception as ex:
+                import traceback
+                print(f"  [{label}] FAILED: {ex}")
+                traceback.print_exc()
                 all_results[(fusion, B)] = None
 
     # ── Results table ──

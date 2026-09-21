@@ -188,13 +188,15 @@ def _pick_interleaved_config(M: int, K_red: int, F: int,
     hw = _get_hw_info()
     max_smem = hw.get('max_smem', 100 * 1024)
 
-    # Orin: moderate tiles, 3-stage pipeline (Ampere cp.async)
-    tile_prefs = [(32, 64), (64, 64), (64, 32), (32, 32)]
+    # Orin: try larger tiles first (128x64, 64x128) to amortize overhead per CTA,
+    # then fall back to moderate tiles. Larger tiles win when the GEMM is big
+    # enough to still fill 16 SMs. 3-stage pipeline for Ampere cp.async.
     bk = min(32, K_red)
     ns = 3
-    thr = 128
 
-    for bm, bn in tile_prefs:
+    # Large tiles with thr=256 (for big GEMMs that still fill 16 SMs)
+    for bm, bn, thr in [(128, 64, 256), (64, 128, 256), (64, 64, 128),
+                         (32, 64, 128), (64, 32, 128), (32, 32, 128)]:
         if bn > max(F, 32):
             continue
         smem = (bm * bk + bk * bn) * 2 * ns + bm * bn * 2
@@ -608,10 +610,19 @@ class TileLangCompiler:
         # For 1x1 conv: use INTERLEAVED kernel (per-CTA T-loop, processes
         # full TB in one call, membrane in registers, no cross-CTA race).
         # For 3x3 conv: use per-timestep kernel (old approach, TB=B per call).
+        # Neuron type of the absorbed successor (IF vs LIF): selects the
+        # epilogue and is part of the cache key.
+        _absorbed = node.extra_attrs.get("absorbed_nids", [])
+        _lif_node = next((self.ir.nodes[a] for a in _absorbed
+                          if self.ir.nodes.get(a) and self.ir.nodes[a].op_type == OpType.LIF), None)
+        _neuron_tag = "lif" if _lif_node is not None else "if"
+        _np = _lif_node.neuron_params if _lif_node is not None else None
+        _recip_tau_3x3 = ((1.0 / _np.tau if (_np and _np.tau and _np.tau > 0) else 0.5)
+                          if _lif_node is not None else None)
         if is_1x1:
-            key = f"interleaved_conv1x1_if_{cp.in_channels}_{cp.out_channels}_{H}x{W}_s{cp.stride_h}_TB{self.TB}_{self.precision}"
+            key = f"interleaved_conv1x1_{_neuron_tag}_{cp.in_channels}_{cp.out_channels}_{H}x{W}_s{cp.stride_h}_TB{self.TB}_{self.precision}"
         else:
-            key = f"fused_conv_if_{cp.in_channels}_{cp.out_channels}_{cp.kernel_h}x{cp.kernel_w}_{H}x{W}_s{cp.stride_h}_B{self.B}_{self.precision}"
+            key = f"fused_conv_{_neuron_tag}_{cp.in_channels}_{cp.out_channels}_{cp.kernel_h}x{cp.kernel_w}_{H}x{W}_s{cp.stride_h}_B{self.B}_{self.precision}"
 
         if key in self._kernel_cache:
             node.tilelang_config = self._config_cache[key]
@@ -716,11 +727,15 @@ class TileLangCompiler:
             K_red = cp.kernel_h * cp.kernel_w * cp.in_channels
 
             def _compile_3x3(cfg):
+                # The T-unrolled kernel writes data_shared 4x per k-iteration, which
+                # TileLang's pipeline planner rejects with num_stages > 1.
+                cfg = dict(cfg); cfg['num_stages'] = 1
                 return conv2d_bn_if_interleaved_kernel(
                     B=self.B, C_in=cp.in_channels, H=H, W=W, F=cp.out_channels,
                     K=cp.kernel_h, S=cp.stride_h, D=cp.dilation_h, P=cp.pad_h,
                     T_steps=self.T,
                     io_dtype=self.io_dtype_tl,
+                    recip_tau=_recip_tau_3x3,
                     **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
             _state_3x3 = torch.zeros(M_per_t, cp.out_channels, dtype=torch.float32, device='cuda')
             _profile_args_3x3 = (

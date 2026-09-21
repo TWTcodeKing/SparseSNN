@@ -978,14 +978,23 @@ def _compute_output_shape(node: Node, in_shapes: list[tuple], T: int) -> tuple:
         if len(inp) < 4:
             return inp
         N, C, H, W = inp
-        kh = pp.get("kernel_h", pp.get("kernel_size", 3))
-        kw = pp.get("kernel_w", pp.get("kernel_size", 3))
-        sh = pp.get("stride_h", pp.get("stride", 2))
-        sw = pp.get("stride_w", pp.get("stride", 2))
-        ph = pp.get("pad_h", pp.get("padding", 1))
-        pw = pp.get("pad_w", pp.get("padding", 1))
-        OH = (H + 2 * ph - kh) // sh + 1
-        OW = (W + 2 * pw - kw) // sw + 1
+        # pool_params are the ONNX attributes (kernel_shape / strides / pads /
+        # ceil_mode, as consumed by the kernel bindings); the scalar keys are a
+        # legacy fallback. Reading the wrong keys silently used 3/2/1 defaults,
+        # which only coincides with a 2x2/s2 pool for even spatial sizes.
+        ks, st, pd = pp.get("kernel_shape"), pp.get("strides"), pp.get("pads")
+        kh = ks[0] if ks else pp.get("kernel_h", pp.get("kernel_size", 3))
+        kw = (ks[1] if len(ks) > 1 else ks[0]) if ks else pp.get("kernel_w", pp.get("kernel_size", 3))
+        sh = st[0] if st else pp.get("stride_h", pp.get("stride", 2))
+        sw = (st[1] if len(st) > 1 else st[0]) if st else pp.get("stride_w", pp.get("stride", 2))
+        ph = pd[0] if pd else pp.get("pad_h", pp.get("padding", 1))
+        pw = (pd[1] if len(pd) > 1 else pd[0]) if pd else pp.get("pad_w", pp.get("padding", 1))
+        if pp.get("ceil_mode", 0):
+            OH = -(-(H + 2 * ph - kh) // sh) + 1
+            OW = -(-(W + 2 * pw - kw) // sw) + 1
+        else:
+            OH = (H + 2 * ph - kh) // sh + 1
+            OW = (W + 2 * pw - kw) // sw + 1
         return (N, C, OH, OW)
 
     if node.op_type == OpType.GlobalAvgPool:
@@ -1117,6 +1126,19 @@ def _compute_output_shape(node: Node, in_shapes: list[tuple], T: int) -> tuple:
                     known *= d
             if neg_idx >= 0 and known > 0:
                 result[neg_idx] = total // known
+            # The ONNX constant was traced at export batch size (1): if the
+            # element count no longer matches the runtime input, rescale the
+            # batch axis (dim 1 of a (T, B, ...) split, else dim 0).
+            prod = 1
+            for d in result:
+                prod *= d
+            if total > 0 and prod != total:
+                for idx in ((1, 0) if len(result) >= 5 else (0, 1)):
+                    if idx < len(result) and result[idx] > 0 and prod % result[idx] == 0:
+                        rest = prod // result[idx]
+                        if rest > 0 and total % rest == 0:
+                            result[idx] = total // rest
+                            break
             return tuple(result)
         if node.output_shapes:
             return node.output_shapes[0]

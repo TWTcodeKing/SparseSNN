@@ -66,6 +66,10 @@ def setup_executor_from_plan(
             t = py_engine.bn_biases.get(bd.source_nid)
             if t is not None:
                 ptr = t.data_ptr()
+        elif bd.category == "gemm_bias":
+            t = getattr(py_engine, 'gemm_biases', {}).get(bd.source_nid)
+            if t is not None:
+                ptr = t.data_ptr()
         elif bd.category == "membrane":
             t = py_engine.membranes.get(bd.source_nid)
             if t is not None:
@@ -327,7 +331,8 @@ def setup_executor_from_plan(
                 M = in_shape[0] if len(in_shape) >= 1 else 1
                 K = in_shape[-1] if len(in_shape) >= 2 else 1
                 N = w_shape[0] if len(w_shape) >= 1 else 1
-                exe.set_gemm_node(nid, in_ptr, w_ptr, out_ptr, M, K, N)
+                b_ptr = p(node_plan.bias_buf) if node_plan.bias_buf is not None and node_plan.bias_buf >= 0 else 0
+                exe.set_gemm_node(nid, in_ptr, w_ptr, out_ptr, M, K, N, b_ptr)
             else:
                 exe.set_skip_node(nid)
 
@@ -499,5 +504,29 @@ def setup_executor_from_plan(
         else:
             logger.warning("  Plan executor: unknown kernel_type '%s' for #%d", kt, nid)
             exe.set_skip_node(nid)
+
+    # ── L2 cache persistence for weight buffers (Orin optimization) ──
+    # Collect all weight buffer pointers and sizes for L2 pinning.
+    weight_ptrs = []
+    weight_sizes = []
+    for bd in plan.buffers:
+        if bd.category in ("weight", "weight_1x1"):
+            ptr = buf_ptrs.get(bd.buf_id, 0)
+            if ptr:
+                nbytes = 1
+                for d in bd.shape:
+                    nbytes *= d
+                nbytes *= 2  # FP16 = 2 bytes (FP32 = 4 bytes if precision is fp32)
+                if ir.precision == "fp32":
+                    nbytes *= 2
+                weight_ptrs.append(ptr)
+                weight_sizes.append(nbytes)
+    import os as _os
+    _on_orin = 'Orin' in torch.cuda.get_device_name(0) or _os.environ.get('SENGINE_EDGE_L2_PERSIST', '0') == '1'
+    if weight_ptrs and _on_orin:
+        try:
+            exe.setup_l2_persistence(weight_ptrs, weight_sizes)
+        except Exception as e:
+            logger.warning("  L2 persistence setup failed: %s", e)
 
     return exe

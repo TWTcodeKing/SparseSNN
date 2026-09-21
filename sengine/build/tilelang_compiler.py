@@ -619,13 +619,24 @@ class TileLangCompiler:
         H, W = self._get_spatial(node)
         is_1x1 = (cp.kernel_h == 1 and cp.kernel_w == 1)
 
+        # Neuron type of the absorbed successor (IF vs LIF): selects the
+        # epilogue and is part of the cache key so IF/LIF kernels of the same
+        # shape never alias.
+        _absorbed = node.extra_attrs.get("absorbed_nids", [])
+        _lif_node = next((self.ir.nodes[a] for a in _absorbed
+                          if self.ir.nodes.get(a) and self.ir.nodes[a].op_type == OpType.LIF), None)
+        _neuron_tag = "lif" if _lif_node is not None else "if"
+        _np = _lif_node.neuron_params if _lif_node is not None else None
+        _recip_tau_3x3 = ((1.0 / _np.tau if (_np and _np.tau and _np.tau > 0) else 0.5)
+                          if _lif_node is not None else None)
+
         # For 1x1 conv: use INTERLEAVED kernel (per-CTA T-loop, processes
         # full TB in one call, membrane in registers, no cross-CTA race).
         # For 3x3 conv: use per-timestep kernel (old approach, TB=B per call).
         if is_1x1:
-            key = f"interleaved_conv1x1_if_{cp.in_channels}_{cp.out_channels}_{H}x{W}_s{cp.stride_h}_TB{self.TB}_{self.precision}"
+            key = f"interleaved_conv1x1_{_neuron_tag}_{cp.in_channels}_{cp.out_channels}_{H}x{W}_s{cp.stride_h}_TB{self.TB}_{self.precision}"
         else:
-            key = f"fused_conv_if_{cp.in_channels}_{cp.out_channels}_{cp.kernel_h}x{cp.kernel_w}_{H}x{W}_s{cp.stride_h}_B{self.B}_{self.precision}"
+            key = f"fused_conv_{_neuron_tag}_{cp.in_channels}_{cp.out_channels}_{cp.kernel_h}x{cp.kernel_w}_{H}x{W}_s{cp.stride_h}_B{self.B}_{self.precision}"
 
         if key in self._kernel_cache:
             node.tilelang_config = self._config_cache[key]
@@ -735,6 +746,7 @@ class TileLangCompiler:
                     K=cp.kernel_h, S=cp.stride_h, D=cp.dilation_h, P=cp.pad_h,
                     T_steps=self.T,
                     io_dtype=self.io_dtype_tl,
+                    recip_tau=_recip_tau_3x3,
                     **{k: cfg[k] for k in ('block_M', 'block_N', 'block_K', 'num_stages', 'threads')})
             _state_3x3 = torch.zeros(M_per_t, cp.out_channels, dtype=torch.float32, device='cuda')
             _profile_args_3x3 = (

@@ -71,6 +71,10 @@ class CPUKernelVariant(Enum):
     TVMConv1x1BN = auto()          # 1x1 Conv+BN
     TVMLinearBN = auto()           # Linear+BN
     TVMMatMul = auto()             # Pure MatMul
+    # Native C fused conv (NHWC im2col + BLAS GEMM + BN + neuron), no TVM needed
+    NativeConvBNIF = auto()
+    NativeConvBNLIF = auto()
+    NativeConvBN = auto()
     # Native C kernels (hand-optimized, SIMD)
     NativeIF = auto()              # IF neuron (OpenMP + SIMD)
     NativeLIF = auto()             # LIF neuron

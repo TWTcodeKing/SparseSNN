@@ -21,6 +21,7 @@ _NEURON_CLASS_NAMES = {
     'MultiStepLIFNeuron', 'MultiStepIFNeuron', 'MultiStepILIFNeuron',
     'LIFNeuron', 'IFNeuron', 'ILIFNeuron',
     'MSNeuron', 'PLIFNeuron',
+    'LIF',  # SpikingResformer's LIF subclass
 }
 
 
@@ -99,13 +100,295 @@ def _patch_msresnet_blocks_inplace(model: nn.Module):
         if cls_name in ('BasicBlock18', 'BasicBlockCifar', 'BasicBlock104'):
             def _make_block_fwd(blk):
                 def forward(self, x):
-                    # x: (B, C, H, W) — no T dim
                     out = self.conv_bn1(self.sn1(x))
                     out = self.conv_bn2(self.sn2(out))
                     sc = self.shortcut(x) if len(self.shortcut) > 0 else x
                     return out + sc
                 return forward
             child.forward = types.MethodType(_make_block_fwd(child), child)
+
+
+def _patch_multistep_ops_inplace(model: nn.Module):
+    """Patch _MultiStep* ops (SpikingResformer) to use base class forward directly."""
+    import types
+    for name, child in model.named_modules():
+        cls_name = type(child).__name__
+        if cls_name in ('_MultiStepConv2d', 'Conv3x3', 'Conv1x1'):
+            def _mk(m):
+                def fwd(self, x):
+                    return nn.Conv2d.forward(self, x)
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+        elif cls_name == '_MultiStepMaxPool2d':
+            def _mk(m):
+                def fwd(self, x):
+                    return nn.MaxPool2d.forward(self, x)
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+        elif cls_name == '_MultiStepAvgPool2d':
+            def _mk(m):
+                def fwd(self, x):
+                    return nn.AdaptiveAvgPool2d.forward(self, x)
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+        elif cls_name == '_MultiStepLinear':
+            def _mk(m):
+                def fwd(self, x):
+                    return nn.Linear.forward(self, x)
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        # BN wrapper (SpikingResformer): flatten(0,1) assumes 5D → just use inner bn
+        elif cls_name == 'BN' and hasattr(child, 'bn') and isinstance(child.bn, nn.BatchNorm2d):
+            def _mk(m):
+                def fwd(self, x):
+                    return self.bn(x)
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        # DSSA: deformable spike self-attention → standard 4D attention
+        elif cls_name == 'DSSA':
+            def _mk(m):
+                def fwd(self, x):
+                    # x: (B, C, H, W) — no T
+                    B, C, H, W = x.shape
+                    x_feat = x
+                    x = self.activation_in(x)
+
+                    y = self.W(x)
+                    y = self.norm(y)
+                    y = y.reshape(B, self.num_heads, 2 * C // self.num_heads, -1)
+                    y1 = y[:, :, :C // self.num_heads, :]
+                    y2 = y[:, :, C // self.num_heads:, :]
+                    x = x.reshape(B, self.num_heads, C // self.num_heads, -1)
+
+                    scale1 = 1.0 / (C // self.num_heads) ** 0.5
+                    attn = torch.matmul(y1.transpose(-2, -1), x) * scale1
+                    attn = self.activation_attn(attn)
+
+                    scale2 = 1.0 / self.lenth ** 0.5
+                    out = torch.matmul(y2, attn) * scale2
+                    out = out.reshape(B, C, H, W)
+                    out = self.activation_out(out)
+
+                    out = self.Wproj(out)
+                    out = self.norm_proj(out)
+                    return out + x_feat
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+
+def _patch_maxformer_submodules_inplace(model: nn.Module):
+    """Patch all MaxFormer submodules to remove 5D T-dimension handling."""
+    import types
+
+    for name, child in model.named_modules():
+        cls_name = type(child).__name__
+
+        # Embed classes: all do T,B,C,H,W = x.shape
+        if cls_name == 'Embed':
+            def _mk(m):
+                def fwd(self, x, dual=False):
+                    if not self.shortcut:
+                        x = self.embed_lif(x)
+                    x_feat = x
+                    x = self.embed_conv(x)
+                    x = self.embed_bn(x)
+                    return (x, x_feat) if dual else x
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        elif cls_name == 'MaxEmbed':
+            def _mk(m):
+                def fwd(self, x, dual=False):
+                    if not self.shortcut:
+                        x = self.embed_lif(x)
+                    x_feat = x
+                    x = self.embed_conv(x)
+                    x = self.embed_bn(x)
+                    x = self.maxpool(x)
+                    return (x, x_feat) if dual else x
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        elif cls_name == 'EmbedOrigImageNet':
+            def _mk(m):
+                def fwd(self, x):
+                    x = self.embed1(x)
+                    x, x_feat = self.embed2(x, dual=True)
+                    x = self.embed3(x)
+                    x_feat = self.embed4(x_feat)
+                    return x + x_feat
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        elif cls_name == 'EmbedOrig':
+            def _mk(m):
+                def fwd(self, x):
+                    x = self.embed1(x)
+                    x, x_feat = self.embed2(x, dual=True)
+                    x_feat = self.embed3(x_feat)
+                    return x + x_feat
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        elif cls_name == 'EmbedMax':
+            def _mk(m):
+                def fwd(self, x):
+                    x, x_feat = self.max_embed1(x, dual=True)
+                    x = self.embed1(x)
+                    x_feat = self.max_embed2(x_feat)
+                    return x + x_feat
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        elif cls_name == 'Embed1Max':
+            def _mk(m):
+                def fwd(self, x):
+                    x, x_feat = self.max_embed1(x, dual=True)
+                    x = self.embed1(x)
+                    x_feat = self.max_embed2(x_feat)
+                    return x + x_feat
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        elif cls_name == 'Embed1MaxCifar':
+            def _mk(m):
+                def fwd(self, x):
+                    x, x_feat = self.embed1(x, dual=True)
+                    x = self.max_embed1(x)
+                    x_feat = self.embed2(x_feat)
+                    return x + x_feat
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        elif cls_name == 'EmbedMaxPlus':
+            def _mk(m):
+                def fwd(self, x):
+                    x = self.proj_conv(x)
+                    x = self.proj_bn(x)
+                    x = self.max_embed1(x)
+                    x, x_feat = self.max_embed2(x, dual=True)
+                    x = self.max_embed3(x)
+                    x_feat = self.embed1(x_feat)
+                    return x + x_feat
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        elif cls_name == 'PatchEmbedInitMaxPool':
+            def _mk(m):
+                def fwd(self, x):
+                    x = self.embed1.embed_conv(x)
+                    x = self.embed1.embed_bn(x)
+                    x = self.maxpool1(x)
+                    x = self.lif1(x)
+                    x_feat = x
+                    x = self.embed2.embed_conv(x)
+                    x = self.embed2.embed_bn(x)
+                    x = self.maxpool2(x)
+                    x = self.lif2(x)
+                    x = self.embed3.embed_conv(x)
+                    x = self.embed3.embed_bn(x)
+                    x_feat = self.embed4.embed_conv(x_feat)
+                    x_feat = self.embed4.embed_bn(x_feat)
+                    return x + x_feat
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        # S_MLP: spiking MLP with residuals
+        elif cls_name == 'S_MLP':
+            def _mk(m):
+                def fwd(self, x):
+                    identity = x
+                    x = self.fc1_lif(x)
+                    x = self.fc1_conv(x)
+                    x = self.fc1_bn(x)
+                    if self.res:
+                        x = identity + x
+                        identity = x
+                    x = self.fc2_lif(x)
+                    x = self.fc2_conv(x)
+                    x = self.fc2_bn(x)
+                    return x + identity
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        # Block classes
+        elif cls_name == 'Block_DWC':
+            def _mk(m):
+                def fwd(self, x):
+                    identity = x
+                    x = self.conv_neuron(x)
+                    x = self.conv(x)
+                    x = self.conv_bn(x)
+                    x = x + identity
+                    x = self.mlp(x)
+                    return x
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        elif cls_name == 'Block_Max':
+            def _mk(m):
+                def fwd(self, x):
+                    x = self.pool(x)
+                    x = self.mlp(x)
+                    return x
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        elif cls_name == 'Block_identity':
+            def _mk(m):
+                def fwd(self, x):
+                    return self.mlp(x)
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        # MaxFormer SSA: Conv1d attention with 5D reshapes → patch for 4D
+        elif cls_name == 'SSA' and hasattr(child, 'q_conv') and hasattr(child, 'x_lif'):
+            def _mk(m):
+                def fwd(self, x):
+                    # x: (B, C, H, W)
+                    B, C, H, W = x.shape
+                    identity = x
+                    x = self.x_lif(x)
+                    N = H * W
+                    x_flat = x.reshape(B, C, N)  # (B, C, N)
+
+                    q = self.q_lif(self.q_bn(self.q_conv(x_flat)))
+                    q = q.transpose(1, 2).reshape(B, N, self.num_heads, C // self.num_heads
+                                                  ).permute(0, 2, 1, 3)
+                    k = self.k_lif(self.k_bn(self.k_conv(x_flat)))
+                    k = k.transpose(1, 2).reshape(B, N, self.num_heads, C // self.num_heads
+                                                  ).permute(0, 2, 1, 3)
+                    v = self.v_lif(self.v_bn(self.v_conv(x_flat)))
+                    v = v.transpose(1, 2).reshape(B, N, self.num_heads, C // self.num_heads
+                                                  ).permute(0, 2, 1, 3)
+
+                    attn = (q @ (k.transpose(-2, -1) @ v)) * self.scale
+                    x = attn.transpose(2, 3).reshape(B, C, N)
+                    x = self.attn_lif(x)
+                    x = self.proj_bn(self.proj_conv(x)).reshape(B, C, H, W)
+                    return x + identity
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        elif cls_name == 'Block_SSA':
+            def _mk(m):
+                def fwd(self, x):
+                    x = self.attn(x)
+                    x = self.mlp(x)
+                    return x
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
+
+        elif cls_name == 'Block_QKA':
+            def _mk(m):
+                def fwd(self, x):
+                    x = self.attn(x)
+                    x = self.mlp(x)
+                    return x
+                return fwd
+            child.forward = types.MethodType(_mk(child), child)
 
 
 # ── Forward patching ──
@@ -125,6 +408,23 @@ def _patch_sewresnet_forward(model):
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         return self.fc(x)
+    import types
+    model.forward = types.MethodType(forward, model)
+
+
+def _patch_dvs_sewresnet_forward(model):
+    """Patch DVSSEWResNet forward: input is (T*B, C, H, W), no temporal ops."""
+    # Replace Flatten(2) (for 5D) with Flatten(1) (for 4D)
+    conv_layers = list(model.conv.children())
+    for i, layer in enumerate(conv_layers):
+        if isinstance(layer, nn.Flatten) and layer.start_dim == 2:
+            conv_layers[i] = nn.Flatten(1)
+    model.conv = nn.Sequential(*conv_layers)
+
+    def forward(self, x):
+        # x: (T*B, C, H, W) — TB already fused by caller
+        x = self.conv(x)   # Sequential: Conv+BN+ReLU... → (T*B, features)
+        return self.out(x)  # Linear → (T*B, num_classes)
     import types
     model.forward = types.MethodType(forward, model)
 
@@ -406,6 +706,8 @@ def _detect_and_patch_forward(model):
 
     if cls_name == 'SEWResNet':
         _patch_sewresnet_forward(model)
+    elif cls_name == 'DVSSEWResNet':
+        _patch_dvs_sewresnet_forward(model)
     elif cls_name == 'SEWResNetCifar':
         _patch_sewresnet_cifar_forward(model)
     elif cls_name == 'MSResNet18':
@@ -448,7 +750,9 @@ def convert_snn_to_ann(model: nn.Module) -> nn.Module:
     _replace_avgpool3d_inplace(model)
     _unwrap_seq_containers_inplace(model)
     _replace_neurons_inplace(model)
+    _patch_multistep_ops_inplace(model)
     _patch_msresnet_blocks_inplace(model)
+    _patch_maxformer_submodules_inplace(model)
     _detect_and_patch_forward(model)
     # Remove T attribute to signal ANN mode
     if hasattr(model, 'T'):

@@ -165,7 +165,7 @@ def main():
         for B in batch_sizes:
             input_shape = (B, in_channels, img_h, img_w)
             engine_path = os.path.join(args.engine_dir,
-                                       f"{tag}_b{B}.engine")
+                                       f"{tag}_b{B}{'_fp16' if args.fp16 else ''}.engine")
 
             if not os.path.exists(engine_path):
                 print(f"\n  [B={B}] Building TRT engine (dense {'FP16' if args.fp16 else 'FP32'}"
@@ -341,7 +341,8 @@ def main():
 
     for B in batch_sizes:
         onnx_path = onnx_paths[B]
-        engine_path = os.path.join(args.engine_dir, f"{tag}_b{B}{sparse_tag}.engine")
+        # precision is part of the name: a fp32 run must not reuse a fp16 engine
+        engine_path = os.path.join(args.engine_dir, f"{tag}_b{B}{sparse_tag}{'_fp16' if args.fp16 else ''}.engine")
         input_shape = (B, seq_len) if is_nlp else (B, in_channels, img_h, img_w)
 
         # Build TRT engine

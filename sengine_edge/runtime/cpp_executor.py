@@ -55,7 +55,7 @@ def _setup_signatures(lib):
     lib.sengine_set_maxpool_node.argtypes = [VP, CI, VP, VP, CI, CI, CI, CI, CI, CI, CI, CI, CI]
     lib.sengine_set_global_avgpool_node.argtypes = [VP, CI, VP, VP, CI, CI, CI, CI]
     lib.sengine_set_temporal_mean_node.argtypes = [VP, CI, VP, VP, CI, CI]
-    lib.sengine_set_gemm_node.argtypes = [VP, CI, VP, VP, VP, CI, CI, CI]
+    lib.sengine_set_gemm_node.argtypes = [VP, CI, VP, VP, VP, CI, CI, CI, VP]
     lib.sengine_set_skip_node.argtypes = [VP, CI]
     lib.sengine_set_alias_node.argtypes = [VP, CI, VP, VP, CI]
     lib.sengine_set_tilelang_node_3.argtypes = [VP, CI, CI, VP, VP, VP]
@@ -84,6 +84,7 @@ def _setup_signatures(lib):
     lib.sengine_set_softmax_node.argtypes = [VP, CI, VP, VP, CI, CI]
     lib.sengine_add_membrane.argtypes = [VP, VP, CI]
 
+    lib.sengine_setup_l2_persistence.argtypes = [VP, ctypes.POINTER(VP), ctypes.POINTER(ctypes.c_size_t), CI]
     lib.sengine_execute.argtypes = [VP]
     lib.sengine_set_fp32.argtypes = [VP, CI]
     lib.sengine_reset_membranes.argtypes = [VP]
@@ -186,9 +187,9 @@ class CppExecutor:
         self._lib.sengine_set_temporal_mean_node(self._handle, nid,
             in_ptr, out_ptr, T, spatial)
 
-    def set_gemm_node(self, nid, in_ptr, w_ptr, out_ptr, M, K, N):
+    def set_gemm_node(self, nid, in_ptr, w_ptr, out_ptr, M, K, N, bias_ptr=0):
         self._lib.sengine_set_gemm_node(self._handle, nid,
-            in_ptr, w_ptr, out_ptr, M, K, N)
+            in_ptr, w_ptr, out_ptr, M, K, N, bias_ptr)
 
     def set_skip_node(self, nid):
         self._lib.sengine_set_skip_node(self._handle, nid)
@@ -270,6 +271,20 @@ class CppExecutor:
             ctypes.c_void_p(in_ptr), ctypes.c_void_p(out_ptr), outer, inner)
 
     # ─── Execution ───
+
+    def setup_l2_persistence(self, weight_ptrs: list[int], weight_sizes: list[int]):
+        """Configure L2 cache persistence for weight buffers (Orin Ampere+).
+
+        Call before capture_graph(). Pins frequently-reused weight data in L2
+        to reduce LPDDR5 refetches across T timesteps.
+        """
+        n = len(weight_ptrs)
+        if n == 0:
+            return
+        VP = ctypes.c_void_p
+        arr_vp = (VP * n)(*[VP(p) for p in weight_ptrs])
+        arr_sz = (ctypes.c_size_t * n)(*weight_sizes)
+        self._lib.sengine_setup_l2_persistence(self._handle, arr_vp, arr_sz, n)
 
     def capture_graph(self):
         self._lib.sengine_capture_graph(self._handle)

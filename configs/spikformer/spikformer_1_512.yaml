@@ -1,0 +1,12 @@
+arch: spikformer
+
+embed_dims: 512
+num_heads: 8
+mlp_ratios: 4
+depths: 1
+patch_size: 16
+sr_ratios: 1
+qkv_bias: false
+drop_rate: 0.0
+attn_drop_rate: 0.0
+drop_path_rate: 0.0

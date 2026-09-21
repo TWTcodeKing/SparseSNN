@@ -55,7 +55,7 @@ def _setup_signatures(lib):
     lib.sengine_set_maxpool_node.argtypes = [VP, CI, VP, VP, CI, CI, CI, CI, CI, CI, CI, CI, CI]
     lib.sengine_set_global_avgpool_node.argtypes = [VP, CI, VP, VP, CI, CI, CI, CI]
     lib.sengine_set_temporal_mean_node.argtypes = [VP, CI, VP, VP, CI, CI]
-    lib.sengine_set_gemm_node.argtypes = [VP, CI, VP, VP, VP, CI, CI, CI]
+    lib.sengine_set_gemm_node.argtypes = [VP, CI, VP, VP, VP, CI, CI, CI, VP]
     lib.sengine_set_skip_node.argtypes = [VP, CI]
     lib.sengine_set_alias_node.argtypes = [VP, CI, VP, VP, CI]
     lib.sengine_set_tilelang_node_3.argtypes = [VP, CI, CI, VP, VP, VP]
@@ -186,9 +186,9 @@ class CppExecutor:
         self._lib.sengine_set_temporal_mean_node(self._handle, nid,
             in_ptr, out_ptr, T, spatial)
 
-    def set_gemm_node(self, nid, in_ptr, w_ptr, out_ptr, M, K, N):
+    def set_gemm_node(self, nid, in_ptr, w_ptr, out_ptr, M, K, N, bias_ptr=0):
         self._lib.sengine_set_gemm_node(self._handle, nid,
-            in_ptr, w_ptr, out_ptr, M, K, N)
+            in_ptr, w_ptr, out_ptr, M, K, N, bias_ptr)
 
     def set_skip_node(self, nid):
         self._lib.sengine_set_skip_node(self._handle, nid)

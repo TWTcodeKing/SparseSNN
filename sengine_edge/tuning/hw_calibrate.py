@@ -37,16 +37,30 @@ def calibrate(device_id: int = 0) -> dict:
             pass
 
     # ── Read from API ──
+    # L2 cache size: PyTorch may not expose props.L2_cache_size on all builds.
+    # Fall back to cudaDeviceGetAttribute (cudaDevAttrL2CacheSize = 38).
+    _l2_size = getattr(props, 'L2_cache_size', 0) or getattr(props, 'l2_cache_size', 0)
+    if not _l2_size:
+        try:
+            import ctypes as _ct
+            _crt = _ct.CDLL('libcudart.so')
+            _v = _ct.c_int()
+            # cudaDevAttrL2CacheSize = 38
+            if _crt.cudaDeviceGetAttribute(_ct.byref(_v), 38, device_id) == 0:
+                _l2_size = _v.value
+        except Exception:
+            _l2_size = 4 * 1024 * 1024  # Orin default: 4MB
+
     hw = {
         'gpu_name': props.name,
         'gpu_uuid': str(props.uuid),
         'arch': f'sm_{props.major}{props.minor}',
         'sm_count': props.multi_processor_count,
-        'l2_size_bytes': props.L2_cache_size,
-        'max_regs_per_sm': props.regs_per_multiprocessor,
-        'max_threads_per_sm': props.max_threads_per_multi_processor,
+        'l2_size_bytes': _l2_size,
+        'max_regs_per_sm': getattr(props, 'regs_per_multiprocessor', 65536),
+        'max_threads_per_sm': getattr(props, 'max_threads_per_multi_processor', 1536),
         'total_mem_bytes': props.total_memory,
-        'warp_size': props.warp_size,
+        'warp_size': getattr(props, 'warp_size', 32),
     }
 
     # Max blocks per SM (from arch)

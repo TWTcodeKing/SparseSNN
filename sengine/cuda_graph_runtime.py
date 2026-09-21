@@ -219,11 +219,26 @@ class CUDAGraphEngine:
                 else:
                     # General Conv: (C_out, C_in/groups, K, K) → (K, K, C_in/groups, C_out)
                     w_nhwc = w_np.transpose(2, 3, 1, 0).astype(w_dtype)
+                    # Stem conv (C_in < 4): pad C_in to 16 for tensor core alignment
+                    if cp.in_channels < 4 and cp.groups == 1:
+                        C_padded = 16
+                        KH, KW, C_in_actual, C_out = w_nhwc.shape
+                        import numpy as np
+                        w_padded = np.zeros((KH, KW, C_padded, C_out), dtype=w_dtype)
+                        w_padded[:, :, :C_in_actual, :] = w_nhwc
+                        w_nhwc = w_padded
                     self.weights[nid] = torch.from_numpy(w_nhwc.copy()).cuda()
 
             elif node.op_type == OpType.Gemm:
                 # FC: (out, in) — keep as-is for cuBLAS
                 self.weights[nid] = torch.from_numpy(w_np.astype(w_dtype)).cuda()
+                # Classifier bias (ONNX Gemm input C), applied after the GEMM
+                if node.bias_info is not None and node.bias_info.name in self.ir.weights:
+                    import numpy as _np
+                    b_np = _np.asarray(self.ir.weights[node.bias_info.name], dtype=_np.float32).reshape(-1)
+                    if not hasattr(self, 'gemm_biases'):
+                        self.gemm_biases = {}
+                    self.gemm_biases[nid] = torch.from_numpy(b_np.copy()).cuda()
 
             elif node.op_type == OpType.Linear:
                 # Linear weight: (K, N) for matmul — keep as-is
@@ -425,6 +440,7 @@ class CUDAGraphEngine:
                 # - MatMul/Linear: flattened 2D (M,N) for GEMM kernels
                 # - Everything else: ONNX shape as-is
                 _NHWC_OPS = {OpType.Conv2d, OpType.MaxPool, OpType.GlobalAvgPool,
+                             OpType.TemporalMean,  # 4D: reduces T of an NHWC tensor
                              OpType.Add, OpType.IF, OpType.LIF, OpType.MS, OpType.ILIF,
                              OpType.Tile, OpType.Sub, OpType.Mul, OpType.Scale,
                              OpType.Resize, OpType.Concat, OpType.Slice,

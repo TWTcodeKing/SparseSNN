@@ -35,6 +35,17 @@ void native_temporal_mean(const float* input, float* output,
 void native_gemm(const float* A, const float* B, float* C,
                  int M, int K, int N);
 
+void native_conv_bn_neuron(
+    const float* input, const float* weight,
+    const float* scale, const float* bias,
+    float* membrane, float* output, float* im2col,
+    int B, int H, int W, int C_in, int F, int T,
+    int KH, int KW, int pad, int stride,
+    int neuron, float v_threshold, float v_reset, float recip_tau);
+void sengine_sgemm(int transB, int M, int N, int K,
+                   const float* A, int lda, const float* B, int ldb,
+                   float* C, int ldc);
+
 void native_softmax(const float* input, float* output,
                     int outer, int inner);
 

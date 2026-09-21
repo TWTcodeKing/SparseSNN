@@ -66,6 +66,10 @@ def setup_executor_from_plan(
             t = py_engine.bn_biases.get(bd.source_nid)
             if t is not None:
                 ptr = t.data_ptr()
+        elif bd.category == "gemm_bias":
+            t = getattr(py_engine, 'gemm_biases', {}).get(bd.source_nid)
+            if t is not None:
+                ptr = t.data_ptr()
         elif bd.category == "membrane":
             t = py_engine.membranes.get(bd.source_nid)
             if t is not None:
@@ -327,7 +331,8 @@ def setup_executor_from_plan(
                 M = in_shape[0] if len(in_shape) >= 1 else 1
                 K = in_shape[-1] if len(in_shape) >= 2 else 1
                 N = w_shape[0] if len(w_shape) >= 1 else 1
-                exe.set_gemm_node(nid, in_ptr, w_ptr, out_ptr, M, K, N)
+                b_ptr = p(node_plan.bias_buf) if node_plan.bias_buf is not None and node_plan.bias_buf >= 0 else 0
+                exe.set_gemm_node(nid, in_ptr, w_ptr, out_ptr, M, K, N, b_ptr)
             else:
                 exe.set_skip_node(nid)
 

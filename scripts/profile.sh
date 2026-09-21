@@ -37,7 +37,7 @@ case "$TOOL" in
             --trace=cuda,nvtx \
             --stats=true \
             --force-overwrite=true \
-            .venv/bin/python scripts/profile_trt_engine.py "$ENGINE" \
+            .venv/bin/python utils/profile_trt_engine.py "$ENGINE" \
                 --warmup 10 --iters 10
         echo ""
         echo "=== Done. Report at profiles/${NAME}.nsys-rep ==="
@@ -50,7 +50,7 @@ case "$TOOL" in
             --launch-skip 20 --launch-count 500 \
             -o "profiles/${NAME}" \
             --force-overwrite \
-            .venv/bin/python scripts/profile_trt_engine.py "$ENGINE" \
+            .venv/bin/python utils/profile_trt_engine.py "$ENGINE" \
                 --warmup 20 --iters 2
         echo ""
         echo "=== Done. Report at profiles/${NAME}.ncu-rep ==="

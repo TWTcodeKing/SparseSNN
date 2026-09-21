@@ -80,6 +80,7 @@ void sengine_cpu_destroy(CPUExecutor* e)
     if (e->nodes) {
         for (int i = 0; i <= e->max_node_id; i++) {
             free(e->nodes[i].tvm_args);
+            free(e->nodes[i].conv_col);
         }
         free(e->nodes);
     }
@@ -170,6 +171,7 @@ void sengine_cpu_alloc_nodes(CPUExecutor* e, int max_id)
     if (e->nodes) {
         for (int i = 0; i <= e->max_node_id; i++) {
             free(e->nodes[i].tvm_args);
+            free(e->nodes[i].conv_col);
         }
         free(e->nodes);
     }
@@ -326,6 +328,33 @@ void sengine_cpu_set_gemm_node(CPUExecutor* e, int nid,
     nd->gemm_N = N;
 }
 
+void sengine_cpu_set_gemm_bias(CPUExecutor* e, int nid, float* bias)
+{
+    e->nodes[nid].gemm_bias = bias;
+}
+
+void sengine_cpu_set_conv_node(CPUExecutor* e, int nid,
+                               float* input, float* weight, float* scale, float* bias,
+                               float* membrane, float* output,
+                               int B, int H, int W, int C_in, int F, int T,
+                               int KH, int KW, int pad, int stride,
+                               int neuron, float v_threshold, float v_reset, float recip_tau)
+{
+    NodeDesc* nd = &e->nodes[nid];
+    nd->type = KT_CONV;
+    nd->conv_in = input; nd->conv_w = weight; nd->conv_scale = scale; nd->conv_bias = bias;
+    nd->conv_mem = membrane; nd->conv_out = output;
+    nd->conv_B = B; nd->conv_H = H; nd->conv_W = W; nd->conv_Cin = C_in; nd->conv_F = F;
+    nd->conv_T = T; nd->conv_KH = KH; nd->conv_KW = KW; nd->conv_pad = pad; nd->conv_stride = stride;
+    nd->conv_neuron = neuron; nd->conv_vth = v_threshold; nd->conv_vreset = v_reset; nd->conv_rt = recip_tau;
+    int OH = (H + 2 * pad - KH) / stride + 1;
+    int OW = (W + 2 * pad - KW) / stride + 1;
+    size_t M = (size_t)B * OH * OW, K = (size_t)KH * KW * C_in;
+    free(nd->conv_col);
+    nd->conv_col = (float*)aligned_alloc(64, ((M * K * sizeof(float) + 63) / 64) * 64);
+    if (!nd->conv_col) fprintf(stderr, "[sengine-cpu] im2col alloc failed (node %d)\n", nid);
+}
+
 void sengine_cpu_set_softmax_node(CPUExecutor* e, int nid,
                                    float* input, float* output,
                                    int outer, int inner)
@@ -458,8 +487,23 @@ void sengine_cpu_execute(CPUExecutor* e)
             break;
 
         case KT_GEMM:
-            native_gemm(nd->gemm_a, nd->gemm_b, nd->gemm_c,
-                        nd->gemm_M, nd->gemm_K, nd->gemm_N);
+            /* C(M,N) = A(M,K) @ B(N,K)^T (+ bias) */
+            sengine_sgemm(1, nd->gemm_M, nd->gemm_N, nd->gemm_K,
+                          nd->gemm_a, nd->gemm_K, nd->gemm_b, nd->gemm_K,
+                          nd->gemm_c, nd->gemm_N);
+            if (nd->gemm_bias) {
+                for (int m = 0; m < nd->gemm_M; m++)
+                    for (int n = 0; n < nd->gemm_N; n++)
+                        nd->gemm_c[m * nd->gemm_N + n] += nd->gemm_bias[n];
+            }
+            break;
+
+        case KT_CONV:
+            native_conv_bn_neuron(nd->conv_in, nd->conv_w, nd->conv_scale, nd->conv_bias,
+                                  nd->conv_mem, nd->conv_out, nd->conv_col,
+                                  nd->conv_B, nd->conv_H, nd->conv_W, nd->conv_Cin, nd->conv_F,
+                                  nd->conv_T, nd->conv_KH, nd->conv_KW, nd->conv_pad, nd->conv_stride,
+                                  nd->conv_neuron, nd->conv_vth, nd->conv_vreset, nd->conv_rt);
             break;
 
         case KT_SOFTMAX:

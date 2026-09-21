@@ -63,7 +63,6 @@ def parse_args():
                         help='Add extra connection from block input to block output (ResNets only)')
     # ---- Dataset ----
     parser.add_argument('--dataset', type=str, default='cifar10',
-                        choices=['cifar10', 'cifar100', 'imagenet', 'cifar10dvs','dvs128gesture'],
                         help='Dataset name')
     parser.add_argument('--data-root', type=str, required=True,
                         help='Path to dataset root directory')
@@ -417,6 +416,9 @@ def main():
             model_kwargs['T'] = args.T
             model_kwargs['zero_init_residual'] = args.zero_init_residual
             model_kwargs['connect_f'] = args.connect_f
+        elif args.model.startswith('snn_vgg'):
+            # SNNVGG takes T directly (time_window would be silently ignored)
+            model_kwargs['T'] = args.T
         else:
             model_kwargs['time_window'] = args.T
         model = build_model(args.model, num_classes=num_classes,**model_kwargs)

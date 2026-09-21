@@ -81,6 +81,7 @@ PyTorch model -> TDL transforms -> plugin ONNX -> ONNXParser -> EngineIR -> opti
   the 3x3 kernel variant, and the Orin-only L2 persistence / L1 carveout switches. Profiles exist
   for RTX 4090 (`ada`, default), A100 (`a100`) and Jetson AGX Orin (`orin`); selection is
   explicit (`target=` / `--target`), by `SENGINE_TARGET`, or auto-detected from the device.
+  `SENGINE_L2_PERSIST=1` / `SENGINE_PREFER_L1=1` force the Orin runtime switches on any target.
 
 Caches: compiled kernel `.so` files in `.cache/sengine_B{batch}/` (Orin profile:
 `.cache/sengine_edge_B{batch}/`), fusion recommendations in `.cache/fusion_rec_*.json`.

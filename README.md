@@ -52,7 +52,7 @@ uv venv .venv && source .venv/bin/activate
 uv pip install torch==2.5.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 uv pip install -r requirements.txt
 
-# C++ executor for sengine (sm_89 by default; see the Makefile for other archs)
+# C++ executor for sengine (CUDA 12.8 + sm_89 by default; `make lib` builds only the ctypes library)
 cd sengine/csrc && make && cd ../..
 # CPU engine runtime
 cd sengine_cpu/csrc && make NO_BLAS=1 && cd ../..
@@ -181,9 +181,10 @@ python scripts/bench_sengine_latency.py --model sew_resnet18 --dataset imagenet 
 python scripts/bench_sengine_latency.py --model sew_resnet18 --dataset imagenet --target orin --fusion none,slicer --autotune --batch-sizes 4
 ```
 
-The Orin needs its own executor build (`make ARCH="-gencode=arch=compute_87,code=sm_87"
-CUDA_HOME=/usr/local/cuda` in `sengine/csrc`); a prebuilt sm_87 binary is kept in
-`sengine/csrc/prebuilt/`.
+The Orin needs its own executor build: `make lib ARCH="-gencode arch=compute_87,code=sm_87"
+CUDA_HOME=/usr/local/cuda CUDNN_LIB="-L/usr/lib/aarch64-linux-gnu -lcudnn"` in `sengine/csrc`.
+The profile can also be forced with `SENGINE_TARGET=orin`; `SENGINE_L2_PERSIST=1` and
+`SENGINE_PREFER_L1=1` switch the Orin-specific L2 weight pinning and L1 carveout on elsewhere.
 
 ### 7. Profiling
 

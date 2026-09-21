@@ -43,7 +43,7 @@ static void resolve_sgemm(void)
         if (f) { g_sgemm = (cblas_sgemm_fn)f; break; }
     }
     if (!g_sgemm)
-        fprintf(stderr, "[sengine-cpu] no cblas_sgemm symbol found: using naive GEMM\n");
+        fprintf(stderr, "[sengine_cpu] no cblas_sgemm symbol found: using naive GEMM\n");
 }
 
 /* Row-major C(M,N) = A(M,K) @ op(B); transB=0: B is (K,N); transB=1: B is (N,K). */

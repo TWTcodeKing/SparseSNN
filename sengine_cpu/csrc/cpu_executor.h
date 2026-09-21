@@ -1,5 +1,5 @@
 /**
- * sengine-cpu: Self-contained C runtime for SNN inference on CPU.
+ * sengine_cpu: Self-contained C runtime for SNN inference on CPU.
  *
  * CPU port of sengine/csrc/cpp_executor.cu. No CUDA, no Python in the
  * hot loop. Uses OpenMP for thread parallelism, AVX2 for vectorized

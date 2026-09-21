@@ -2,7 +2,7 @@
 """
 bench_snn_vgg9_cpu.py — Cross-platform SNN-VGG-9 CPU inference benchmark.
 
-Benchmarks sengine-cpu (MLAS), ONNX Runtime, OpenVINO, and ncnn
+Benchmarks sengine_cpu (MLAS), ONNX Runtime, OpenVINO, and ncnn
 on SNN-VGG-9 (T=4, B=1, 112×128 NTU-Fi-HumanID input, 14 classes).
 
 Portable across: AMD EPYC (AVX2/FMA3), Intel Xeon (AVX-512), ARM Cortex-A7 (NEON).
@@ -43,7 +43,8 @@ VGG9_LAYERS = [
     (512, 512,  14,  16, True),   # → pool → 7×8
 ]
 
-CACHE_DIR = Path("/tmp/snn_vgg9_bench")
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+CACHE_DIR = _REPO_ROOT / ".cache" / "snn_vgg9_cpu_bench"   # gitignored
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -275,10 +276,11 @@ def export_models():
 # Framework benchmarks
 # ──────────────────────────────────────────────────────────────────────
 def bench_sengine(n_threads, warmup, iters):
-    """Benchmark sengine-cpu MLAS kernel (TB-merged Conv + fused BN+LIF)."""
-    so_path = Path("sengine-cpu/csrc/libmlas_conv_bn_lif.so")
+    """Benchmark sengine_cpu MLAS kernel (TB-merged Conv + fused BN+LIF)."""
+    so_path = _REPO_ROOT / "sengine_cpu" / "csrc" / "libmlas_conv_bn_lif.so"
     if not so_path.exists():
-        return None, "libmlas_conv_bn_lif.so not found (run build_mlas.sh)"
+        return None, ("libmlas_conv_bn_lif.so not found; build it with the g++ command in "
+                      "sengine_cpu/BUILD.md (MLAS kernel appendix)")
 
     lib = ctypes.CDLL(str(so_path))
     lib.mlas_conv2d_bn_lif.argtypes = (

@@ -16,7 +16,8 @@ __pycache__/
 .vscode/
 .pkl_memoize_py3/
 .cache/
-.sengine-cpu.cache/
+.sengine_cpu.cache/
+sengine_cpu/.tvm-env/
 
 # vendored
 third_party/
@@ -37,9 +38,9 @@ trt_engines/
 trt_engines_fp32/
 onnxrt_exports/
 profiles/
-GPUtil/engines/
-GPUtil/trt_engines/
-GPUtil/ncu_reports/
+experiments/gpu_util/engines/
+experiments/gpu_util/trt_engines/
+experiments/gpu_util/ncu_reports/
 
 # compiled executors (rebuild with make)
 sengine/csrc/sengine_exec

@@ -1,4 +1,4 @@
-"""Graph IR data structures for sengine-cpu.
+"""Graph IR data structures for sengine_cpu.
 
 Self-contained CPU inference engine IR. No imports from sengine/.
 """
@@ -230,7 +230,7 @@ class FusionGroup:
 # ═══════════════════════════════════════════════════════════════════
 
 class EngineIR:
-    """Directed acyclic graph of operators for sengine-cpu."""
+    """Directed acyclic graph of operators for sengine_cpu."""
 
     def __init__(self):
         self.nodes: dict[int, Node] = {}

@@ -1,8 +1,8 @@
-"""Logging for sengine-cpu."""
+"""Logging for sengine_cpu."""
 
 import logging
 
-def get_logger(name: str = "sengine-cpu") -> logging.Logger:
+def get_logger(name: str = "sengine_cpu") -> logging.Logger:
     logger = logging.getLogger(name)
     if not logger.handlers:
         handler = logging.StreamHandler()

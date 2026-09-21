@@ -1,5 +1,5 @@
 /**
- * Native CPU kernels for sengine-cpu.
+ * Native CPU kernels for sengine_cpu.
  *
  * Hand-optimized C kernels with OpenMP thread parallelism and
  * AVX2 SIMD intrinsics for vectorized element-wise operations.

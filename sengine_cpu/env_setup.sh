@@ -1,5 +1,5 @@
 #!/bin/bash
-# sengine-cpu TVM environment setup
+# sengine_cpu TVM environment setup
 #
 # TVM must be installed separately from the main SparseSNN venv because
 # tilelang bundles its own TVM (0.23.dev0) without LLVM codegen support.
@@ -13,7 +13,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_DIR="$SCRIPT_DIR/.tvm-env"
 
-echo "=== sengine-cpu TVM Environment Setup ==="
+echo "=== sengine_cpu TVM Environment Setup ==="
 
 # 1. Create venv
 if [ ! -d "$ENV_DIR" ]; then

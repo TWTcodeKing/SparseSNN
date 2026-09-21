@@ -1,6 +1,7 @@
-"""sengine-cpu: High-performance CPU inference engine for Spiking Neural Networks.
+"""sengine_cpu: CPU inference engine for Spiking Neural Networks.
 
-Self-contained CPU port of sengine. TVM-based fused kernels + C runtime.
+Self-contained CPU port of sengine: a C runtime (csrc/) with native fused
+Conv+BN+IF/LIF kernels; an optional TVM backend (see tvm_env.py).
 
     import sengine_cpu
 

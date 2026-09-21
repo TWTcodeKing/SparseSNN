@@ -1,10 +1,11 @@
-"""TVM kernel compiler for sengine-cpu.
+"""TVM kernel compiler for sengine_cpu (optional backend).
 
 Compiles TVM TE kernels to standalone .so files. Handles shape-key
 deduplication: identical layer shapes share one compiled .so.
 
-Compilation runs in the TVM venv (/home/twt/tvm_build/tvm_venv/).
-Compiled .so files are standalone — no TVM dependency at runtime.
+Compilation runs in a separate TVM interpreter (see sengine_cpu/tvm_env.py:
+$SENGINE_CPU_TVM_PYTHON or sengine_cpu/.tvm-env). Compiled .so files are
+standalone — no TVM dependency at runtime.
 
 Self-contained — no imports from sengine/.
 """
@@ -26,13 +27,10 @@ from sengine_cpu.ir import (
     EngineIR, Node, OpType, NeuronType, CPUKernelVariant, BoundType,
 )
 from sengine_cpu.logger import log
-
-
-# TVM venv python — used for compilation subprocess
-TVM_PYTHON = "/home/twt/tvm_build/tvm_venv/bin/python"
+from sengine_cpu.tvm_env import tvm_python, require_tvm_python
 
 # Default build directory for compiled .so files
-DEFAULT_BUILD_DIR = ".sengine-cpu.cache"
+DEFAULT_BUILD_DIR = ".sengine_cpu.cache"
 
 # Fused kernel variants that need TVM compilation
 _TVM_FUSED_VARIANTS = {
@@ -100,6 +98,8 @@ class TVMCompiler:
         """Compile all TVM kernels. Returns {node_id: so_path}.
 
         Nodes with non-TVM kernels (Native*, ZeroCost, Skip) are not compiled.
+        Raises RuntimeError if TVM kernels are needed but no TVM interpreter
+        is configured.
         """
         # Group nodes by shape key for deduplication
         shape_groups: dict[str, list[int]] = {}
@@ -115,6 +115,8 @@ class TVMCompiler:
         log.info("TVM compiler: %d unique shapes from %d TVM nodes",
                  len(shape_groups),
                  sum(len(nids) for nids in shape_groups.values()))
+        if shape_groups:
+            require_tvm_python()
 
         # Compile each unique shape
         kernel_map: dict[int, str] = {}
@@ -232,18 +234,15 @@ class TVMCompiler:
     def _run_tvm_subprocess(self, module_name: str, func_name: str,
                             kwargs: dict, so_path: str) -> bool:
         """Run TVM compilation in a subprocess (avoids tilelang conflicts)."""
-        # Generate a small script that imports the kernel builder and compiles
-        # The sengine-cpu directory has a hyphen so it can't be imported directly.
-        # Add its parent to PYTHONPATH and create a symlink or use importlib.
+        # Generate a small script that imports the kernel builder and compiles.
+        # The TVM interpreter imports sengine_cpu.kernels.<module> from the
+        # repo root (put on PYTHONPATH below).
         pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        kernel_file = os.path.join(pkg_dir, "kernels", f"{module_name}.py")
+        repo_root = os.path.dirname(pkg_dir)
 
         script = f"""
-import sys, os, importlib.util
-# Load kernel module directly by file path (avoids hyphen-in-package-name issue)
-spec = importlib.util.spec_from_file_location("kernel_mod", "{kernel_file}")
-kmod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(kmod)
+import importlib
+kmod = importlib.import_module("sengine_cpu.kernels.{module_name}")
 target = {json.dumps(self.target) if isinstance(self.target, dict) else repr(self.target)}
 lib = kmod.{func_name}(**{repr(kwargs)}, target_str=target)
 kmod.export_kernel(lib, "{so_path}")
@@ -255,10 +254,9 @@ print("OK")
 
         try:
             result = subprocess.run(
-                [TVM_PYTHON, script_path],
+                [tvm_python(), script_path],
                 capture_output=True, text=True, timeout=120,
-                env={**os.environ, "PYTHONPATH": os.path.dirname(
-                    os.path.dirname(os.path.abspath(__file__)))},
+                env={**os.environ, "PYTHONPATH": repo_root},
             )
             if result.returncode != 0:
                 log.warning("TVM compile failed for %s: %s",

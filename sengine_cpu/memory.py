@@ -1,4 +1,4 @@
-"""Memory planning for sengine-cpu.
+"""Memory planning for sengine_cpu.
 
 Tensor lifetime analysis + greedy first-fit pool allocation.
 All FP32, 64-byte alignment (cache line).

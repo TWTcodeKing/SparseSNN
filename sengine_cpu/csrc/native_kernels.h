@@ -1,5 +1,5 @@
 /**
- * Native CPU kernels for sengine-cpu.
+ * Native CPU kernels for sengine_cpu.
  *
  * All kernels operate on FP32 data in NHWC layout.
  * OpenMP for thread parallelism, AVX2 SIMD where beneficial.

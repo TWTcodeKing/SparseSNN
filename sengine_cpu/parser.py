@@ -1,4 +1,4 @@
-"""ONNX Parser for sengine-cpu.
+"""ONNX Parser for sengine_cpu.
 
 Parses ONNX files (with FusedIFNeuron/FusedLIFNeuron/FusedMSNeuron/FusedILIFNeuron
 custom ops) into EngineIR. Self-contained — no imports from sengine/.
@@ -63,7 +63,7 @@ def _get_attrs(onnx_node) -> dict:
 
 
 class ONNXParser:
-    """Parse ONNX into sengine-cpu EngineIR."""
+    """Parse ONNX into sengine_cpu EngineIR."""
 
     def __init__(self, onnx_path: str):
         self.onnx_model = onnx.load(onnx_path)

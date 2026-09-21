@@ -1,4 +1,4 @@
-"""Graph Slicer: compute-anchored deep fusion for sengine-cpu.
+"""Graph Slicer: compute-anchored deep fusion for sengine_cpu.
 
 Partitions the graph into FusionSlices: each anchored by a COMPUTE-bound op
 (Conv, Linear, MatMul) absorbing reachable MEMORY-bound successors (IF, LIF,

@@ -1,4 +1,4 @@
-# sengine-cpu: C runtime for SNN inference on CPU
+# sengine_cpu: C runtime for SNN inference on CPU
 #
 # Build:  make              (with OpenBLAS)
 #         make NO_BLAS=1    (naive GEMM fallback)

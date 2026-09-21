@@ -1,4 +1,4 @@
-"""BA-MTTS scheduler for sengine-cpu.
+"""BA-MTTS scheduler for sengine_cpu.
 
 Bound-Aware Maximum-Transition Topological Sort: greedy topo sort that
 maximizes COMPUTE↔MEMORY transitions to exploit CPU prefetch overlap

@@ -22,7 +22,7 @@ def _find_lib() -> str:
         if os.path.exists(path):
             return path
     raise FileNotFoundError(
-        "libsengine_cpu.so not found. Build it with: cd sengine-cpu/csrc && make")
+        "libsengine_cpu.so not found. Build it with: cd sengine_cpu/csrc && make NO_BLAS=1")
 
 
 def _preload_blas() -> str | None:

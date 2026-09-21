@@ -8,13 +8,9 @@ Args signature (5 buffers):
   -> spike(M, F), new_mem(M, F)
 """
 
-import os, sys
+from sengine_cpu.tvm_env import inject_tvm_site_packages
 
-_TVM_VENV = "/home/twt/tvm_build/tvm_venv"
-if os.path.isdir(_TVM_VENV):
-    _TVM_SITE = os.path.join(_TVM_VENV, "lib/python3.12/site-packages")
-    if _TVM_SITE not in sys.path:
-        sys.path.insert(0, _TVM_SITE)
+inject_tvm_site_packages()
 
 
 def make_add_lif(M: int, F: int,

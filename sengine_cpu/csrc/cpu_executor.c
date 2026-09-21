@@ -1,5 +1,5 @@
 /**
- * sengine-cpu executor implementation.
+ * sengine_cpu executor implementation.
  *
  * Self-contained C runtime that loads compiled .so kernel files via
  * dlopen and dispatches execution through a pre-computed schedule.
@@ -33,7 +33,7 @@ CPUExecutor* sengine_cpu_create(int n_threads)
 {
     CPUExecutor* e = (CPUExecutor*)calloc(1, sizeof(CPUExecutor));
     if (!e) {
-        fprintf(stderr, "[sengine-cpu] allocation failed\n");
+        fprintf(stderr, "[sengine_cpu] allocation failed\n");
         return NULL;
     }
 
@@ -108,7 +108,7 @@ int sengine_cpu_load_tvm(CPUExecutor* e, const char* so_path)
         e->tvm_kernels = (TVMKernel*)realloc(
             e->tvm_kernels, e->max_tvm_kernels * sizeof(TVMKernel));
         if (!e->tvm_kernels) {
-            fprintf(stderr, "[sengine-cpu] realloc tvm_kernels failed\n");
+            fprintf(stderr, "[sengine_cpu] realloc tvm_kernels failed\n");
             return -1;
         }
         /* Zero new entries */
@@ -121,7 +121,7 @@ int sengine_cpu_load_tvm(CPUExecutor* e, const char* so_path)
 
     k->dl_handle = dlopen(so_path, RTLD_LAZY | RTLD_LOCAL);
     if (!k->dl_handle) {
-        fprintf(stderr, "[sengine-cpu] dlopen failed: %s\n", dlerror());
+        fprintf(stderr, "[sengine_cpu] dlopen failed: %s\n", dlerror());
         return -1;
     }
 
@@ -130,7 +130,7 @@ int sengine_cpu_load_tvm(CPUExecutor* e, const char* so_path)
     k->call_fn = dlsym(k->dl_handle, "call");
 
     if (!k->call_fn) {
-        fprintf(stderr, "[sengine-cpu] no call() symbol in %s\n", so_path);
+        fprintf(stderr, "[sengine_cpu] no call() symbol in %s\n", so_path);
         dlclose(k->dl_handle);
         k->dl_handle = NULL;
         return -1;
@@ -141,7 +141,7 @@ int sengine_cpu_load_tvm(CPUExecutor* e, const char* so_path)
     if (k->init_fn) {
         int ret = k->init_fn();
         if (ret != 0) {
-            fprintf(stderr, "[sengine-cpu] init() failed in %s (ret=%d)\n",
+            fprintf(stderr, "[sengine_cpu] init() failed in %s (ret=%d)\n",
                     so_path, ret);
             dlclose(k->dl_handle);
             k->dl_handle = NULL;
@@ -352,7 +352,7 @@ void sengine_cpu_set_conv_node(CPUExecutor* e, int nid,
     size_t M = (size_t)B * OH * OW, K = (size_t)KH * KW * C_in;
     free(nd->conv_col);
     nd->conv_col = (float*)aligned_alloc(64, ((M * K * sizeof(float) + 63) / 64) * 64);
-    if (!nd->conv_col) fprintf(stderr, "[sengine-cpu] im2col alloc failed (node %d)\n", nid);
+    if (!nd->conv_col) fprintf(stderr, "[sengine_cpu] im2col alloc failed (node %d)\n", nid);
 }
 
 void sengine_cpu_set_softmax_node(CPUExecutor* e, int nid,
@@ -443,7 +443,7 @@ void sengine_cpu_execute(CPUExecutor* e)
                 break;
             default:
                 fprintf(stderr,
-                    "[sengine-cpu] unsupported TVM arity %d at node %d\n",
+                    "[sengine_cpu] unsupported TVM arity %d at node %d\n",
                     nd->tvm_n_args, nid);
                 break;
             }
@@ -526,7 +526,7 @@ void sengine_cpu_execute(CPUExecutor* e)
 
         default:
             fprintf(stderr,
-                "[sengine-cpu] unknown kernel type %d at node %d\n",
+                "[sengine_cpu] unknown kernel type %d at node %d\n",
                 nd->type, nid);
             break;
         }

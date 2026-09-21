@@ -1,4 +1,4 @@
-"""Graph optimization passes for sengine-cpu.
+"""Graph optimization passes for sengine_cpu.
 
 Passes (applied in order):
 1. BN folding:       Absorb BatchNorm into preceding Conv/Gemm
@@ -23,16 +23,17 @@ def _native_conv_backend() -> bool:
     """True when conv layers should use the native C kernel instead of TVM.
 
     SENGINE_CPU_BACKEND=native|tvm forces a choice; the default ('auto') uses
-    TVM only when its isolated interpreter exists on this machine.
+    TVM only when its isolated interpreter exists (see sengine_cpu/tvm_env.py).
     """
     import os
+    from sengine_cpu.tvm_env import tvm_available, require_tvm_python
     mode = os.environ.get("SENGINE_CPU_BACKEND", "auto").lower()
     if mode == "native":
         return True
     if mode == "tvm":
+        require_tvm_python()
         return False
-    from sengine_cpu.build.tvm_compiler import TVM_PYTHON
-    return not os.path.exists(TVM_PYTHON)
+    return not tvm_available()
 
 
 def optimize_ir(ir: EngineIR, batch_size: int = 1, T: int = 4) -> EngineIR:

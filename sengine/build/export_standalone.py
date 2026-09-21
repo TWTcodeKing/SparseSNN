@@ -36,18 +36,22 @@ def _get_include_paths():
 
 def export_kernel_so(kern, output_path: str,
                      nvcc: str | None = None,
-                     arch: str = 'sm_89') -> str:
+                     arch: str | None = None) -> str:
     """Export a TileLang JITKernel as a standalone .so.
 
     Args:
         kern: TileLang JITKernel object (from @tilelang.jit)
         output_path: Where to write the .so file
         nvcc: Path to nvcc compiler
-        arch: CUDA architecture (e.g., 'sm_89' for RTX 4090)
+        arch: CUDA architecture (e.g., 'sm_89' for RTX 4090); defaults to the
+              active target profile's arch.
 
     Returns:
         Path to the compiled .so file
     """
+    if arch is None:
+        from sengine.targets import active_target
+        arch = active_target().arch
     from tilelang import tvm
     from tilelang.jit.adapter.wrapper import TLCUDASourceWrapper
 
@@ -105,7 +109,7 @@ def export_kernel_so(kern, output_path: str,
 
 def export_all_kernels(kernels: dict, ir, build_dir: str,
                        nvcc: str | None = None,
-                       arch: str = 'sm_89') -> dict[int, str]:
+                       arch: str | None = None) -> dict[int, str]:
     """Export all TileLang kernels in a schedule to standalone .so files.
 
     Args:

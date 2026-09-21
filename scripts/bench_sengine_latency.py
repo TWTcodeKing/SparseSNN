@@ -25,6 +25,12 @@ Usage:
     # Export only (for cross-platform: export on x86, build on Jetson Orin)
     python scripts/bench_sengine_latency.py \
         --model sew_resnet18 --dataset imagenet --T 4 --export-only
+
+    # On the Jetson AGX Orin (sengine target profile 'orin' is auto-detected;
+    # --target forces it, e.g. for a functional check on x86)
+    python scripts/bench_sengine_latency.py \
+        --model sew_resnet18 --dataset imagenet --T 4 --batch-sizes 1 \
+        --fusion slicer --autotune --target orin --power-mode MAXN
 """
 
 import argparse
@@ -158,6 +164,12 @@ def main():
     parser.add_argument('--precision', type=str, default='fp16',
                         choices=['fp16', 'fp32'], help='Global precision (fp16 or fp32)')
     parser.add_argument('--gpu-ids', type=str, default='0')
+    parser.add_argument('--target', type=str, default='auto',
+                        choices=['auto', 'ada', 'a100', 'orin'],
+                        help='sengine target profile (default: auto-detect from the GPU; '
+                             'env SENGINE_TARGET also works)')
+    parser.add_argument('--power-mode', type=str, default=None,
+                        help='Jetson power mode hint (e.g. MAXN, 30W, 15W); logged only')
     args = parser.parse_args()
 
     if not args.model and not args.config:
@@ -184,6 +196,11 @@ def main():
     gpu_sms = props.multi_processor_count
     gpu_mem = props.total_memory / 1e9
     print(f"GPU {physical_gpu}: {gpu_name} ({gpu_arch}, {gpu_sms} SMs, {gpu_mem:.1f} GB)")
+    from sengine.targets import set_active_target
+    target = set_active_target(args.target)
+    print(f"Target profile: {target}")
+    if args.power_mode:
+        print(f"Power mode: {args.power_mode}")
     print(f"Model: {tag} | Dataset: {args.dataset} | T={args.T}")
     print(f"Fusion: {fusion_modes} | Autotune: {args.autotune} | Precision: {args.precision}")
 
@@ -264,7 +281,8 @@ def main():
                 e = sengine.build(plugin_onnx, T=args.T, batch_size=B,
                                   fusion=fusion, autotune=args.autotune,
                                   fusion_rec=rec_path,
-                                  precision=args.precision)
+                                  precision=args.precision,
+                                  target=target.name)
                 build_s = time.time() - t0
 
                 mode = 'C++' if not e._use_python_runtime else 'Python'
@@ -301,7 +319,8 @@ def main():
     # ── Results table ──
     print(f"\n{'='*80}")
     print(f"  {tag} | {args.dataset} | T={args.T}")
-    print(f"  GPU {device_id}: {gpu_name} ({gpu_arch}, {gpu_sms} SMs)")
+    print(f"  GPU {physical_gpu}: {gpu_name} ({gpu_arch}, {gpu_sms} SMs) | target={target.name}"
+          + (f" | power={args.power_mode}" if args.power_mode else ""))
     print(f"  Autotune: {args.autotune} | Precision: {args.precision}")
     print(f"{'='*80}")
     print(f"  {'Fusion':<10} {'Batch':<6} {'Latency':>10} {'Throughput':>12} "

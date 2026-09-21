@@ -39,7 +39,7 @@ def bench_sengine(args) -> float:
         print(f"  Loading sengine: {args.sengine}")
         print(f"{'='*60}")
         t0 = time.time()
-        engine = sengine.load(args.sengine)
+        engine = sengine.load(args.sengine, target=getattr(args, 'target', None))
         print(f"  Loaded in {time.time()-t0:.1f}s")
     elif args.onnx:
         print(f"\n{'='*60}")
@@ -51,7 +51,8 @@ def bench_sengine(args) -> float:
                                autotune=args.autotune,
                                fusion=args.fusion,
                                fusion_rec=getattr(args, 'fusion_rec', None),
-                               precision=getattr(args, 'precision', 'fp16'))
+                               precision=getattr(args, 'precision', 'fp16'),
+                               target=getattr(args, 'target', None))
         build_time = time.time() - t0
         cpp_mode = "C++ CUDA Graph" if not engine._use_python_runtime else "Python"
         print(f"  Built in {build_time:.1f}s ({cpp_mode})")
@@ -160,6 +161,9 @@ def main():
                        help='Fusion strategy (default: none)')
     build.add_argument('--fusion-rec', type=str, default=None,
                        help='Path to fusion recommendation JSON from validator pre-pass')
+    build.add_argument('--target', type=str, default='auto',
+                       choices=['auto', 'ada', 'a100', 'orin'],
+                       help='sengine target profile (default: auto-detect)')
     build.add_argument('--precision', type=str, default='fp16', choices=['fp16', 'fp32'],
                        help='Precision (default: fp16)')
     build.add_argument('--save', type=str, help='Save built engine to .sengine file')

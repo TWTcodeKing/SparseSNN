@@ -89,35 +89,32 @@ def classify_shape(M_per_t, K, N, T_steps, bpe=2):
 def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
     """Generate top-K tile config candidates using roofline classification.
 
-    Architecture-adaptive: expands search space for GPUs with larger shared
-    memory (A100: 164KB), higher bandwidth (A100: 2TB/s), or more pipeline
-    depth capability. Explores threads=256 and num_stages=4/5 on Ampere+.
+    The search space, grid filter, ranking weights and known-good list come
+    from the active target profile (`sengine.targets`): the RTX 4090 profile is
+    the historical default, A100 explores larger tiles / deeper pipelines /
+    512 threads, and Jetson Orin (16 SMs) weights grid coverage, occupancy and
+    wave efficiency.
 
     Args:
         bpe: bytes per element (2 for fp16, 4 for fp32).
     """
+    from sengine.targets import active_target
+    tp = active_target()
+    space = tp.roofline_space
+    rank = tp.roofline_rank
+
     hw = _detect_gpu()
     bound, ai, _ = classify_shape(M_per_t, K, N, T_steps, bpe)
     sm_count = hw['sm_count']
     max_smem = hw['max_smem_per_sm']
 
-    # Architecture-adaptive search space
-    is_ampere_plus = max_smem >= 160 * 1024  # A100: 164KB, H100: 228KB
-
-    bM_choices = [16, 32, 64, 128, 256]
-    bN_choices = [32, 64, 128, 256]
+    bM_choices = list(space.bM)
+    bN_choices = list(space.bN)
     # K-divisibility-aware: include block_K values that evenly divide C_in
     # to avoid wasted tail iterations in the K-loop
-    bK_base = [32, 64, 128] if bpe == 2 else [32, 64]
-    bK_divisors = set()
-    for bk in [32, 48, 64, 96, 128]:
-        if bpe == 4 and bk > 64:
-            continue
-        if K > 0 and K % bk == 0 and bk <= K:
-            bK_divisors.add(bk)
-    bK_choices = sorted(set(bK_base) | bK_divisors)
-    ns_choices = [2, 3, 4, 5] if is_ampere_plus else [2, 3]
-    thr_choices = [128, 256, 512] if is_ampere_plus else [128, 256]
+    bK_choices = tp.bK_for(space, K, bpe)
+    ns_choices = list(space.ns)
+    thr_choices = list(space.thr)
 
     all_cfgs = []
     for bM in bM_choices:
@@ -142,7 +139,7 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
                         # allow small grids for tiny GEMMs (e.g., attention hd×hd)
                         # where the problem size itself limits parallelism.
                         max_possible_grid = math.ceil(M_per_t / bM_choices[0]) * math.ceil(N / bN_choices[0])
-                        min_grid = max(sm_count // 16, 1) if is_ampere_plus else max(sm_count // 8, 1)
+                        min_grid = max(sm_count // space.min_grid_divisor, 1)
                         min_grid = min(min_grid, max_possible_grid)
                         if grid < min_grid:
                             continue
@@ -155,25 +152,41 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
         return [dict(block_M=32, block_N=64, block_K=max(16, min(32, K)),
                      num_stages=2, threads=128)]
 
-    # Ranking: balance tile area, grid coverage, K-loop depth, AND occupancy.
+    # Ranking: balance tile area, grid coverage, K-loop depth, occupancy and
+    # (on few-SM targets) wave efficiency.
     sm_half = sm_count // 2
     def _rank(cfg_tuple):
         cfg, grid, occ, area = cfg_tuple
         # Tile area: larger tiles = better tensor core utilization
-        # A100+ benefits from much larger tiles than consumer GPUs
-        area_cap = 16384 if is_ampere_plus else 4096
-        area_score = min(area, area_cap)
+        area_score = min(area, rank.area_cap)
         # Grid coverage: prefer configs that fill the GPU
-        grid_ok = 1.0 if grid >= sm_half else (0.7 if grid >= sm_count // 4 else 0.4)
+        if rank.grid_ok_mode == 'wave':
+            if grid >= sm_count * 2:
+                grid_ok = 1.0
+            elif grid >= sm_count:
+                grid_ok = 0.85
+            elif grid >= sm_half:
+                grid_ok = 0.5
+            else:
+                grid_ok = 0.2
+        else:
+            grid_ok = 1.0 if grid >= sm_half else (0.7 if grid >= sm_count // 4 else 0.4)
+        # Wave efficiency: fraction of SM slots used across all waves
+        # (grid=16 on 16 SMs -> 1.0, grid=17 -> 17/32).
+        if rank.wave_efficiency:
+            active_slots = sm_count * occ if occ >= 1 else sm_count
+            n_waves = math.ceil(grid / active_slots)
+            wave_eff = grid / (n_waves * active_slots) if n_waves > 0 else 0.5
+        else:
+            wave_eff = 1.0
         # K-loop depth penalty
         k_iters = math.ceil(K / cfg['block_K'])
-        k_eff = min(1.0, 256.0 / k_iters) if k_iters > 256 else 1.0
-        # Occupancy bonus: higher occupancy helps hide memory latency,
-        # especially on high-bandwidth GPUs (A100: 2TB/s)
-        occ_score = 1.0 + 0.15 * min(occ, 4) if is_ampere_plus else 1.0
-        # Pipeline depth bonus: deeper pipeline on high-BW GPUs
-        ns_bonus = 1.0 + 0.05 * (cfg['num_stages'] - 2) if is_ampere_plus else 1.0
-        return -(area_score * grid_ok * k_eff * occ_score * ns_bonus)
+        k_eff = min(1.0, rank.k_iters_ref / k_iters) if k_iters > rank.k_iters_ref else 1.0
+        # Occupancy bonus: hides memory latency (high-BW GPUs, LPDDR5)
+        occ_score = 1.0 + rank.occ_bonus * min(occ, 4)
+        # Pipeline depth bonus
+        ns_bonus = 1.0 + rank.ns_bonus * (cfg['num_stages'] - 2)
+        return -(area_score * grid_ok * wave_eff * k_eff * occ_score * ns_bonus)
 
     all_cfgs.sort(key=_rank)
 
@@ -190,43 +203,9 @@ def prune_candidates(M_per_t, K, N, T_steps, n_membranes=1, top_k=5, bpe=2):
         if len(pruned) >= top_k:
             break
 
-    # Architecture-specific known-good configs (cuBLAS-inspired tile shapes)
-    if is_ampere_plus:
-        known_good = [
-            # cuBLAS A100 typical configs — square & rectangular
-            dict(block_M=128, block_N=128, block_K=64, num_stages=3, threads=256),
-            dict(block_M=128, block_N=128, block_K=32, num_stages=4, threads=256),
-            dict(block_M=64, block_N=128, block_K=64, num_stages=4, threads=256),
-            dict(block_M=128, block_N=64, block_K=64, num_stages=4, threads=256),
-            dict(block_M=64, block_N=64, block_K=64, num_stages=4, threads=128),
-            dict(block_M=256, block_N=64, block_K=64, num_stages=3, threads=256),
-            dict(block_M=64, block_N=256, block_K=64, num_stages=3, threads=256),
-            # Asymmetric tiles for M>>N or M<<N shapes
-            dict(block_M=32, block_N=128, block_K=64, num_stages=4, threads=128),
-            dict(block_M=128, block_N=32, block_K=64, num_stages=4, threads=128),
-            dict(block_M=256, block_N=128, block_K=64, num_stages=3, threads=256),
-            dict(block_M=128, block_N=256, block_K=64, num_stages=3, threads=256),
-            # Deeper pipeline variants
-            dict(block_M=64, block_N=128, block_K=64, num_stages=5, threads=128),
-            dict(block_M=128, block_N=64, block_K=64, num_stages=5, threads=128),
-            # K-divisibility configs for common C_in values (96, 192, 384, 768)
-            dict(block_M=64, block_N=128, block_K=96, num_stages=3, threads=256),
-            dict(block_M=128, block_N=64, block_K=96, num_stages=3, threads=256),
-            dict(block_M=64, block_N=64, block_K=48, num_stages=4, threads=128),
-        ]
-    else:
-        known_good = [
-            dict(block_M=64, block_N=64, block_K=32, num_stages=2, threads=128),
-            dict(block_M=32, block_N=64, block_K=32, num_stages=2, threads=128),
-            dict(block_M=64, block_N=64, block_K=64, num_stages=2, threads=128),
-            dict(block_M=64, block_N=128, block_K=32, num_stages=2, threads=128),
-            dict(block_M=128, block_N=64, block_K=32, num_stages=2, threads=128),
-            # Asymmetric tiles for narrow GEMM shapes
-            dict(block_M=32, block_N=128, block_K=32, num_stages=2, threads=128),
-            dict(block_M=128, block_N=32, block_K=32, num_stages=2, threads=128),
-            dict(block_M=64, block_N=64, block_K=64, num_stages=3, threads=128),
-        ]
-    for kg in known_good:
+    # Target-specific known-good configs (cuBLAS-inspired tile shapes)
+    for kg in tp.known_good:
+        kg = dict(kg)
         if kg['block_K'] > K:
             continue
         if kg['block_M'] * kg['block_N'] < kg['threads']:

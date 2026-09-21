@@ -34,6 +34,10 @@ def setup_executor_from_plan(
 
     Returns a ready-to-capture CppExecutor.
     """
+    import os as _os
+    from sengine.targets import active_target
+    _tp = active_target()
+
     exe = CppExecutor()
     max_nid = max(n.nid for n in plan.nodes) if plan.nodes else 0
     exe.alloc_nodes(max_nid)
@@ -41,6 +45,11 @@ def setup_executor_from_plan(
 
     # Set global precision flag
     exe.set_fp32(ir.precision == "fp32")
+
+    # Memory-bound native kernels (IF/LIF/Add/Pool/TemporalMean) prefer the
+    # max-L1 carveout on targets with a small unified L1/smem (Orin).
+    if _tp.l1_carveout_native_kernels or _os.environ.get('SENGINE_PREFER_L1', '0') == '1':
+        exe.set_prefer_l1(True)
 
     # ── Build buffer ID → GPU pointer map ──
     buf_ptrs: dict[int, int] = {}  # buf_id → raw GPU pointer
@@ -504,5 +513,26 @@ def setup_executor_from_plan(
         else:
             logger.warning("  Plan executor: unknown kernel_type '%s' for #%d", kt, nid)
             exe.set_skip_node(nid)
+
+    # ── L2 cache persistence for weight buffers (Orin profile) ──
+    # Pins the weight buffers (read every timestep) in persisting L2 so they
+    # are not refetched from LPDDR5 across T. Profile-gated; SENGINE_L2_PERSIST=1 forces it.
+    if _tp.l2_persist or _os.environ.get('SENGINE_L2_PERSIST', '0') == '1':
+        weight_ptrs, weight_sizes = [], []
+        elem_bytes = 4 if ir.precision == "fp32" else 2
+        for bd in plan.buffers:
+            if bd.category in ("weight", "weight_1x1"):
+                ptr = buf_ptrs.get(bd.buf_id, 0)
+                if ptr:
+                    nbytes = elem_bytes
+                    for d in bd.shape:
+                        nbytes *= d
+                    weight_ptrs.append(ptr)
+                    weight_sizes.append(nbytes)
+        if weight_ptrs:
+            try:
+                exe.setup_l2_persistence(weight_ptrs, weight_sizes)
+            except Exception as e:
+                logger.warning("  L2 persistence setup failed: %s", e)
 
     return exe

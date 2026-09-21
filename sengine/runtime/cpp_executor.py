@@ -10,23 +10,46 @@ import ctypes
 import os
 from typing import Optional
 
-_LIB_PATH = os.path.join(os.path.dirname(__file__), '..', 'csrc', 'libsengine_exec.so')
+_CSRC_DIR = os.path.join(os.path.dirname(__file__), '..', 'csrc')
+_LIB_PATH = os.path.join(_CSRC_DIR, 'libsengine_exec.so')
+_PREBUILT_DIR = os.path.join(_CSRC_DIR, 'prebuilt')
 _lib: Optional[ctypes.CDLL] = None
+
+
+def _current_arch() -> str:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            p = torch.cuda.get_device_properties(torch.cuda.current_device())
+            return f"sm_{p.major}{p.minor}"
+    except Exception:
+        pass
+    from sengine.targets import active_target
+    return active_target().arch
+
+
+def _resolve_lib_path() -> str:
+    """csrc/libsengine_exec.so (built by `make lib`), else csrc/prebuilt/libsengine_exec.<arch>.so."""
+    if os.path.exists(_LIB_PATH):
+        return _LIB_PATH
+    arch = _current_arch()
+    prebuilt = os.path.join(_PREBUILT_DIR, f'libsengine_exec.{arch}.so')
+    if os.path.exists(prebuilt):
+        return prebuilt
+    raise FileNotFoundError(
+        f"libsengine_exec.so not found at {os.path.abspath(_LIB_PATH)} and no prebuilt "
+        f"binary for {arch} at {os.path.abspath(prebuilt)}. Build it with\n"
+        f"    make -C sengine/csrc lib            # RTX 4090 (sm_89, CUDA 12.8)\n"
+        f"    make -C sengine/csrc lib ARCH=\"-gencode arch=compute_{arch[3:]},code={arch}\" "
+        f"CUDA_HOME=/usr/local/cuda   # other GPUs, e.g. Jetson Orin sm_87"
+    )
 
 
 def _load_lib():
     global _lib
     if _lib is not None:
         return _lib
-    if not os.path.exists(_LIB_PATH):
-        raise FileNotFoundError(
-            f"libsengine_exec.so not found at {_LIB_PATH}. "
-            "Compile with: nvcc -O3 --use_fast_math -shared -Xcompiler -fPIC "
-            "-gencode=arch=compute_89,code=sm_89 "
-            "-o sengine/csrc/libsengine_exec.so sengine/csrc/cpp_executor.cu "
-            "-lcudart -ldl -lcublas"
-        )
-    _lib = ctypes.CDLL(_LIB_PATH)
+    _lib = ctypes.CDLL(_resolve_lib_path())
     _setup_signatures(_lib)
     return _lib
 
@@ -83,6 +106,12 @@ def _setup_signatures(lib):
     lib.sengine_set_ilif_node.argtypes = [VP, CI, VP, VP, VP, CI, CI, CF, CF]
     lib.sengine_set_softmax_node.argtypes = [VP, CI, VP, VP, CI, CI]
     lib.sengine_add_membrane.argtypes = [VP, VP, CI]
+
+    # Target-profile knobs (Orin): persisting-L2 weight window, max-L1 carveout
+    lib.sengine_setup_l2_persistence.argtypes = [VP, ctypes.POINTER(VP),
+                                                 ctypes.POINTER(ctypes.c_size_t), CI]
+    lib.sengine_set_prefer_l1.argtypes = [VP, CI]
+    lib.sengine_set_prefer_l1.restype = CI
 
     lib.sengine_execute.argtypes = [VP]
     lib.sengine_set_fp32.argtypes = [VP, CI]
@@ -268,6 +297,22 @@ class CppExecutor:
     def set_softmax_node(self, nid, in_ptr, out_ptr, outer, inner):
         self._lib.sengine_set_softmax_node(self._handle, nid,
             ctypes.c_void_p(in_ptr), ctypes.c_void_p(out_ptr), outer, inner)
+
+    # ─── Target-profile knobs ───
+
+    def setup_l2_persistence(self, weight_ptrs: list[int], weight_sizes: list[int]):
+        """Pin weight buffers in persisting L2 (Orin profile). Call before capture_graph()."""
+        n = len(weight_ptrs)
+        if n == 0:
+            return
+        VP = ctypes.c_void_p
+        arr_vp = (VP * n)(*[VP(p) for p in weight_ptrs])
+        arr_sz = (ctypes.c_size_t * n)(*weight_sizes)
+        self._lib.sengine_setup_l2_persistence(self._handle, arr_vp, arr_sz, n)
+
+    def set_prefer_l1(self, enable: bool = True) -> int:
+        """Ask the native memory-bound kernels for the max-L1 shared-memory carveout."""
+        return self._lib.sengine_set_prefer_l1(self._handle, 1 if enable else 0)
 
     # ─── Execution ───
 

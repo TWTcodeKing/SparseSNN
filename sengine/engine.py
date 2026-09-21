@@ -51,20 +51,29 @@ TILELANG_CUSTOM_VARIANTS = frozenset({
 })
 
 
-def _detect_arch() -> str:
-    """Detect current GPU SM architecture."""
-    if not torch.cuda.is_available():
-        return 'sm_80'
-    props = torch.cuda.get_device_properties(0)
-    return f'sm_{props.major}{props.minor}'
+def _detect_arch(profile=None) -> str:
+    """SM architecture of the current GPU (kernels are always compiled for the
+    device that runs them); falls back to the target profile's arch."""
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return f'sm_{props.major}{props.minor}'
+    from sengine.targets import active_target
+    return (profile or active_target()).arch
 
 
-def _detect_nvcc() -> str:
-    """Find nvcc binary."""
-    for path in ['/usr/local/cuda-12.8/bin/nvcc', '/usr/local/cuda/bin/nvcc']:
+def _detect_nvcc(profile=None) -> str:
+    """Find nvcc: the target profile's search list, then PATH."""
+    from sengine.targets import active_target
+    for path in (profile or active_target()).nvcc_paths:
         if os.path.exists(path):
             return path
     return 'nvcc'
+
+
+def _kernel_build_dir(profile, batch_size: int) -> str:
+    """<repo>/.cache/<profile.cache_subdir> — kept per target so caches don't mix."""
+    return os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                        '.cache', profile.cache_dir_for(batch_size))
 
 
 class SEngine:
@@ -85,6 +94,7 @@ class SEngine:
         self.T: int = 4
         self.batch_size: int = 1
         self._graph_captured: bool = False
+        self._target = None
 
     # ─── Build API ───
 
@@ -92,7 +102,7 @@ class SEngine:
     def build(onnx_path: str, T: int = 4, batch_size: int = 1,
               autotune: bool = False, build_dir: str | None = None,
               fusion: str = "none", fusion_rec: str = None,
-              precision: str = "fp16") -> SEngine:
+              precision: str = "fp16", target: str | None = None) -> SEngine:
         """Build an engine from an ONNX file.
 
         Args:
@@ -100,22 +110,29 @@ class SEngine:
             T: Number of temporal steps.
             batch_size: Inference batch size.
             autotune: Run autotuning sweep for tile configs.
-            build_dir: Directory for compiled .so files (default: /tmp/sengine_B{batch}).
+            build_dir: Directory for compiled .so files (default: <repo>/.cache/<target>_B{batch}).
             fusion: Fusion strategy — 'none' or 'slicer'.
             fusion_rec: Path to fusion recommendation JSON from validator pre-pass.
             precision: Global precision — 'fp16' or 'fp32'.
+            target: Target profile name ('ada', 'a100', 'orin'); None/'auto' picks
+                    from SENGINE_TARGET or the detected GPU (see sengine.targets).
 
         Returns:
             Ready-to-run SEngine instance.
         """
+        from sengine.targets import set_active_target
+        profile = set_active_target(target)
+
         eng = SEngine()
         eng.T = T
         eng.batch_size = batch_size
         eng._precision = precision
+        eng._target = profile
 
         t0 = time.time()
-        arch = _detect_arch()
-        nvcc = _detect_nvcc()
+        arch = _detect_arch(profile)
+        nvcc = _detect_nvcc(profile)
+        logger.phase("BUILD", "Target profile: %s", profile)
         logger.phase("BUILD", "Target: %s, T=%d, B=%d, fusion=%s", arch, T, batch_size, fusion)
 
         # 1. Build Python engine (parse → optimize → compile → schedule)
@@ -129,8 +146,7 @@ class SEngine:
 
         # 2. Export TileLang kernels as standalone .so
         if build_dir is None:
-            build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                                     '.cache', f'sengine_B{batch_size}')
+            build_dir = _kernel_build_dir(profile, batch_size)
         eng._kernel_so_map = export_all_kernels(
             eng._kernels, eng._ir, build_dir, nvcc=nvcc, arch=arch)
 
@@ -205,7 +221,8 @@ class SEngine:
         logger.phase("SAVE", "Saved to %s (%.1f MB)", path, os.path.getsize(path) / 1e6)
 
     @staticmethod
-    def load(path: str, build_dir: str | None = None) -> SEngine:
+    def load(path: str, build_dir: str | None = None,
+             target: str | None = None) -> SEngine:
         """Load engine from .sengine file.
 
         Recompiles TileLang kernels for the current GPU (fast, uses cached tile configs).
@@ -213,6 +230,7 @@ class SEngine:
         Args:
             path: Path to .sengine file.
             build_dir: Directory for compiled .so files.
+            target: Target profile name (see build()).
 
         Returns:
             Ready-to-run SEngine instance.
@@ -220,11 +238,15 @@ class SEngine:
         from sengine.build.sengine_io import load_sengine
         from sengine.build.tilelang_compiler import TileLangCompiler
         from sengine.cuda_graph_runtime import CUDAGraphEngine
+        from sengine.targets import set_active_target
+        profile = set_active_target(target)
 
         eng = SEngine()
+        eng._target = profile
         t0 = time.time()
-        arch = _detect_arch()
-        nvcc = _detect_nvcc()
+        arch = _detect_arch(profile)
+        nvcc = _detect_nvcc(profile)
+        logger.phase("LOAD", "Target profile: %s", profile)
 
         # 1. Load IR + schedule from file
         ir, schedule, T, batch_size = load_sengine(path)
@@ -243,8 +265,7 @@ class SEngine:
 
         # 4. Export standalone .so + C++ executor
         if build_dir is None:
-            build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                                     '.cache', f'sengine_B{batch_size}')
+            build_dir = _kernel_build_dir(profile, batch_size)
         eng._kernel_so_map = export_all_kernels(
             eng._kernels, ir, build_dir, nvcc=nvcc, arch=arch)
         eng._setup_cpp_executor()
@@ -887,12 +908,14 @@ def build(onnx_path: str, T: int = 4, batch_size: int = 1, **kwargs) -> SEngine:
         batch_size: Inference batch size.
         fusion: Fusion strategy — 'none' (ablation) or 'slicer' (graph slicer).
         autotune: Run autotuning sweep for tile configs.
+        target: 'ada' (RTX 4090), 'a100', 'orin' (Jetson AGX Orin) or None/'auto'.
 
     Returns:
         Ready-to-run SEngine instance.
 
     Example:
         engine = sengine.build("model.onnx", T=4, batch_size=1, fusion='slicer')
+        engine = sengine.build("model.onnx", T=4, batch_size=1, fusion='slicer', target='orin')
     """
     return SEngine.build(onnx_path, T=T, batch_size=batch_size, **kwargs)
 

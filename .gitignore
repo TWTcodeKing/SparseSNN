@@ -33,7 +33,6 @@ obc_pt_ft/
 # engine / benchmark artifacts
 sengine/exports/
 sengine/exports_trained/
-sengine_edge/exports/
 trt_engines/
 trt_engines_fp32/
 onnxrt_exports/
@@ -44,7 +43,6 @@ experiments/gpu_util/ncu_reports/
 
 # compiled executors (rebuild with make)
 sengine/csrc/sengine_exec
-sengine_edge/csrc/sengine_exec
 
 # local-only notes (early design docs, PDFs)
 docs/archive/

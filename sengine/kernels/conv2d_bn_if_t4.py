@@ -38,16 +38,18 @@ _HOPPER = _is_hopper()
 
 
 # ---------------------------------------------------------------------------
-# Config space for autotuning (SM89 / RTX 4090)
+# Config space for autotuning (block_M / block_N ranges from the target profile)
 # ---------------------------------------------------------------------------
 
 def _make_configs_conv(C_in, F, K, OH, OW, TB):
     """Generate tile config space based on problem dimensions."""
+    from sengine.targets import active_target
+    tp = active_target()
     K_red = K * K * C_in
     M = TB * OH * OW
     configs = []
-    for block_M in [32, 64, 128, 256]:
-        for block_N in [32, 64, 128, 256]:
+    for block_M in tp.conv_autotune_bM:
+        for block_N in tp.conv_autotune_bN:
             for block_K in [32, 64]:
                 for num_stages in [2, 3, 4]:
                     for threads in [128, 256]:
@@ -1277,6 +1279,289 @@ def conv2d_bn_if_interleaved_kernel(
                         m = by * block_M + i; f = bx * block_N + j
                         if m < M_per_t and f < F:
                             spikes_flat[t * M_per_t + m, f] = out_shared[i, j]
+
+            # Write final membrane
+            for i, j in T.Parallel(block_M, block_N):
+                m = by * block_M + i
+                f = bx * block_N + j
+                if m < M_per_t and f < F:
+                    state[m, f] = mem_frag[i, j]
+
+    return main
+
+
+# ---------------------------------------------------------------------------
+# Kernel: Conv3x3+BN+IF interleaved, hand-unrolled T=4 (Jetson Orin profile)
+#
+# K-outer / T-inner: the weight tile is loaded once per K iteration and
+# reused for all four timesteps (75% less weight traffic than the T-outer
+# loop above). Four im2col tiles + four accumulators, then four sequential
+# BN+IF epilogues so the membrane flows t=0..3. Requires num_stages=1 and
+# T_steps == 4; the compiler selects it via TargetProfile.conv3x3_interleaved_variant.
+# ---------------------------------------------------------------------------
+
+@tilelang.jit(out_idx=[-1])
+def conv2d_bn_if_interleaved_t4_unrolled_kernel(
+    B, C_in, H, W, F, K, S, D, P, T_steps,
+    block_M, block_N, block_K, num_stages, threads,
+    v_threshold=1.0, v_reset=0.0,
+    io_dtype=T.float16,
+    recip_tau=None,
+):
+    """Interleaved Conv3x3+BN+IF with K-outer/T-inner loop order.
+
+    Weight loaded once per k_iter, data gathered T times → 75% weight
+    bandwidth saving vs T-outer approach. Grid covers B*OH*OW spatial
+    positions; membrane state persists in fragment across T iterations.
+
+    Requires T_steps == 4 (manually unrolled to avoid TVM Var indexing).
+    """
+    if T_steps != 4:
+        raise ValueError(
+            f"conv2d_bn_if_interleaved_t4_unrolled_kernel requires T_steps=4, got {T_steps}; "
+            "the compiler falls back to conv2d_bn_if_interleaved_kernel for other T")
+    KH = KW = K
+    OH = (H + 2 * P - D * (K - 1) - 1) // S + 1
+    OW = (W + 2 * P - D * (K - 1) - 1) // S + 1
+    M_per_t = B * OH * OW
+    K_red = KH * KW * C_in
+    TB = T_steps * B
+    # IF: decay=1, rt=1. LIF: decay=1-1/tau, rt=1/tau (models.neurons.LIFNeuron).
+    _rt = float(recip_tau) if recip_tau is not None else 1.0
+    _decay = (1.0 - _rt) if recip_tau is not None else 1.0
+
+    @T.prim_func
+    def main(
+        data:     T.Tensor((TB, H, W, C_in), io_dtype),
+        weight:   T.Tensor((KH, KW, C_in, F), io_dtype),
+        state:    T.Tensor((M_per_t, F), T.float32),
+        bn_scale: T.Tensor((F,), T.float32),
+        bn_bias:  T.Tensor((F,), T.float32),
+        spikes:   T.Tensor((TB, OH, OW, F), io_dtype),
+    ):
+        weight_flat = T.Tensor((K_red, F), io_dtype, weight.data)
+        spikes_flat = T.Tensor((TB * OH * OW, F), io_dtype, spikes.data)
+
+        with T.Kernel(
+            T.ceildiv(F, block_N), T.ceildiv(M_per_t, block_M),
+            threads=threads,
+        ) as (bx, by):
+            # One im2col tile per unrolled timestep: TileLang's pipeline planner
+            # rejects multiple writes to one shared buffer inside T.Pipelined.
+            data_shared0  = T.alloc_shared((block_M, block_K), io_dtype)
+            data_shared1  = T.alloc_shared((block_M, block_K), io_dtype)
+            data_shared2  = T.alloc_shared((block_M, block_K), io_dtype)
+            data_shared3  = T.alloc_shared((block_M, block_K), io_dtype)
+            weight_shared = T.alloc_shared((block_K, block_N), io_dtype)
+            mem_frag      = T.alloc_fragment((block_M, block_N), T.float32)
+            out_shared    = T.alloc_shared((block_M, block_N), io_dtype)
+
+            # 4 accumulators — one per timestep (T_steps must be 4).
+            # K-outer/T-inner loop order: weight loaded once per k_iter.
+            acc0 = T.alloc_fragment((block_M, block_N), T.float32)
+            acc1 = T.alloc_fragment((block_M, block_N), T.float32)
+            acc2 = T.alloc_fragment((block_M, block_N), T.float32)
+            acc3 = T.alloc_fragment((block_M, block_N), T.float32)
+
+            # Load initial membrane
+            for i, j in T.Parallel(block_M, block_N):
+                m = by * block_M + i
+                f = bx * block_N + j
+                if m < M_per_t and f < F:
+                    mem_frag[i, j] = state[m, f]
+                else:
+                    mem_frag[i, j] = T.float32(0)
+
+            T.clear(acc0)
+            T.clear(acc1)
+            T.clear(acc2)
+            T.clear(acc3)
+
+            # ── K-outer / T-inner GEMM ──
+            # Weight loaded ONCE per k_iter; data gathered 4 times.
+            # Saves 75% of weight DRAM traffic vs T-outer.
+            for k_iter in T.Pipelined(
+                T.ceildiv(K_red, block_K), num_stages=num_stages,
+            ):
+                # NOTE: K_red = 9*C_in is a multiple of block_K for C_in >= 64; the
+                # stem kernel (C_in padded to 16) uses a bounds-guarded load instead.
+                T.copy(weight_flat[k_iter * block_K, bx * block_N],
+                       weight_shared)
+
+                # t=0
+                for i, j in T.Parallel(block_M, block_K):
+                    k = k_iter * block_K + j
+                    m = by * block_M + i
+                    n_idx = 0 * B + m // (OH * OW)
+                    hw = m % (OH * OW)
+                    oh = hw // OW
+                    ow = hw % OW
+                    kh = k // (KW * C_in)
+                    kw = (k // C_in) % KW
+                    cin = k % C_in
+                    ih = oh * S + kh * D - P
+                    iw = ow * S + kw * D - P
+                    ib = ((ih >= 0) and (iw >= 0) and (ih < H) and (iw < W)
+                          and (m < M_per_t) and (k < K_red))
+                    data_shared0[i, j] = T.if_then_else(
+                        ib, data[n_idx, ih, iw, cin], io_dtype(0))
+                T.gemm(data_shared0, weight_shared, acc0,
+                       policy=_warp_policy(block_M, block_N))
+
+                # t=1
+                for i, j in T.Parallel(block_M, block_K):
+                    k = k_iter * block_K + j
+                    m = by * block_M + i
+                    n_idx = 1 * B + m // (OH * OW)
+                    hw = m % (OH * OW)
+                    oh = hw // OW
+                    ow = hw % OW
+                    kh = k // (KW * C_in)
+                    kw = (k // C_in) % KW
+                    cin = k % C_in
+                    ih = oh * S + kh * D - P
+                    iw = ow * S + kw * D - P
+                    ib = ((ih >= 0) and (iw >= 0) and (ih < H) and (iw < W)
+                          and (m < M_per_t) and (k < K_red))
+                    data_shared1[i, j] = T.if_then_else(
+                        ib, data[n_idx, ih, iw, cin], io_dtype(0))
+                T.gemm(data_shared1, weight_shared, acc1,
+                       policy=_warp_policy(block_M, block_N))
+
+                # t=2
+                for i, j in T.Parallel(block_M, block_K):
+                    k = k_iter * block_K + j
+                    m = by * block_M + i
+                    n_idx = 2 * B + m // (OH * OW)
+                    hw = m % (OH * OW)
+                    oh = hw // OW
+                    ow = hw % OW
+                    kh = k // (KW * C_in)
+                    kw = (k // C_in) % KW
+                    cin = k % C_in
+                    ih = oh * S + kh * D - P
+                    iw = ow * S + kw * D - P
+                    ib = ((ih >= 0) and (iw >= 0) and (ih < H) and (iw < W)
+                          and (m < M_per_t) and (k < K_red))
+                    data_shared2[i, j] = T.if_then_else(
+                        ib, data[n_idx, ih, iw, cin], io_dtype(0))
+                T.gemm(data_shared2, weight_shared, acc2,
+                       policy=_warp_policy(block_M, block_N))
+
+                # t=3
+                for i, j in T.Parallel(block_M, block_K):
+                    k = k_iter * block_K + j
+                    m = by * block_M + i
+                    n_idx = 3 * B + m // (OH * OW)
+                    hw = m % (OH * OW)
+                    oh = hw // OW
+                    ow = hw % OW
+                    kh = k // (KW * C_in)
+                    kw = (k // C_in) % KW
+                    cin = k % C_in
+                    ih = oh * S + kh * D - P
+                    iw = ow * S + kw * D - P
+                    ib = ((ih >= 0) and (iw >= 0) and (ih < H) and (iw < W)
+                          and (m < M_per_t) and (k < K_red))
+                    data_shared3[i, j] = T.if_then_else(
+                        ib, data[n_idx, ih, iw, cin], io_dtype(0))
+                T.gemm(data_shared3, weight_shared, acc3,
+                       policy=_warp_policy(block_M, block_N))
+
+            # ── Sequential BN + IF epilogues ──
+            # t=0 before t=1 etc. so membrane state flows correctly.
+
+            # t=0
+            for i, j in T.Parallel(block_M, block_N):
+                m = by * block_M + i
+                f = bx * block_N + j
+                if m < M_per_t and f < F:
+                    bn_out = acc0[i, j] * bn_scale[f] + bn_bias[f]
+                    h = T.float32(_decay) * mem_frag[i, j] + T.float32(_rt) * bn_out
+                    spike = T.if_then_else(
+                        h >= T.float32(v_threshold),
+                        T.float32(1), T.float32(0))
+                    mem_frag[i, j] = (T.float32(1) - spike) * h + \
+                                      spike * T.float32(v_reset)
+                    out_shared[i, j] = T.cast(spike, io_dtype)
+            # Guarded store: a full-tile copy would spill rows past M_per_t into the
+            # next timestep's region when M_per_t % block_M != 0 (e.g. 250x90 inputs).
+            if M_per_t % block_M == 0 and F % block_N == 0:
+                T.copy(out_shared, spikes_flat[0 * M_per_t + by * block_M, bx * block_N])
+            else:
+                for i, j in T.Parallel(block_M, block_N):
+                    m = by * block_M + i; f = bx * block_N + j
+                    if m < M_per_t and f < F:
+                        spikes_flat[0 * M_per_t + m, f] = out_shared[i, j]
+
+            # t=1
+            for i, j in T.Parallel(block_M, block_N):
+                m = by * block_M + i
+                f = bx * block_N + j
+                if m < M_per_t and f < F:
+                    bn_out = acc1[i, j] * bn_scale[f] + bn_bias[f]
+                    h = T.float32(_decay) * mem_frag[i, j] + T.float32(_rt) * bn_out
+                    spike = T.if_then_else(
+                        h >= T.float32(v_threshold),
+                        T.float32(1), T.float32(0))
+                    mem_frag[i, j] = (T.float32(1) - spike) * h + \
+                                      spike * T.float32(v_reset)
+                    out_shared[i, j] = T.cast(spike, io_dtype)
+            # Guarded store: a full-tile copy would spill rows past M_per_t into the
+            # next timestep's region when M_per_t % block_M != 0 (e.g. 250x90 inputs).
+            if M_per_t % block_M == 0 and F % block_N == 0:
+                T.copy(out_shared, spikes_flat[1 * M_per_t + by * block_M, bx * block_N])
+            else:
+                for i, j in T.Parallel(block_M, block_N):
+                    m = by * block_M + i; f = bx * block_N + j
+                    if m < M_per_t and f < F:
+                        spikes_flat[1 * M_per_t + m, f] = out_shared[i, j]
+
+            # t=2
+            for i, j in T.Parallel(block_M, block_N):
+                m = by * block_M + i
+                f = bx * block_N + j
+                if m < M_per_t and f < F:
+                    bn_out = acc2[i, j] * bn_scale[f] + bn_bias[f]
+                    h = T.float32(_decay) * mem_frag[i, j] + T.float32(_rt) * bn_out
+                    spike = T.if_then_else(
+                        h >= T.float32(v_threshold),
+                        T.float32(1), T.float32(0))
+                    mem_frag[i, j] = (T.float32(1) - spike) * h + \
+                                      spike * T.float32(v_reset)
+                    out_shared[i, j] = T.cast(spike, io_dtype)
+            # Guarded store: a full-tile copy would spill rows past M_per_t into the
+            # next timestep's region when M_per_t % block_M != 0 (e.g. 250x90 inputs).
+            if M_per_t % block_M == 0 and F % block_N == 0:
+                T.copy(out_shared, spikes_flat[2 * M_per_t + by * block_M, bx * block_N])
+            else:
+                for i, j in T.Parallel(block_M, block_N):
+                    m = by * block_M + i; f = bx * block_N + j
+                    if m < M_per_t and f < F:
+                        spikes_flat[2 * M_per_t + m, f] = out_shared[i, j]
+
+            # t=3
+            for i, j in T.Parallel(block_M, block_N):
+                m = by * block_M + i
+                f = bx * block_N + j
+                if m < M_per_t and f < F:
+                    bn_out = acc3[i, j] * bn_scale[f] + bn_bias[f]
+                    h = T.float32(_decay) * mem_frag[i, j] + T.float32(_rt) * bn_out
+                    spike = T.if_then_else(
+                        h >= T.float32(v_threshold),
+                        T.float32(1), T.float32(0))
+                    mem_frag[i, j] = (T.float32(1) - spike) * h + \
+                                      spike * T.float32(v_reset)
+                    out_shared[i, j] = T.cast(spike, io_dtype)
+            # Guarded store: a full-tile copy would spill rows past M_per_t into the
+            # next timestep's region when M_per_t % block_M != 0 (e.g. 250x90 inputs).
+            if M_per_t % block_M == 0 and F % block_N == 0:
+                T.copy(out_shared, spikes_flat[3 * M_per_t + by * block_M, bx * block_N])
+            else:
+                for i, j in T.Parallel(block_M, block_N):
+                    m = by * block_M + i; f = bx * block_N + j
+                    if m < M_per_t and f < F:
+                        spikes_flat[3 * M_per_t + m, f] = out_shared[i, j]
 
             # Write final membrane
             for i, j in T.Parallel(block_M, block_N):

@@ -32,6 +32,8 @@ def _get_hw() -> dict:
     if _HW is not None:
         return _HW
 
+    from sengine.targets import active_target
+    tp = active_target()
     try:
         from sengine.tuning.hw_calibrate import calibrate
         cal = calibrate()
@@ -39,7 +41,8 @@ def _get_hw() -> dict:
             'sm_count': cal['sm_count'],
             'tc_tflops': cal['tc_tflops'],
             'mem_bw_gbps': cal['mem_bw_gbps'],
-            'l2_bw_gbps': cal['mem_bw_gbps'] * 4,  # ~4× DRAM as L2 estimate
+            # L2 BW estimate relative to DRAM (4x on 4090/A100, 2x on Orin's 4MB L2)
+            'l2_bw_gbps': cal['mem_bw_gbps'] * tp.l2_bw_multiplier,
             'l2_size_bytes': cal['l2_size_bytes'],
             'max_smem_per_sm': cal['max_smem_per_sm'],
             'max_regs_per_sm': cal['max_regs_per_sm'],
@@ -47,17 +50,18 @@ def _get_hw() -> dict:
             'max_blocks_per_sm': cal['max_blocks_per_sm'],
         }
     except Exception:
-        # Fallback: conservative defaults
+        # Fallback: the active target's hardware table
+        hw = tp.hw
         _HW = {
-            'sm_count': 128,
-            'tc_tflops': 82.6,
-            'mem_bw_gbps': 1008,
-            'l2_bw_gbps': 4000,
-            'l2_size_bytes': 72 * 1024 * 1024,
-            'max_smem_per_sm': 100 * 1024,
-            'max_regs_per_sm': 65536,
-            'max_threads_per_sm': 1536,
-            'max_blocks_per_sm': 16,
+            'sm_count': hw.sm_count,
+            'tc_tflops': hw.tc_tflops,
+            'mem_bw_gbps': hw.mem_bw_gbps,
+            'l2_bw_gbps': hw.mem_bw_gbps * tp.l2_bw_multiplier,
+            'l2_size_bytes': hw.l2_size_bytes,
+            'max_smem_per_sm': hw.max_smem,
+            'max_regs_per_sm': hw.max_regs_per_sm,
+            'max_threads_per_sm': hw.max_threads_per_sm,
+            'max_blocks_per_sm': hw.max_blocks_per_sm,
         }
     return _HW
 
@@ -111,9 +115,12 @@ def predict_interleaved_us(M_per_t, K, N, T_steps, bM, bN, bK, ns, thr,
     # Tile efficiency: tensor core MMA instructions operate on 16×16 fragments.
     # Small tiles (bM=16) have fewer fragments per CTA → worse instruction-level
     # parallelism, more pipeline bubbles, less register reuse.
-    # Reference area scales with GPU: A100 benefits from larger tiles.
+    # Reference area comes from the target profile (4096 on 4090, 8192 on
+    # A100, 2048 on Orin).
+    from sengine.targets import active_target
+    tp = active_target()
     tile_area = bM * bN
-    ref_area = 8192 if hw['max_smem_per_sm'] >= 160 * 1024 else 4096
+    ref_area = tp.analytical_ref_area
     tile_efficiency = min(1.0, (tile_area / ref_area) ** 0.5)
     # Clamp: even the smallest tile achieves at least 25% of peak
     tile_efficiency = max(0.25, tile_efficiency)
@@ -124,8 +131,9 @@ def predict_interleaved_us(M_per_t, K, N, T_steps, bM, bN, bK, ns, thr,
     data_bytes = M_per_t * K * 2  # FP16 input tile
     weight_bytes = K * N * 2      # FP16 weight
 
-    # Weight caching: after t=0, weight likely in L2 (if < L2 size)
-    weight_in_l2 = (weight_bytes < hw['l2_size_bytes'] * 0.5)
+    # Weight caching: after t=0, weight likely in L2 if it fits in a fraction
+    # of L2 (0.5 on 4090/A100; 0.3 on Orin's 4MB L2)
+    weight_in_l2 = (weight_bytes < hw['l2_size_bytes'] * tp.analytical_weight_l2_frac)
     weight_bw = l2_bytes_per_us if weight_in_l2 else dram_bytes_per_us
 
     t_data = data_bytes / dram_bytes_per_us     # data always from DRAM
@@ -194,15 +202,16 @@ def select_config_analytical(M_per_t, K, N, T_steps,
     Returns dict with block_M, block_N, block_K, num_stages, threads, latency_us.
     """
     hw = _get_hw()
-    is_high_bw = hw['max_smem_per_sm'] >= 160 * 1024  # A100+
+    from sengine.targets import active_target
+    space = active_target().analytical_space
 
     candidates = []
 
-    bM_choices = [16, 32, 64, 128, 256]
-    bN_choices = [32, 64, 128, 256]
-    bK_choices = [32, 64, 128]
-    ns_choices = [2, 3, 4] if is_high_bw else [2, 3]
-    thr_choices = [128, 256, 512] if is_high_bw else [128, 256]
+    bM_choices = list(space.bM)
+    bN_choices = list(space.bN)
+    bK_choices = list(space.bK)
+    ns_choices = list(space.ns)
+    thr_choices = list(space.thr)
 
     for bM in bM_choices:
         for bN in bN_choices:
@@ -217,7 +226,7 @@ def select_config_analytical(M_per_t, K, N, T_steps,
                         if smem > hw['max_smem_per_sm']:
                             continue
                         grid = math.ceil(M_per_t / bM) * math.ceil(N / bN)
-                        if grid < hw['sm_count'] // 8:
+                        if grid < max(hw['sm_count'] // space.min_grid_divisor, 1):
                             continue
 
                         us, details = predict_interleaved_us(

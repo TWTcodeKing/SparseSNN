@@ -1,7 +1,8 @@
 """Analytical roofline cost model for SNN operator latency estimation.
 
 Estimates per-operator latency using max(compute_time, memory_time) roofline
-model. Calibrated against nsys profiling data from RTX 4090.
+model. Calibration factors come from the active target profile
+(RTX 4090 by default; see sengine/targets).
 
 Used by the SliceGraph DP partitioner (Phase 2) for balanced stage assignment
 and by the PTB scheduler (Phase 3) for SM allocation.
@@ -113,7 +114,15 @@ class CostModel:
                  calibration: Optional[CalibrationFactors] = None):
         self.hw = hw
         self.dtype_bytes = dtype_bytes
-        self.cal = calibration or CalibrationFactors()
+        if calibration is None:
+            # Target-specific empirical factors (RTX 4090 defaults; Orin has
+            # higher memory-bound penalties and much lower L2 hit rates).
+            try:
+                from sengine.targets import active_target
+                calibration = CalibrationFactors(**active_target().calibration)
+            except Exception:
+                calibration = CalibrationFactors()
+        self.cal = calibration
 
         # Precompute throughput in convenient units
         self._peak_flops_per_us = hw.fp16_tflops * 1e6   # FLOP/us

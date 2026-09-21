@@ -818,6 +818,92 @@ void sengine_set_fp32(SEngineExecutor* e, int fp32) {
     e->is_fp32 = fp32;
 }
 
+int sengine_set_prefer_l1(SEngineExecutor* e, int enable) {
+    /**
+     * Shared-memory carveout hint for the native memory-bound kernels
+     * (IF/LIF/Add/MaxPool/GAP/TemporalMean). On Jetson Orin (sm_87, 128KB
+     * unified L1/smem) these streaming kernels benefit from the max-L1 split
+     * (cudaSharedmemCarveoutMaxL1 = 0); enable=0 restores the default (-1).
+     * Function attributes are process-global, so this applies to every
+     * executor. Called by runtime/plan_executor.py when the target profile
+     * sets l1_carveout_native_kernels (or SENGINE_PREFER_L1=1).
+     */
+    (void)e;
+    const int carveout = enable ? cudaSharedmemCarveoutMaxL1 : cudaSharedmemCarveoutDefault;
+    const void* kernels[] = {
+        (const void*)if_neuron_kernel, (const void*)lif_neuron_kernel,
+        (const void*)add_fp16_kernel, (const void*)maxpool2d_nhwc_kernel,
+        (const void*)global_avgpool_nhwc_kernel, (const void*)temporal_mean_kernel,
+        (const void*)if_neuron_fp32_kernel, (const void*)lif_neuron_fp32_kernel,
+        (const void*)add_fp32_kernel,
+    };
+    int n_ok = 0;
+    for (const void* k : kernels) {
+        if (cudaFuncSetAttribute(k, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 carveout) == cudaSuccess) n_ok++;
+    }
+    cudaGetLastError();  // clear any sticky attribute error
+    return n_ok;
+}
+
+void sengine_setup_l2_persistence(SEngineExecutor* e, void** weight_ptrs,
+                                   size_t* weight_sizes, int n_weights) {
+    /**
+     * Pin weight buffers in persisting L2 (Ampere+; used by the Jetson Orin
+     * profile: 4MB L2, LPDDR5). Reserves up to 75% of the max persisting L2
+     * and sets an access-policy window on the execution stream for the
+     * largest weight buffer. Must be called before sengine_capture_graph().
+     * No-op on devices without persisting L2.
+     */
+    if (n_weights == 0) return;
+
+    int max_persist = 0;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&max_persist, cudaDevAttrMaxPersistingL2CacheSize, dev);
+    if (max_persist <= 0) {
+        cudaGetLastError();
+        return;
+    }
+
+    size_t total_weight_bytes = 0;
+    for (int i = 0; i < n_weights; i++) total_weight_bytes += weight_sizes[i];
+
+    size_t persist_budget = (size_t)(max_persist * 0.75);
+    size_t persist_size = (total_weight_bytes < persist_budget) ? total_weight_bytes : persist_budget;
+    if (cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persist_size) != cudaSuccess) {
+        cudaGetLastError();
+        return;
+    }
+
+    size_t max_buf_size = 0;
+    void* max_buf_ptr = nullptr;
+    for (int i = 0; i < n_weights; i++) {
+        if (weight_sizes[i] > max_buf_size) {
+            max_buf_size = weight_sizes[i];
+            max_buf_ptr = weight_ptrs[i];
+        }
+    }
+    if (max_buf_ptr && max_buf_size > 0) {
+        int max_window = 0;
+        cudaDeviceGetAttribute(&max_window, cudaDevAttrMaxAccessPolicyWindowSize, dev);
+        size_t win = max_buf_size;
+        if (max_window > 0 && win > (size_t)max_window) win = (size_t)max_window;
+        cudaStreamAttrValue stream_attr;
+        memset(&stream_attr, 0, sizeof(stream_attr));
+        stream_attr.accessPolicyWindow.base_ptr = max_buf_ptr;
+        stream_attr.accessPolicyWindow.num_bytes = win;
+        stream_attr.accessPolicyWindow.hitRatio = 1.0f;
+        stream_attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+        stream_attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+        cudaStreamSetAttribute(e->stream, cudaStreamAttributeAccessPolicyWindow, &stream_attr);
+        cudaGetLastError();
+    }
+
+    fprintf(stderr, "[sengine] L2 persistence: %zu KB / %d KB max for %zu KB weights\n",
+            persist_size / 1024, max_persist / 1024, total_weight_bytes / 1024);
+}
+
 void sengine_destroy(SEngineExecutor* e) {
     if (!e) return;
     if (e->exec) cudaGraphExecDestroy(e->exec);

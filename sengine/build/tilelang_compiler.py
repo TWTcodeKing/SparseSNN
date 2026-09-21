@@ -125,9 +125,11 @@ def _get_hw_info() -> dict:
                         else 100 * 1024,
         }
     except Exception:
+        from sengine.targets import active_target
+        tp = active_target()
         _HW_INFO = {
-            'gpu_name': 'unknown', 'gpu_arch': 'sm_89',
-            'sm_count': 128, 'max_smem': 100 * 1024,
+            'gpu_name': tp.hw.gpu_name, 'gpu_arch': tp.arch,
+            'sm_count': tp.hw.sm_count, 'max_smem': tp.hw.max_smem,
         }
     return _HW_INFO
 
@@ -181,31 +183,25 @@ def estimate_occupancy(block_M, block_N, block_K, num_stages, threads,
 # ─── Config selection ───
 
 def _pick_interleaved_config(M: int, K_red: int, F: int,
-                              sm_count: int = 128,
+                              sm_count: int | None = None,
                               n_membranes: int = 1) -> dict:
-    """Pick tile config optimized for interleaved kernels.
+    """Pick tile config optimized for interleaved kernels (no autotuning).
 
-    Architecture-adaptive: uses larger tiles, deeper pipeline, and more threads
-    on GPUs with higher bandwidth and shared memory (A100, H100).
+    Tile preferences, block_K and pipeline depth come from the active target
+    profile (4090: moderate tiles / 2 stages; A100: larger tiles / 3 stages;
+    Orin: large tiles first so 16 SMs are still filled, 3 stages).
     """
+    from sengine.targets import active_target
+    pick = active_target().pick
     hw = _get_hw_info()
     max_smem = hw.get('max_smem', 100 * 1024)
-    is_high_bw = max_smem >= 160 * 1024  # A100 (164KB) / H100 (228KB)
+    if sm_count is None:
+        sm_count = hw.get('sm_count', 128)
 
-    if is_high_bw:
-        # A100+: prefer larger tiles + deeper pipeline for high BW utilization
-        tile_prefs = [(64, 128), (128, 64), (64, 64), (32, 64)]
-        bk = min(64, K_red)
-        ns = 3
-        thr = 128
-    else:
-        # RTX 4090 / consumer: moderate tiles, 2-stage pipeline
-        tile_prefs = [(32, 64), (64, 64), (64, 32)]
-        bk = min(32, K_red)
-        ns = 2
-        thr = 128
+    bk = min(pick.interleaved_bk, K_red)
+    ns = pick.interleaved_ns
 
-    for bm, bn in tile_prefs:
+    for bm, bn, thr in pick.interleaved_prefs:
         if bn > max(F, 32):
             continue
         smem = (bm * bk + bk * bn) * 2 * ns + bm * bn * 2
@@ -221,33 +217,33 @@ def _pick_interleaved_config(M: int, K_red: int, F: int,
 
 
 def _pick_config(M: int, K_red: int, F: int, bpe: int = 2) -> dict:
-    """Pick a reasonable default tile config for a GEMM problem.
+    """Pick a reasonable default tile config for a GEMM problem (no autotuning).
 
-    Architecture-adaptive: A100+ gets larger tiles, deeper pipeline, wider threads.
+    Thresholds, block_K and pipeline depth come from the active target profile.
 
     Args:
         bpe: bytes per element (2 for fp16, 4 for fp32).
 
     Returns dict with block_M, block_N, block_K, num_stages, threads.
     """
+    from sengine.targets import active_target
+    pick = active_target().pick
     hw = _get_hw_info()
     max_smem = hw.get('max_smem', 100 * 1024)
-    is_high_bw = max_smem >= 160 * 1024
 
-    if M >= 100000:
-        bm = 128
-    elif M >= 10000:
-        bm = 64
-    else:
-        bm = 32
+    bm = pick.bm_default
+    for threshold, choice in pick.bm_thresholds:
+        if M >= threshold:
+            bm = choice
+            break
 
     bn = min(64, F) if F > 0 else 64
-    bk = min(64 if is_high_bw else 32, K_red) if K_red > 0 else 32
-    ns = 3 if is_high_bw else 2
+    bk = min(pick.bk, K_red) if K_red > 0 else 32
+    ns = pick.ns
     thr = 128
 
-    # On high-BW GPUs, prefer wider output tile
-    if is_high_bw and F >= 128 and bpe == 2:
+    # On high-BW GPUs (A100), prefer a wider output tile
+    if pick.wide_bn and F >= 128 and bpe == 2:
         bn = min(128, F)
 
     # FP32: TileLang can't generate float32xN vector types for N>8.
@@ -274,22 +270,20 @@ def _autotune_config(compile_fn, profile_args: tuple, M: int, K_red: int, F: int
 
     Hardware-adaptive: uses detected SM count and max smem to prune config space.
     """
+    from sengine.targets import active_target
+    tp = active_target()
+    space = tp.autotune_space
     hw = _get_hw_info()
     smem_limit = hw['max_smem']  # use real limit, no artificial cap
     sm_count = hw['sm_count']
-    is_high_bw = smem_limit >= 160 * 1024
 
     candidates = []
-    bm_choices = [32, 64, 128, 256]
-    bn_choices = [32, 64, 128, 256]
+    bm_choices = list(space.bM)
+    bn_choices = list(space.bN)
     # K-divisibility-aware block_K choices
-    bk_base = {32, 64, 128}
-    for bk in [48, 96]:
-        if K_red > 0 and K_red % bk == 0 and bk <= K_red:
-            bk_base.add(bk)
-    bk_choices = sorted(bk_base)
-    ns_choices = [2, 3, 4] if is_high_bw else [2, 3]
-    thr_choices = [128, 256, 512] if is_high_bw else [128, 256]
+    bk_choices = tp.bK_for(space, K_red, 2)
+    ns_choices = list(space.ns)
+    thr_choices = list(space.thr)
 
     for bm in bm_choices:
         for bn in bn_choices:
@@ -304,7 +298,7 @@ def _autotune_config(compile_fn, profile_args: tuple, M: int, K_red: int, F: int
                         if smem > smem_limit:
                             continue
                         n_tiles = ((M + bm - 1) // bm) * ((F + bn - 1) // bn)
-                        if n_tiles < sm_count // 4:
+                        if n_tiles < max(sm_count // space.min_grid_divisor, 1):
                             continue
                         candidates.append(dict(block_M=bm, block_N=bn, block_K=bk,
                                                num_stages=ns, threads=thr))
@@ -350,22 +344,20 @@ def _autotune_interleaved(compile_fn, profile_args: tuple,
     and uses a composite score: measured_latency × occupancy_penalty.
     Configs with ≥2 CTAs/SM get a bonus; configs with <1 CTA/SM are penalized.
     """
+    from sengine.targets import active_target
+    tp = active_target()
+    space = tp.autotune_interleaved_space
     hw = _get_hw_info()
     smem_limit = hw['max_smem']  # use real limit
     sm_count = hw['sm_count']
-    is_high_bw = smem_limit >= 160 * 1024
 
     candidates = []
-    bm_choices = [16, 32, 64, 128, 256]
-    bn_choices = [32, 64, 128, 256]
+    bm_choices = list(space.bM)
+    bn_choices = list(space.bN)
     # K-divisibility-aware block_K choices
-    bk_base = {32, 64, 128}
-    for bk in [48, 96]:
-        if K_red > 0 and K_red % bk == 0 and bk <= K_red:
-            bk_base.add(bk)
-    bk_choices = sorted(bk_base)
-    ns_choices = [2, 3, 4] if is_high_bw else [2, 3]
-    thr_choices = [128, 256, 512] if is_high_bw else [128]
+    bk_choices = tp.bK_for(space, K_red, 2)
+    ns_choices = list(space.ns)
+    thr_choices = list(space.thr)
 
     for bm in bm_choices:
         for bn in bn_choices:
@@ -380,7 +372,7 @@ def _autotune_interleaved(compile_fn, profile_args: tuple,
                         if smem > smem_limit:
                             continue
                         n_tiles = ((M + bm - 1) // bm) * ((F + bn - 1) // bn)
-                        if n_tiles < sm_count // 8:
+                        if n_tiles < max(sm_count // space.min_grid_divisor, 1):
                             continue
                         occ = estimate_occupancy(bm, bn, bk, ns, thr, n_membranes)
                         candidates.append((dict(block_M=bm, block_N=bn, block_K=bk,
@@ -464,6 +456,8 @@ class TileLangCompiler:
         self.autotune = autotune
         self.tuning_cache = tuning_cache
         self.precision = precision
+        from sengine.targets import active_target
+        self.target = active_target()
         # Derive dtype constants from global precision
         import tilelang.language as _TL
         self.io_dtype_tl = _TL.float32 if precision == "fp32" else _TL.float16
@@ -737,14 +731,28 @@ class TileLangCompiler:
 
             kern = _compile_stem(cfg)
         else:
-            # 3x3: interleaved (per-CTA T-loop with im2col)
-            from sengine.kernels.conv2d_bn_if_t4 import conv2d_bn_if_interleaved_kernel
+            # 3x3: interleaved (per-CTA T-loop with im2col). The target profile
+            # may select the hand-unrolled T=4 variant (Orin: weight tile loaded
+            # once per K iteration for all four timesteps; needs num_stages=1
+            # because TileLang's pipeline planner rejects four writes to shared
+            # inside T.Pipelined). Any other T falls back to the generic T-loop.
+            from sengine.kernels.conv2d_bn_if_t4 import (
+                conv2d_bn_if_interleaved_kernel,
+                conv2d_bn_if_interleaved_t4_unrolled_kernel,
+            )
+            _use_unrolled = (self.target.conv3x3_interleaved_variant == 't_unrolled4'
+                             and self.T == 4)
+            _kernel_3x3 = (conv2d_bn_if_interleaved_t4_unrolled_kernel if _use_unrolled
+                           else conv2d_bn_if_interleaved_kernel)
+            _ns_override = self.target.conv3x3_num_stages_override if _use_unrolled else None
 
             M_per_t = self.B * OH * OW
             K_red = cp.kernel_h * cp.kernel_w * cp.in_channels
 
             def _compile_3x3(cfg):
-                return conv2d_bn_if_interleaved_kernel(
+                if _ns_override is not None:
+                    cfg = dict(cfg); cfg['num_stages'] = _ns_override
+                return _kernel_3x3(
                     B=self.B, C_in=cp.in_channels, H=H, W=W, F=cp.out_channels,
                     K=cp.kernel_h, S=cp.stride_h, D=cp.dilation_h, P=cp.pad_h,
                     T_steps=self.T,
@@ -761,9 +769,11 @@ class TileLangCompiler:
             )
             cfg = self._resolve_config(key, M_per_t, K_red, cp.out_channels,
                                         compile_fn=_compile_3x3, profile_args=_profile_args_3x3)
-            logger.debug("  Interleaved Conv3x3+BN+IF %d→%d %dx%d B=%d T=%d cfg=%dx%dx%d",
+            logger.phase("COMPILE", "Interleaved Conv3x3+BN+IF %d→%d %dx%d B=%d T=%d variant=%s cfg=%dx%dx%d ns=%d",
                          cp.in_channels, cp.out_channels, H, W, self.B, self.T,
-                         cfg['block_M'], cfg['block_N'], cfg['block_K'])
+                         't_unrolled4' if _use_unrolled else 't_loop',
+                         cfg['block_M'], cfg['block_N'], cfg['block_K'],
+                         _ns_override if _ns_override is not None else cfg['num_stages'])
 
             kern = _compile_3x3(cfg)
 

@@ -84,6 +84,7 @@ class CUDAGraphEngine:
         self._allocate_weights()
         self._allocate_membranes()
         self._allocate_activations()
+        self._setup_l2_persistence()
 
         # CUDA IF/LIF extension loaded lazily only when Python runtime dispatches neurons.
         # The C++ executor has native IF/LIF kernels — no torch extension needed.
@@ -185,6 +186,52 @@ class CUDAGraphEngine:
         return start.elapsed_time(end) / n_iters
 
     # ─── Internal ───
+
+    def _setup_l2_persistence(self):
+        """Reserve persisting L2 for weight tensors when the target asks for it.
+
+        On Jetson AGX Orin (4MB L2, 204.8 GB/s LPDDR5) weights are the primary
+        reuse candidate: they are read every timestep while activations stream
+        through. This sets cudaLimitPersistingL2CacheSize for the Python
+        runtime; the C++ executor additionally sets the stream access-policy
+        window (see runtime/plan_executor.py). Enabled by the target profile
+        (`l2_persist`) or forced with SENGINE_L2_PERSIST=1.
+        """
+        import os as _os
+        from sengine.targets import active_target
+        if not (active_target().l2_persist or _os.environ.get('SENGINE_L2_PERSIST', '0') == '1'):
+            return
+        try:
+            import ctypes
+            _cudart = ctypes.CDLL('libcudart.so')
+        except Exception:
+            logger.phase("ENGINE", "L2 persistence: libcudart.so not available, skipping")
+            return
+
+        total_weight_bytes = 0
+        for t in list(self.weights.values()) + list(self.weights_1x1.values()):
+            total_weight_bytes += t.nelement() * t.element_size()
+        if total_weight_bytes == 0:
+            return
+
+        # cudaDevAttrMaxPersistingL2CacheSize = 108
+        _val = ctypes.c_int()
+        ret = _cudart.cudaDeviceGetAttribute(ctypes.byref(_val), 108, torch.cuda.current_device())
+        if ret != 0 or _val.value == 0:
+            logger.phase("ENGINE", "L2 persistence: device does not support persisting L2")
+            return
+        max_persist_bytes = _val.value
+
+        # Reserve up to 75% of the max persisting L2 for weights
+        persist_size = min(total_weight_bytes, int(max_persist_bytes * 0.75))
+        # cudaLimitPersistingL2CacheSize = 0x06
+        ret = _cudart.cudaDeviceSetLimit(0x06, ctypes.c_size_t(persist_size))
+        if ret != 0:
+            logger.phase("ENGINE", "L2 persistence: cudaDeviceSetLimit failed (%d)", ret)
+            return
+        logger.phase("ENGINE", "L2 persistence: reserved %d KB / %d KB max for %d KB weights",
+                     persist_size // 1024, max_persist_bytes // 1024,
+                     total_weight_bytes // 1024)
 
     def _allocate_weights(self):
         """Convert ONNX weights to NHWC tensors on GPU (precision-aware)."""

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""End-to-end correctness check of an engine (sengine / sengine_edge / sengine_cpu)
-against the PyTorch model on real dataset samples.
+"""End-to-end correctness check of an engine (sengine GPU engine, any target
+profile, or sengine_cpu) against the PyTorch model on real dataset samples.
 
 For each of N test samples the script compares the engine logits with the
 PyTorch FP32 and FP16 (model.half()) outputs: top-1 agreement, cosine
@@ -13,7 +13,8 @@ Usage:
         --num-samples 100 --eval-acc --gpu-ids 1
     python scripts/verify_workloads.py --engine sengine_cpu --model snn_vgg9 \
         --dataset urbansound8k --T 4 --checkpoint ... --threads 16
-    python scripts/verify_workloads.py --engine sengine_edge --model snn_vgg16 --dataset ut_har --T 4
+    # Jetson AGX Orin profile (auto-detected on the Orin; --target forces it on x86)
+    python scripts/verify_workloads.py --engine sengine --target orin --model snn_vgg16 --dataset ut_har --T 4
 
 Pass criteria (per engine): top-1 agreement with the PyTorch FP16 reference
 >= --min-agree (default 0.99) and mean cosine >= --min-cos (default 0.99).
@@ -39,12 +40,14 @@ import torch
 import torch.nn.functional as F
 
 
-ENGINES = ('sengine', 'sengine_edge', 'sengine_cpu')
+ENGINES = ('sengine', 'sengine_cpu')
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--engine', required=True, choices=ENGINES)
+    p.add_argument('--target', type=str, default='auto', choices=['auto', 'ada', 'a100', 'orin'],
+                   help='sengine target profile (GPU engine only; default: auto-detect)')
     p.add_argument('--model', type=str, default=None, help='factory model name (e.g. snn_vgg16)')
     p.add_argument('--config', type=str, default=None, help='transformer YAML config')
     p.add_argument('--dataset', type=str, required=True)
@@ -143,7 +146,7 @@ def torch_forward(model, x_np, device, half=False):
 
 def export_onnx(args, ds_cfg, img_size, state_dict):
     """Export plugin ONNX with the reference weights. Returns path."""
-    pkg = 'sengine_edge' if args.engine == 'sengine_edge' else 'sengine'
+    pkg = 'sengine'
     export_dir = args.export_dir or os.path.join(pkg, 'exports')
     os.makedirs(export_dir, exist_ok=True)
     tmp_ckpt = os.path.join(tempfile.gettempdir(), f'verify_{os.getpid()}.pth')
@@ -166,9 +169,9 @@ def build_engine(args, onnx_path):
     if args.engine == 'sengine_cpu':
         import sengine_cpu
         return sengine_cpu.build(onnx_path, T=args.T, batch_size=args.engine_batch, n_threads=args.threads)
-    pkg = __import__(args.engine)
-    return pkg.build(onnx_path, T=args.T, batch_size=args.engine_batch, fusion=args.fusion,
-                     autotune=args.autotune, precision=args.precision)
+    import sengine
+    return sengine.build(onnx_path, T=args.T, batch_size=args.engine_batch, fusion=args.fusion,
+                         autotune=args.autotune, precision=args.precision, target=args.target)
 
 
 def metrics(a, b):

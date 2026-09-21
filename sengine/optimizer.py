@@ -1229,7 +1229,7 @@ def _is_sequential_context(ir: EngineIR, conv_nid: int) -> bool:
 
 
 def _should_use_fused_per_t(cp, ir: EngineIR, batch_size: int,
-                            sm_count: int = 128) -> bool:
+                            sm_count: int | None = None) -> bool:
     """Decide whether a Conv+IF pair should use per-timestep fused kernel.
 
     The per-timestep fused kernel (T=1 per launch) wins when the per-timestep
@@ -1261,16 +1261,19 @@ def classify_bound_and_assign_tilelang(ir: EngineIR, batch_size: int = 1):
     Memory-bound fusions (Add+LIF, Pool+LIF) are always beneficial
     regardless of saturation — they reduce kernel launches with no GEMM penalty.
     """
+    from sengine.targets import active_target
+    _tp = active_target()
     try:
         import torch
         sm_count = torch.cuda.get_device_properties(0).multi_processor_count
     except Exception:
-        sm_count = 128
-    # Saturation criterion: per-timestep GEMM tiles >= SM_count / wave_factor.
-    # Empirically: interleaved wins when M_per_t >= ~2000 (B=16 at 14x14 = 3136
-    # was 7.7% faster). Conservative factor: SM_count * 16 (~2048 on 4090).
-    BLOCK_M_REF = 16  # conservative: ~2 tiles per SM is enough for saturation
-    FUSED_THRESHOLD = sm_count * BLOCK_M_REF  # ~2048 on RTX 4090, ~1728 on A100
+        sm_count = _tp.fused_per_t_sm_default
+    # Saturation criterion: per-timestep GEMM tiles >= SM_count * BLOCK_M_REF.
+    # Empirically: interleaved wins when M_per_t >= ~2000 on the 4090 (B=16 at
+    # 14x14 = 3136 was 7.7% faster) -> BLOCK_M_REF=16 (~2048 on 4090, ~1728 on
+    # A100). Orin (16 SMs) uses 32 (~512: one full wave at block_M=32).
+    BLOCK_M_REF = _tp.fused_per_t_block_m_ref
+    FUSED_THRESHOLD = sm_count * BLOCK_M_REF
 
     n_compute = n_memory = n_zero = 0
     n_fused = n_decomposed = 0
